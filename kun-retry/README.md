@@ -9,6 +9,7 @@ Local Pi extension that replaces `@narumitw/pi-retry`.
 - **Extra error regex patterns**
 - **Legacy pi-retry matchers** (empty-detail Unknown error, Codex WS limit, Codex generic retry)
 - **Stall stream watchdog** (default 90s)
+- **Empty-response retry** — a completed-but-empty assistant turn (HTTP 200, no answer text and no tool calls; thinking-only turns count as empty too) is rewritten into a retryable error so Pi retries it
 - **`/retry-nl`** — unlimited mode: *any* assistant error becomes retryable, with a huge `maxRetries` written to settings
 
 ## Install / load
@@ -41,6 +42,7 @@ Then `/reload` or restart Pi.
   "errorPatterns": [],
   "stallTimeoutMs": 90000,
   "nl": false,
+  "retryEmptyResponse": true,
   "syncSettings": true
 }
 ```
@@ -56,6 +58,7 @@ Then `/reload` or restart Pi.
 | `/retry codes 401,403` | Status codes to match |
 | `/retry patterns "quota reset",timeout` | Extra regexes |
 | `/retry stall 60000` | Stall watchdog ms (`off`/`0` disables) |
+| `/retry empty on` / `off` | Retry empty provider responses (default on) |
 | `/retry sync` | Force write maxRetries into settings.json |
 | `/retry-nl` | Toggle unlimited any-error mode |
 | `/retry-nl on` / `off` | Explicit nl |
@@ -64,6 +67,8 @@ Then `/reload` or restart Pi.
 
 1. On match (legacy / status / pattern / nl), `message_end` appends  
    `provider returned error` so Pi’s `isRetryableAssistantError` accepts it.
+   Empty responses (non-error stopReason, no usable content) are rewritten with
+   `stopReason: "error"` + the same hint so the built-in classifier sees them.
 2. Pi’s agent auto-retry removes the failed assistant turn and `continue()`s with exponential backoff.
 3. Attempt budget is **Pi settings** `retry.maxRetries` — this extension keeps that in sync with its config (and uses a large number when `nl` is on).
 
@@ -81,3 +86,4 @@ PI_RETRY_STALL_TIMEOUT_MS=10000 pi
 - Context overflow is **not** turned into auto-retry (Pi compaction path).
 - Escape still cancels an in-progress backoff.
 - `nl` mode retries *every* `stopReason: "error"`; use carefully.
+- Empty-response retry ignores `aborted` (user cancel) and `length` (partial output cut off by token limit) turns; disable with `/retry empty off` if a provider legitimately returns empty completions.

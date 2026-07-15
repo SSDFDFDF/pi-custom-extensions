@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	appendRetryHint,
+	isEmptyAssistantContent,
 	matchRetryableError,
 	matchesStatusCode,
 	neutralizeNonRetryable,
@@ -70,6 +71,51 @@ test("neutralize is idempotent enough on already-broken text", () => {
 	const first = neutralizeNonRetryable("billing").text;
 	const second = neutralizeNonRetryable(first).text;
 	assert.equal(second, first);
+});
+
+test("empty content: no blocks / non-array is empty", () => {
+	assert.equal(isEmptyAssistantContent([]), true);
+	assert.equal(isEmptyAssistantContent(undefined), true);
+	assert.equal(isEmptyAssistantContent(null), true);
+});
+
+test("empty content: whitespace-only text is empty", () => {
+	assert.equal(isEmptyAssistantContent([{ type: "text", text: "   \n\t" }]), true);
+	assert.equal(isEmptyAssistantContent([{ type: "text", text: "" }]), true);
+});
+
+test("empty content: thinking-only is empty (reasoning is not usable output)", () => {
+	assert.equal(isEmptyAssistantContent([{ type: "thinking", thinking: "  " }]), true);
+	assert.equal(isEmptyAssistantContent([{ type: "thinking", thinking: "pondering hard" }]), true);
+	assert.equal(
+		isEmptyAssistantContent([
+			{ type: "thinking", thinking: "pondering" },
+			{ type: "text", text: "" },
+		]),
+		true,
+	);
+});
+
+test("non-empty content: real text", () => {
+	assert.equal(isEmptyAssistantContent([{ type: "text", text: "hello" }]), false);
+});
+
+test("non-empty content: tool call", () => {
+	assert.equal(isEmptyAssistantContent([{ type: "toolCall", name: "read" }]), false);
+});
+
+test("non-empty content: thinking then real text", () => {
+	assert.equal(
+		isEmptyAssistantContent([
+			{ type: "thinking", thinking: "pondering" },
+			{ type: "text", text: "here is the answer" },
+		]),
+		false,
+	);
+});
+
+test("unknown block type is treated as non-empty (safe)", () => {
+	assert.equal(isEmptyAssistantContent([{ type: "image" }]), false);
 });
 
 test("appendRetryHint is idempotent", () => {

@@ -19,7 +19,14 @@ import {
 	loadConfig,
 	saveConfig,
 } from "./config.ts";
-import { appendRetryHint, matchRetryableError, neutralizeNonRetryable, RETRYABLE_HINT } from "./match.ts";
+import {
+	appendRetryHint,
+	EMPTY_RESPONSE_TAG,
+	isEmptyAssistantContent,
+	matchRetryableError,
+	neutralizeNonRetryable,
+	RETRYABLE_HINT,
+} from "./match.ts";
 import { syncBuiltinRetrySettings } from "./settings-bridge.ts";
 
 const STALL_WATCHDOG_TAG = "[stall-watchdog-retry]";
@@ -36,6 +43,7 @@ type MessageShape = {
 	role?: string;
 	stopReason?: string;
 	errorMessage?: unknown;
+	content?: unknown;
 	[key: string]: unknown;
 };
 
@@ -293,6 +301,39 @@ export default function kunRetry(pi: ExtensionAPI) {
 		}
 
 		if (!cfg.enabled) return;
+
+		// Empty provider response → force retryable error.
+		// A completed-but-empty assistant turn (no answer text and no tool calls;
+		// thinking-only counts as empty) with a non-error stopReason is HTTP 200 with
+		// nothing usable. Pi's built-in classifier only inspects stopReason ===
+		// "error", so it never retries this. Rewrite it into a retryable error so the
+		// built-in retry path engages. "aborted" is a user cancel and "length" may
+		// carry partial output, so both are left untouched.
+		if (
+			cfg.retryEmptyResponse &&
+			message.stopReason !== "error" &&
+			message.stopReason !== "aborted" &&
+			message.stopReason !== "length" &&
+			isEmptyAssistantContent(message.content)
+		) {
+			const existing = typeof message.errorMessage === "string" ? message.errorMessage : "";
+			if (existing.includes(EMPTY_RESPONSE_TAG)) return;
+			const errorMessage = `Provider returned an empty response (stopReason: ${
+				typeof message.stopReason === "string" ? message.stopReason : "unknown"
+			}, no answer text or tool calls).\n\n${EMPTY_RESPONSE_TAG} ${RETRYABLE_HINT}; treating empty provider response as retryable.`;
+			if (ctx.hasUI) {
+				showRetryStatus(ctx);
+				ctx.ui.notify?.("Empty provider response; letting Pi auto-retry this turn.", "warning");
+			}
+			return {
+				message: {
+					...message,
+					stopReason: "error",
+					errorMessage,
+				} as typeof event.message,
+			};
+		}
+
 		if (message.stopReason !== "error") return;
 		if (typeof message.errorMessage !== "string") return;
 
@@ -357,7 +398,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 
 	pi.registerCommand("retry", {
 		description:
-			"kun-retry: status | on | off | config | max <n> | delay <ms> | codes <list> | patterns <list> | stall <ms|off> | sync",
+			"kun-retry: status | on | off | config | max <n> | delay <ms> | codes <list> | patterns <list> | stall <ms|off> | empty <on|off> | sync",
 		handler: async (args, ctx) => {
 			refreshConfig();
 			const raw = (args ?? "").trim();
@@ -492,6 +533,24 @@ export default function kunRetry(pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === "empty" || sub === "emptyresponse") {
+				if (!restJoined) {
+					ctx.ui.notify(`retryEmptyResponse=${cfg.retryEmptyResponse}`, "info");
+					return;
+				}
+				const a = restJoined.toLowerCase();
+				let next: boolean;
+				if (a === "on" || a === "1" || a === "true" || a === "enable") next = true;
+				else if (a === "off" || a === "0" || a === "false" || a === "disable") next = false;
+				else {
+					ctx.ui.notify("Usage: /retry empty <on|off>", "error");
+					return;
+				}
+				cfg = saveConfig({ retryEmptyResponse: next });
+				ctx.ui.notify(`kun-retry retryEmptyResponse=${cfg.retryEmptyResponse}`, "info");
+				return;
+			}
+
 			if (sub === "sync") {
 				const sync = applySettingsSync(ctx);
 				ctx.ui.notify(
@@ -511,6 +570,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 						"/retry codes 401,403    extra HTTP codes in error text",
 						"/retry patterns a,b     extra regexes (i)",
 						"/retry stall <ms|off>   stream stall watchdog",
+						"/retry empty <on|off>   retry empty (no-content) responses",
 						"/retry config {json}    patch config file",
 						"/retry sync             write maxRetries into settings.json",
 						"/retry-nl [on|off]      unlimited any-error mode",

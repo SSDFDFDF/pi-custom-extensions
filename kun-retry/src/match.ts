@@ -6,6 +6,40 @@
 
 export const RETRYABLE_HINT = "provider returned error";
 
+/** Tag used when rewriting an empty provider response into a retryable error. */
+export const EMPTY_RESPONSE_TAG = "[kun-retry-empty-response]";
+
+type ContentBlock = { type?: unknown; text?: unknown; thinking?: unknown; name?: unknown };
+
+/**
+ * True when an assistant message carries no usable *final* output: no tool
+ * calls and no non-whitespace text. Providers occasionally return HTTP 200 with
+ * an empty body / zero content blocks; because the stopReason is not "error",
+ * Pi's built-in classifier never treats it as retryable.
+ *
+ * Thinking is deliberately NOT counted as usable output: a turn that produced
+ * only reasoning and no answer text or tool call is a failed turn from the
+ * user's perspective, so it is treated as empty (retryable).
+ */
+export function isEmptyAssistantContent(content: unknown): boolean {
+	if (!Array.isArray(content)) return true;
+	for (const raw of content) {
+		if (typeof raw !== "object" || raw === null) continue;
+		const block = raw as ContentBlock;
+		if (block.type === "toolCall") return false;
+		// Thinking-only turns count as empty: reasoning without an answer or tool
+		// call is not usable output, so skip thinking blocks entirely.
+		if (block.type === "thinking") continue;
+		if (block.type === "text") {
+			if (typeof block.text === "string" && block.text.trim()) return false;
+			continue;
+		}
+		// Unknown block type with any content is treated as non-empty to stay safe.
+		return false;
+	}
+	return true;
+}
+
 /**
  * Substrings Pi's built-in classifier treats as NON-retryable (quota/billing),
  * checked BEFORE its retryable patterns. If any survive in errorMessage, the

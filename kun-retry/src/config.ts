@@ -33,6 +33,14 @@ export interface KunRetryConfig {
 	 * Toggle via `/retry-nl`.
 	 */
 	nl: boolean;
+	/**
+	 * Treat a completed-but-empty assistant response (no text / thinking / tool
+	 * calls, non-error stopReason) as retryable. The provider returned HTTP 200
+	 * with nothing usable, which Pi's built-in classifier never sees because the
+	 * stopReason is not "error". When true, kun-retry rewrites it into a retryable
+	 * error so the built-in retry path engages.
+	 */
+	retryEmptyResponse: boolean;
 	/** When true, write maxRetries/baseDelayMs/enabled into ~/.pi/agent/settings.json. */
 	syncSettings: boolean;
 }
@@ -45,6 +53,7 @@ export const DEFAULT_CONFIG: KunRetryConfig = {
 	errorPatterns: [],
 	stallTimeoutMs: 90_000,
 	nl: false,
+	retryEmptyResponse: true,
 	syncSettings: true,
 };
 
@@ -120,6 +129,7 @@ export function normalizeConfig(raw: Partial<KunRetryConfig> | undefined): KunRe
 				? Math.min(Math.floor(stallTimeoutMs), 3_600_000)
 				: DEFAULT_CONFIG.stallTimeoutMs,
 		nl: base.nl === true,
+		retryEmptyResponse: base.retryEmptyResponse !== false,
 		syncSettings: base.syncSettings !== false,
 	};
 }
@@ -147,6 +157,7 @@ export function formatConfigSummary(cfg: KunRetryConfig): string {
 		`statusCodes: [${cfg.statusCodes.join(", ")}]`,
 		`errorPatterns: ${cfg.errorPatterns.length ? cfg.errorPatterns.map((p) => JSON.stringify(p)).join(", ") : "(none extra)"}`,
 		`stallTimeoutMs: ${cfg.stallTimeoutMs === 0 ? "off" : cfg.stallTimeoutMs}`,
+		`retryEmptyResponse: ${cfg.retryEmptyResponse}`,
 		`syncSettings: ${cfg.syncSettings}`,
 		`config: ${defaultConfigPath()}`,
 	].join("\n");
