@@ -1,0 +1,12 @@
+{
+  "name": "client-mimic",
+  "version": "0.1.0",
+  "description": "Make pi's outgoing provider requests look like another client (Codex CLI, Claude Code) for self-hosted gateways that gate on client fingerprint. Header/body rewrite only; no OAuth, no transport-layer spoofing. Includes /mimic update to pull client versions from npm.",
+  "type": "module",
+  "private": true,
+  "keywords": ["pi-package", "pi-extension", "mimic", "gateway"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
