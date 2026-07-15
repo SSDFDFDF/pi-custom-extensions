@@ -8,7 +8,7 @@ npm/git package extensions declared in `settings.json` are not tracked here.
 
 | Extension | Type | Purpose |
 |-----------|------|---------|
-| `neutral-system-prompt.ts` | file | Rewrites the built-in system prompt intro to the "kun / π" identity. |
+| `client-mimic/` | dir | Rewrites outgoing provider headers/body to mimic Codex CLI / Claude Code, and owns system-prompt transformation (neutral rewrite or per-profile prompt files). Supersedes the former `neutral-system-prompt.ts`. |
 | `kun-retry/` | dir | Configurable retry: override built-in retry count/backoff, extra HTTP status codes and error patterns, stall watchdog, and `/retry-nl` unlimited mode. |
 | `hybrid-goal/` | dir | Goal-mode state machine (pi-goal lineage) + independent judge + `/goal-evol` self-evolution. |
 
@@ -16,7 +16,10 @@ npm/git package extensions declared in `settings.json` are not tracked here.
 
 ```
 ~/.pi/agent/extensions/
-├── neutral-system-prompt.ts
+├── client-mimic/
+│   ├── index.ts
+│   ├── prompts/                # per-profile file-mode prompts (codex.md, claude-code.md)
+│   └── src/                    # config, header rewrite, system-prompt, update
 ├── kun-retry/
 │   ├── index.ts
 │   ├── src/
@@ -26,6 +29,11 @@ npm/git package extensions declared in `settings.json` are not tracked here.
     ├── src/
     └── test/
 ```
+
+Example per-profile prompt files for `client-mimic`'s file mode live inside the
+repo at `client-mimic/prompts/` (`codex.md`, `claude-code.md`), so they back up
+and restore with the repo. Reference them from the config with a path relative
+to `~/.pi/agent`, e.g. `extensions/client-mimic/prompts/codex.md`.
 
 ## Not tracked
 

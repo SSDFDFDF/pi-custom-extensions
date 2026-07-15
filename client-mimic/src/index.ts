@@ -16,8 +16,17 @@
  *   /mimic on|off          master switch
  *   /mimic use <profile>   activate a profile (codex | claude-code | off)
  *   /mimic list            list profiles
- *   /mimic show [profile]  print a profile's resolved headers/body
+ *   /mimic show [profile]  print a profile's resolved headers/body/prompt mode
+ *   /mimic prompt [...]    system-prompt control:
+ *                            /mimic prompt                       show config (all levels)
+ *                            /mimic prompt <off|neutral>         set the global default
+ *                            /mimic prompt <profile> <inherit|off|neutral|file> [path]
  *   /mimic update [name]   pull latest version from npm and refresh {version}
+ *
+ * System prompt: this extension also owns pi's system prompt via
+ * before_agent_start (folding in the old standalone neutral-system-prompt.ts).
+ * The active profile's systemPrompt spec wins unless it is "inherit", in which
+ * case the global MimicConfig.systemPrompt applies (default: neutral rewrite).
  *
  * Flag:
  *   --mimic <profile>      activate a profile for this launch (session-only)
@@ -26,14 +35,17 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	defaultConfigPath,
 	formatStatus,
 	loadConfig,
 	resolveTemplate,
 	saveConfig,
 	type MimicConfig,
 	type MimicProfile,
+	type SystemPromptSpec,
 	type TemplateContext,
 } from "./config.ts";
+import { applySystemPrompt, effectiveSpec } from "./system-prompt.ts";
 import { formatUpdateResults, updateVersions } from "./update.ts";
 
 const FLAG = "mimic";
@@ -78,6 +90,7 @@ export default function clientMimic(pi: ExtensionAPI) {
 		version: profile.version,
 		sessionId: ctx.sessionManager.getSessionId?.() ?? sessionId,
 		uuid: () => randomUUID(),
+		vars: profile.templateVars,
 	});
 
 	const updateFooter = (ctx: Pick<ExtensionContext, "hasUI" | "ui">) => {
@@ -167,13 +180,29 @@ export default function clientMimic(pi: ExtensionAPI) {
 		return { ...payload, ...profile.bodyPatch };
 	});
 
+	// ── System prompt ──────────────────────────────────────────────────────────
+
+	pi.on("before_agent_start", (event, ctx) => {
+		// System-prompt handling is independent of the header master switch: even
+		// with mimic "off"/disabled, the global systemPrompt (neutral by default)
+		// still applies. effectiveProfile() returns null unless a profile is truly
+		// active, so the global spec governs in that case.
+		const profile = effectiveProfile();
+		const spec = effectiveSpec(cfg, profile);
+		const result = applySystemPrompt(event.systemPrompt, spec);
+		if (result.warning && ctx.hasUI) {
+			ctx.ui.notify(`client-mimic: ${result.warning}`, "warning");
+		}
+		return result.prompt === event.systemPrompt ? undefined : { systemPrompt: result.prompt };
+	});
+
 	// ── Commands ───────────────────────────────────────────────────────────────
 
 	pi.registerCommand("mimic", {
 		description:
 			"client-mimic: status | on | off | use <profile> | list | show [profile] | update [name|all]",
 		getArgumentCompletions: (prefix: string) => {
-			const subs = ["status", "on", "off", "use", "list", "show", "update"];
+			const subs = ["status", "on", "off", "use", "list", "show", "update", "prompt"];
 			const profiles = Object.keys(loadConfig().profiles);
 			const parts = prefix.split(/\s+/);
 			let items: { value: string; label: string }[];
@@ -183,6 +212,19 @@ export default function clientMimic(pi: ExtensionAPI) {
 				items = [...profiles, "off"].map((p) => ({ value: `${parts[0]} ${p}`, label: p }));
 			} else if (parts[0] === "update") {
 				items = ["all", ...profiles].map((p) => ({ value: `update ${p}`, label: p }));
+			} else if (parts[0] === "prompt") {
+				// `/mimic prompt <mode>` sets the global default; `/mimic prompt <profile> <mode>`
+				// targets one profile. Offer both global modes and profile names at depth 2.
+				if (parts.length <= 2) {
+					items = ["off", "neutral", ...profiles].map((m) => ({ value: `prompt ${m}`, label: m }));
+				} else if (profiles.includes(parts[1])) {
+					items = ["inherit", "off", "neutral", "file"].map((m) => ({
+						value: `prompt ${parts[1]} ${m}`,
+						label: m,
+					}));
+				} else {
+					return null;
+				}
 			} else {
 				return null;
 			}
@@ -259,6 +301,75 @@ export default function clientMimic(pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === "prompt") {
+				const tokens = rest.map((t) => t.toLowerCase()).filter(Boolean);
+
+				// No args: show current system-prompt configuration.
+				if (tokens.length === 0) {
+					const profile = effectiveProfile();
+					const spec = effectiveSpec(cfg, profile);
+					const lines = [
+						`global systemPrompt: ${describeSpec(cfg.systemPrompt)}`,
+						`active profile: ${effectiveActive()}`,
+					];
+					if (profile) lines.push(`profile systemPrompt: ${describeSpec(profile.systemPrompt)}`);
+					lines.push(`effective (this session): ${describeSpec(spec)}`);
+					for (const [key, p] of Object.entries(cfg.profiles)) {
+						lines.push(`  ${key}: ${describeSpec(p.systemPrompt)}`);
+					}
+					lines.push(
+						"",
+						"Global:      /mimic prompt <off|neutral>",
+						"Per-profile: /mimic prompt <profile> <inherit|off|neutral|file> [path]",
+					);
+					ctx.ui.notify(lines.join("\n"), "info");
+					return;
+				}
+
+				// `/mimic prompt <profile> <mode> [path]` — per-profile control.
+				if (cfg.profiles[tokens[0]]) {
+					const key = tokens[0];
+					const mode = tokens[1];
+					if (!mode || !["inherit", "off", "neutral", "file"].includes(mode)) {
+						ctx.ui.notify(
+							`Usage: /mimic prompt ${key} <inherit|off|neutral|file> [path]`,
+							"error",
+						);
+						return;
+					}
+					let nextSpec: SystemPromptSpec;
+					if (mode === "file") {
+						// Default to the tracked seed file for this profile when no path is given.
+						const path = rest.slice(1).join(" ").trim() || `extensions/client-mimic/prompts/${key}.md`;
+						const prev = cfg.profiles[key].systemPrompt;
+						const apply = prev.mode === "file" && prev.apply ? prev.apply : "replace";
+						nextSpec = { mode: "file", file: path, apply };
+					} else {
+						nextSpec = { mode: mode as SystemPromptSpec["mode"] };
+					}
+					const nextProfiles = {
+						...cfg.profiles,
+						[key]: { ...cfg.profiles[key], systemPrompt: nextSpec },
+					};
+					cfg = saveConfig({ profiles: nextProfiles });
+					ctx.ui.notify(`client-mimic: ${key} systemPrompt = ${describeSpec(cfg.profiles[key].systemPrompt)}`, "info");
+					return;
+				}
+
+				// `/mimic prompt <mode>` — global default (inherit not allowed here).
+				const target = tokens[0];
+				if (target !== "off" && target !== "neutral") {
+					ctx.ui.notify(
+						`Unknown target "${target}". Global: /mimic prompt <off|neutral>. Per-profile: /mimic prompt <${Object.keys(cfg.profiles).join("|")}> <mode> [path]`,
+						"error",
+					);
+					return;
+				}
+				cfg = saveConfig({ systemPrompt: { mode: target } });
+				ctx.ui.notify(`client-mimic global system prompt: ${target}`, "info");
+				return;
+			}
+
 			if (sub === "help") {
 				ctx.ui.notify(
 					[
@@ -267,6 +378,9 @@ export default function clientMimic(pi: ExtensionAPI) {
 						"/mimic use <profile>     activate codex | claude-code | off",
 						"/mimic list              list profiles",
 						"/mimic show [profile]    print resolved headers + body patch",
+						"/mimic prompt                show system-prompt config (all levels)",
+						"/mimic prompt <off|neutral>  set the global default",
+						"/mimic prompt <profile> <inherit|off|neutral|file> [path]  per-profile",
 						"/mimic update [name|all] refresh version(s) from npm registry",
 						"flag: --mimic <profile>  session-only override at launch",
 					].join("\n"),
@@ -300,6 +414,17 @@ export default function clientMimic(pi: ExtensionAPI) {
 		if (profile.stripHeaders.length) lines.push(`strip: ${profile.stripHeaders.join(", ")}`);
 		const bodyKeys = Object.keys(profile.bodyPatch);
 		if (bodyKeys.length) lines.push(`bodyPatch: ${JSON.stringify(profile.bodyPatch)}`);
+		const varKeys = Object.keys(profile.templateVars);
+		if (varKeys.length) lines.push(`templateVars: ${JSON.stringify(profile.templateVars)}`);
+		lines.push(`systemPrompt: ${describeSpec(profile.systemPrompt)}`);
 		ctx.ui.notify(lines.join("\n"), "info");
 	}
+}
+
+/** One-line human description of a SystemPromptSpec. */
+function describeSpec(spec: { mode: string; file?: string; apply?: string }): string {
+	if (spec.mode === "file") {
+		return `file (${spec.apply ?? "replace"}: ${spec.file ?? "<unset>"})`;
+	}
+	return spec.mode;
 }

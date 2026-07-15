@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -15,7 +16,9 @@ export interface MimicProfile {
 	/**
 	 * Headers to add/override on every outgoing provider request.
 	 * Values support placeholders (see resolveTemplate): {version}, {session_id},
-	 * {uuid}, {os}, {arch}, {node_version}, {platform}.
+	 * {uuid}, {os}, {arch}, {node_version}, {platform}, {os_type}, {os_version},
+	 * {uname_arch}, {terminal}, {stainless_os}, {stainless_arch}, plus any key
+	 * defined in `templateVars`.
 	 * A value of null deletes the header instead of setting it.
 	 */
 	headers: Record<string, string | null>;
@@ -37,6 +40,40 @@ export interface MimicProfile {
 	 * refresh `version`. Empty string disables auto-update for this profile.
 	 */
 	npmPackage: string;
+	/**
+	 * Extra named placeholders usable in header values as {key}. Handy for
+	 * client-specific constants that are not derived from the runtime, e.g. an
+	 * SDK package version ({stainless_version}). User-defined keys here override
+	 * the built-in placeholder set of the same name.
+	 */
+	templateVars: Record<string, string>;
+	/**
+	 * Optional per-profile system-prompt behavior. When set (and not "inherit"),
+	 * it decides how pi's system prompt is transformed while this profile is
+	 * active. See SystemPromptSpec.
+	 */
+	systemPrompt: SystemPromptSpec;
+}
+
+/**
+ * How the active profile transforms pi's system prompt.
+ *
+ * - mode "inherit": defer to the global MimicConfig.systemPrompt setting.
+ * - mode "off": leave pi's built-in system prompt untouched.
+ * - mode "neutral": apply the neutral "kun / π" identity rewrite (the behavior
+ *   of the standalone neutral-system-prompt extension), keeping pi's generated
+ *   tool list, guidelines, skills, and context intact.
+ * - mode "file": load text from `file` and combine it with pi's prompt per
+ *   `apply` (replace | prepend | append). Relative paths resolve against the
+ *   agent dir (~/.pi/agent). Missing files fall back to leaving the prompt
+ *   untouched (a warning is surfaced by the extension).
+ */
+export interface SystemPromptSpec {
+	mode: "inherit" | "off" | "neutral" | "file";
+	/** Path to the prompt file when mode is "file". */
+	file?: string;
+	/** How a file prompt combines with pi's prompt. Default: "replace". */
+	apply?: "replace" | "prepend" | "append";
 }
 
 export interface MimicConfig {
@@ -44,20 +81,79 @@ export interface MimicConfig {
 	enabled: boolean;
 	/** Active profile key, or "off" to disable without flipping enabled. */
 	active: string;
+	/**
+	 * Default system-prompt behavior when the active profile's systemPrompt.mode
+	 * is "inherit" (or when no profile is active). Uses the same SystemPromptSpec
+	 * shape but "inherit" is treated as "off" at this level.
+	 */
+	systemPrompt: SystemPromptSpec;
 	/** Named profiles. */
 	profiles: Record<string, MimicProfile>;
 }
 
-const OS_MAP: Record<string, string> = {
+/**
+ * Stainless SDK OS token (X-Stainless-OS). Matches the values the JS Stainless
+ * runtime emits: "MacOS", "Linux", "Windows", "Unknown".
+ */
+const STAINLESS_OS_MAP: Record<string, string> = {
 	linux: "Linux",
-	darwin: "macOS",
+	darwin: "MacOS",
 	win32: "Windows",
 };
 
-const ARCH_MAP: Record<string, string> = {
+/**
+ * Stainless SDK arch token (X-Stainless-Arch): "x64", "arm64", "x32", or
+ * "other:<arch>".
+ */
+const STAINLESS_ARCH_MAP: Record<string, string> = {
 	x64: "x64",
 	arm64: "arm64",
+	ia32: "x32",
 };
+
+/**
+ * OS type token used by Codex's User-Agent, modeled on the `os_info` crate's
+ * `OsType` Display output that the real client embeds, e.g. "Linux", "Mac OS",
+ * "Windows".
+ */
+const OS_TYPE_MAP: Record<string, string> = {
+	linux: "Linux",
+	darwin: "Mac OS",
+	win32: "Windows",
+};
+
+/**
+ * uname-style machine arch used by Codex's User-Agent (os_info architecture()):
+ * "x86_64", "arm64"/"aarch64", etc. On Linux the kernel reports "aarch64"; on
+ * macOS the common form is "arm64".
+ */
+function unameArch(): string {
+	switch (process.arch) {
+		case "x64":
+			return "x86_64";
+		case "arm64":
+			return process.platform === "darwin" ? "arm64" : "aarch64";
+		case "ia32":
+			return "i686";
+		default:
+			return process.arch;
+	}
+}
+
+/**
+ * Terminal identifier token used by Codex's User-Agent, mirroring codex's
+ * terminal-detection `user_agent_token()`: `TERM_PROGRAM/TERM_PROGRAM_VERSION`
+ * when present, else `TERM`, else "unknown".
+ */
+function terminalToken(): string {
+	const prog = (process.env.TERM_PROGRAM ?? "").trim();
+	if (prog) {
+		const ver = (process.env.TERM_PROGRAM_VERSION ?? "").trim();
+		return ver ? `${prog}/${ver}` : prog;
+	}
+	const term = (process.env.TERM ?? "").trim();
+	return term || "unknown";
+}
 
 /**
  * Default profiles. Header sets are modeled on the real clients as of the
@@ -73,8 +169,16 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 		npmPackage: "@openai/codex",
 		headers: {
 			originator: "codex_cli_rs",
-			"User-Agent": "codex_cli_rs/{version}",
+			// Real Codex User-Agent is
+			//   codex_cli_rs/{version} ({OS Type} {OS Version}; {uname arch}) {terminal}
+			// e.g. "codex_cli_rs/0.144.4 (Linux 6.8.0; x86_64) unknown". The bare
+			// "codex_cli_rs/{version}" form used before is easy to fingerprint as
+			// non-CLI; the full form matches the client's default_client.rs.
+			"User-Agent": "codex_cli_rs/{version} ({os_type} {os_version}; {uname_arch}) {terminal}",
 			"OpenAI-Beta": "responses=experimental",
+			// Codex also sends a bare `version` header on Responses requests; some
+			// gateways (see Sub2API PR #2494) validate it. Mirror the CLI version.
+			version: "{version}",
 			// hyphenated form only — underscored aliases are rejected by some proxies
 			"session-id": "{session_id}",
 		},
@@ -85,30 +189,46 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 		// are also OpenAI-Responses-specific and can 400 on other providers. Add per-field
 		// overrides only when your gateway requires them and they match pi's request mode.
 		bodyPatch: {},
+		templateVars: {},
+		systemPrompt: { mode: "inherit" },
 	},
 	"claude-code": {
-		label: "Anthropic Claude Code (claude-cli / tengu)",
+		label: "Anthropic Claude Code (claude-cli)",
 		version: "2.1.210",
 		npmPackage: "@anthropic-ai/claude-code",
 		headers: {
-			"User-Agent": "claude-code/{version}",
+			// Real Claude Code User-Agent is "claude-cli/{version} (external, cli)",
+			// NOT "claude-code/{version}". The latter is trivially fingerprinted.
+			"User-Agent": "claude-cli/{version} (external, cli)",
 			"x-app": "cli",
-			"X-Claude-Code-Session-Id": "{session_id}",
+			// API version + the direct-browser-access flag the real CLI sends.
+			"anthropic-version": "2023-06-01",
+			"anthropic-dangerous-direct-browser-access": "true",
+			// Stainless SDK metadata (the underlying @anthropic-ai/sdk).
 			"X-Stainless-Lang": "js",
-			"X-Stainless-OS": "{os}",
-			"X-Stainless-Arch": "{arch}",
+			"X-Stainless-Package-Version": "{stainless_version}",
+			"X-Stainless-OS": "{stainless_os}",
+			"X-Stainless-Arch": "{stainless_arch}",
 			"X-Stainless-Runtime": "node",
 			"X-Stainless-Runtime-Version": "{node_version}",
 			"X-Stainless-Retry-Count": "0",
+			"X-Stainless-Timeout": "600",
 		},
 		stripHeaders: [],
 		bodyPatch: {},
+		// Version of the bundled @anthropic-ai/sdk that Claude Code ships. Not the
+		// same as the CLI version; refresh by hand if your gateway checks it.
+		templateVars: { stainless_version: "0.74.0" },
+		systemPrompt: { mode: "inherit" },
 	},
 };
 
 export const DEFAULT_CONFIG: MimicConfig = {
 	enabled: true,
 	active: "off",
+	// Preserve the prior standalone-extension behavior: neutral "kun / π" rewrite
+	// by default. Set to { mode: "off" } to keep pi's built-in prompt verbatim.
+	systemPrompt: { mode: "neutral" },
 	profiles: DEFAULT_PROFILES,
 };
 
@@ -150,6 +270,27 @@ export function saveConfig(patch: Partial<MimicConfig>): MimicConfig {
 	return next;
 }
 
+/** Coerce arbitrary input into a valid SystemPromptSpec. */
+function normalizeSystemPrompt(
+	raw: unknown,
+	fallback: SystemPromptSpec,
+	allowInherit: boolean,
+): SystemPromptSpec {
+	if (!raw || typeof raw !== "object") return { ...fallback };
+	const src = raw as Partial<SystemPromptSpec>;
+	const modes = allowInherit
+		? ["inherit", "off", "neutral", "file"]
+		: ["off", "neutral", "file"];
+	const mode = typeof src.mode === "string" && modes.includes(src.mode) ? src.mode : fallback.mode;
+	const spec: SystemPromptSpec = { mode: mode as SystemPromptSpec["mode"] };
+	if (spec.mode === "file") {
+		spec.file = typeof src.file === "string" ? src.file : fallback.file;
+		const apply = src.apply ?? fallback.apply ?? "replace";
+		spec.apply = apply === "prepend" || apply === "append" ? apply : "replace";
+	}
+	return spec;
+}
+
 function normalizeProfile(key: string, raw: Partial<MimicProfile> | undefined): MimicProfile {
 	const base = DEFAULT_PROFILES[key];
 	const src = raw ?? {};
@@ -166,6 +307,11 @@ function normalizeProfile(key: string, raw: Partial<MimicProfile> | undefined): 
 		src.bodyPatch && typeof src.bodyPatch === "object" && !Array.isArray(src.bodyPatch)
 			? { ...(src.bodyPatch as Record<string, unknown>) }
 			: { ...(base?.bodyPatch ?? {}) };
+	const templateVars: Record<string, string> = {};
+	const rawVars = (src.templateVars ?? base?.templateVars ?? {}) as Record<string, unknown>;
+	for (const [k, v] of Object.entries(rawVars)) {
+		if (typeof v === "string") templateVars[k] = v;
+	}
 
 	return {
 		label: typeof src.label === "string" && src.label ? src.label : base?.label ?? key,
@@ -174,6 +320,8 @@ function normalizeProfile(key: string, raw: Partial<MimicProfile> | undefined): 
 		headers,
 		stripHeaders,
 		bodyPatch,
+		templateVars,
+		systemPrompt: normalizeSystemPrompt(src.systemPrompt, base?.systemPrompt ?? { mode: "inherit" }, true),
 	};
 }
 
@@ -193,6 +341,7 @@ export function normalizeConfig(raw: Partial<MimicConfig> | undefined): MimicCon
 	return {
 		enabled: src.enabled !== false,
 		active: active === "off" || profiles[active] ? active : "off",
+		systemPrompt: normalizeSystemPrompt(src.systemPrompt, { mode: "neutral" }, false),
 		profiles,
 	};
 }
@@ -200,6 +349,8 @@ export function normalizeConfig(raw: Partial<MimicConfig> | undefined): MimicCon
 /** Resolve template placeholders in a header value against runtime context. */
 export function resolveTemplate(value: string, ctx: TemplateContext): string {
 	return value.replace(/\{(\w+)\}/g, (match, key: string) => {
+		// Profile-defined vars win over built-ins of the same name.
+		if (ctx.vars && key in ctx.vars) return ctx.vars[key];
 		switch (key) {
 			case "version":
 				return ctx.version;
@@ -208,9 +359,21 @@ export function resolveTemplate(value: string, ctx: TemplateContext): string {
 			case "uuid":
 				return ctx.uuid();
 			case "os":
-				return OS_MAP[process.platform] ?? "Unknown";
+				return STAINLESS_OS_MAP[process.platform] ?? "Unknown";
+			case "stainless_os":
+				return STAINLESS_OS_MAP[process.platform] ?? "Unknown";
 			case "arch":
-				return ARCH_MAP[process.arch] ?? `other:${process.arch}`;
+				return STAINLESS_ARCH_MAP[process.arch] ?? `other:${process.arch}`;
+			case "stainless_arch":
+				return STAINLESS_ARCH_MAP[process.arch] ?? `other:${process.arch}`;
+			case "os_type":
+				return OS_TYPE_MAP[process.platform] ?? "Unknown";
+			case "os_version":
+				return os.release() || "unknown";
+			case "uname_arch":
+				return unameArch();
+			case "terminal":
+				return terminalToken();
 			case "node_version":
 				return process.version;
 			case "platform":
@@ -225,6 +388,8 @@ export interface TemplateContext {
 	version: string;
 	sessionId: string;
 	uuid: () => string;
+	/** Profile-defined template vars, overriding built-in placeholders. */
+	vars?: Record<string, string>;
 }
 
 export function activeProfile(cfg: MimicConfig): MimicProfile | null {
@@ -232,16 +397,38 @@ export function activeProfile(cfg: MimicConfig): MimicProfile | null {
 	return cfg.profiles[cfg.active] ?? null;
 }
 
+/** One-line human description of a SystemPromptSpec (e.g. for status output). */
+export function describeSystemPrompt(spec: SystemPromptSpec): string {
+	if (spec.mode === "file") {
+		return `file (${spec.apply ?? "replace"}: ${spec.file ?? "<unset>"})`;
+	}
+	return spec.mode;
+}
+
+/**
+ * The system-prompt spec that actually takes effect, given the active profile:
+ * a profile spec wins unless it is "inherit"; a global "inherit" resolves to
+ * "off". Mirrors system-prompt.ts effectiveSpec so status output matches runtime.
+ */
+export function effectiveSystemPrompt(cfg: MimicConfig): SystemPromptSpec {
+	const profile = activeProfile(cfg);
+	if (profile && profile.systemPrompt.mode !== "inherit") return profile.systemPrompt;
+	return cfg.systemPrompt.mode === "inherit" ? { mode: "off" } : cfg.systemPrompt;
+}
+
 export function formatStatus(cfg: MimicConfig): string {
 	const lines: string[] = [
 		`enabled: ${cfg.enabled}`,
 		`active: ${cfg.active}`,
 		`config: ${defaultConfigPath()}`,
+		`system prompt: global=${describeSystemPrompt(cfg.systemPrompt)} | effective=${describeSystemPrompt(effectiveSystemPrompt(cfg))}`,
 		"profiles:",
 	];
 	for (const [key, p] of Object.entries(cfg.profiles)) {
 		const mark = key === cfg.active ? "*" : " ";
-		lines.push(`  ${mark} ${key} — ${p.label} v${p.version}${p.npmPackage ? ` (npm: ${p.npmPackage})` : ""}`);
+		lines.push(
+			`  ${mark} ${key} — ${p.label} v${p.version}${p.npmPackage ? ` (npm: ${p.npmPackage})` : ""} [prompt: ${describeSystemPrompt(p.systemPrompt)}]`,
+		);
 	}
 	return lines.join("\n");
 }

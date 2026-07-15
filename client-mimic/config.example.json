@@ -1,0 +1,26 @@
+{
+  "_comment": "Example client-mimic config. Copy to ~/.pi/agent/client-mimic.config.json and edit. The live file is NOT tracked by git (it may hold environment-specific values); this example is. Missing/unknown fields are backfilled from built-in defaults on load, so you only need to keep what you change.",
+  "enabled": true,
+  "active": "off",
+  "systemPrompt": {
+    "_comment": "Global default when a profile's systemPrompt.mode is 'inherit'. mode: off | neutral. 'neutral' applies the kun/π identity rewrite while keeping pi's generated tools/guidelines/skills/context.",
+    "mode": "neutral"
+  },
+  "profiles": {
+    "codex": {
+      "systemPrompt": {
+        "_comment": "Example: present a Codex-style prompt for this profile. Path is relative to ~/.pi/agent, so this resolves to the git-tracked seed file that restores with the repo. apply: replace | prepend | append.",
+        "mode": "file",
+        "file": "extensions/client-mimic/prompts/codex.md",
+        "apply": "replace"
+      }
+    },
+    "claude-code": {
+      "systemPrompt": {
+        "mode": "file",
+        "file": "extensions/client-mimic/prompts/claude-code.md",
+        "apply": "replace"
+      }
+    }
+  }
+}
