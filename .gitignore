@@ -1,0 +1,21 @@
+# dependencies / build artifacts
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# extension-local caches (e.g. hybrid-goal /goal-evol clones)
+cache/
+
+# logs / temp
+*.log
+tmp/
+.DS_Store
+
+# secrets — never commit credentials
+*.pem
+*.key
+auth.json
+telegram.json
+.env
+.env.*
