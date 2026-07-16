@@ -321,10 +321,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 			const errorMessage = `Provider returned an empty response (stopReason: ${
 				typeof message.stopReason === "string" ? message.stopReason : "unknown"
 			}, no answer text or tool calls).\n\n${EMPTY_RESPONSE_TAG} ${RETRYABLE_HINT}; treating empty provider response as retryable.`;
-			if (ctx.hasUI) {
-				showRetryStatus(ctx);
-				ctx.ui.notify?.("Empty provider response; letting Pi auto-retry this turn.", "warning");
-			}
+			if (ctx.hasUI) showRetryStatus(ctx);
 			return {
 				message: {
 					...message,
@@ -356,10 +353,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 		const base = cfg.nl ? neutralizeNonRetryable(message.errorMessage).text : message.errorMessage;
 		const errorMessage = appendRetryHint(base, matched);
 
-		if (ctx.hasUI) {
-			showRetryStatus(ctx);
-			ctx.ui.notify?.(matched.notification, "warning");
-		}
+		if (ctx.hasUI) showRetryStatus(ctx);
 
 		return {
 			message: {
