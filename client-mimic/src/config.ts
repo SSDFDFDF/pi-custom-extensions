@@ -31,8 +31,29 @@ export interface MimicProfile {
 	 * Shallow body field overrides merged into the provider payload
 	 * (e.g. { store: false, stream: true }). Values are used verbatim.
 	 * Only top-level keys are set; omit to leave the body untouched.
+	 *
+	 * For Claude-Code-shaped gateways, prefer the dedicated body helpers below
+	 * (`ensureMetadataUserId`, `prependBillingSystem`) over hard-coding fields
+	 * here — they are applied after bodyPatch and understand Anthropic payload
+	 * shapes (string/array system, metadata.user_id).
 	 */
 	bodyPatch: Record<string, unknown>;
+	/**
+	 * When true, ensure the Anthropic Messages payload has `metadata.user_id`
+	 * in the Claude Code JSON-string form:
+	 *   {"device_id":"...","account_uuid":"","session_id":"..."}
+	 * Existing metadata.user_id is left alone. device_id is a stable per-machine
+	 * hash; session_id reuses pi's session id.
+	 */
+	ensureMetadataUserId: boolean;
+	/**
+	 * When true, prepend Claude Code's attribution/identity system blocks:
+	 *   1) "x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli;"
+	 *   2) "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+	 * Works for both string and content-block-array `system` fields. Skips
+	 * injection when a billing-header block is already present.
+	 */
+	prependBillingSystem: boolean;
 	/** Client version string used to fill {version} in headers. */
 	version: string;
 	/**
@@ -189,21 +210,32 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 		// are also OpenAI-Responses-specific and can 400 on other providers. Add per-field
 		// overrides only when your gateway requires them and they match pi's request mode.
 		bodyPatch: {},
+		ensureMetadataUserId: false,
+		prependBillingSystem: false,
 		templateVars: {},
 		systemPrompt: { mode: "inherit" },
 	},
 	"claude-code": {
 		label: "Anthropic Claude Code (claude-cli)",
-		version: "2.1.210",
+		// Pin to a version observed on the wire. Refresh with `/mimic update`.
+		version: "2.1.198",
 		npmPackage: "@anthropic-ai/claude-code",
 		headers: {
 			// Real Claude Code User-Agent is "claude-cli/{version} (external, cli)",
 			// NOT "claude-code/{version}". The latter is trivially fingerprinted.
 			"User-Agent": "claude-cli/{version} (external, cli)",
 			"x-app": "cli",
+			// Session id the real CLI always sends; some gateways require it.
+			"X-Claude-Code-Session-Id": "{session_id}",
 			// API version + the direct-browser-access flag the real CLI sends.
 			"anthropic-version": "2023-06-01",
 			"anthropic-dangerous-direct-browser-access": "true",
+			// Claude Code identity beta. Gateways that "only allow Claude Code
+			// clients" commonly require at least claude-code-20250219. We force
+			// the core set here; pi may already contribute interleaved-thinking.
+			// Existing beta values are merged (not replaced) at request time.
+			"anthropic-beta":
+				"claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24",
 			// Stainless SDK metadata (the underlying @anthropic-ai/sdk).
 			"X-Stainless-Lang": "js",
 			"X-Stainless-Package-Version": "{stainless_version}",
@@ -216,9 +248,14 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 		},
 		stripHeaders: [],
 		bodyPatch: {},
-		// Version of the bundled @anthropic-ai/sdk that Claude Code ships. Not the
+		// Body-level Claude Code fingerprints required by some self-hosted
+		// gateways (e.g. "this group only allows Claude Code clients").
+		ensureMetadataUserId: true,
+		prependBillingSystem: true,
+		// Version of the bundled @anthropic-ai/sdk that recent Claude Code
+		// builds ship (captured from 2.1.198 on the wire: 0.94.0). Not the
 		// same as the CLI version; refresh by hand if your gateway checks it.
-		templateVars: { stainless_version: "0.74.0" },
+		templateVars: { stainless_version: "0.94.0" },
 		systemPrompt: { mode: "inherit" },
 	},
 };
@@ -320,6 +357,14 @@ function normalizeProfile(key: string, raw: Partial<MimicProfile> | undefined): 
 		headers,
 		stripHeaders,
 		bodyPatch,
+		ensureMetadataUserId:
+			typeof src.ensureMetadataUserId === "boolean"
+				? src.ensureMetadataUserId
+				: (base?.ensureMetadataUserId ?? false),
+		prependBillingSystem:
+			typeof src.prependBillingSystem === "boolean"
+				? src.prependBillingSystem
+				: (base?.prependBillingSystem ?? false),
 		templateVars,
 		systemPrompt: normalizeSystemPrompt(src.systemPrompt, base?.systemPrompt ?? { mode: "inherit" }, true),
 	};

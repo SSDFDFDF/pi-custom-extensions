@@ -16,6 +16,12 @@
       }
     },
     "claude-code": {
+      "version": "2.1.198",
+      "ensureMetadataUserId": true,
+      "prependBillingSystem": true,
+      "templateVars": {
+        "stainless_version": "0.94.0"
+      },
       "systemPrompt": {
         "mode": "file",
         "file": "extensions/client-mimic/prompts/claude-code.md",

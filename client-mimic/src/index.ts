@@ -32,7 +32,8 @@
  *   --mimic <profile>      activate a profile for this launch (session-only)
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	defaultConfigPath,
@@ -66,6 +67,8 @@ export default function clientMimic(pi: ExtensionAPI) {
 	let flagConsumed = false;
 	// Stable per-session id reused for {session_id}. Regenerated on each session_start.
 	let sessionId = randomUUID();
+	// Stable per-machine device id for Claude Code metadata.user_id (hashed host+user).
+	const deviceId = stableDeviceId();
 
 	const refresh = () => {
 		cfg = loadConfig();
@@ -157,27 +160,63 @@ export default function clientMimic(pi: ExtensionAPI) {
 		// existing key that matches case-insensitively before writing the profile's
 		// canonical spelling. Deletion uses null so it also cancels a same-name key
 		// added by an earlier-loaded extension.
+		//
+		// anthropic-beta is special-cased: merge with any existing value (union of
+		// comma-separated flags) so we don't clobber betas pi already set for
+		// thinking/tool-streaming while still forcing Claude Code identity flags.
 		for (const [name, rawValue] of Object.entries(profile.headers)) {
 			const lower = name.toLowerCase();
-			for (const existing of Object.keys(event.headers)) {
-				if (existing !== name && existing.toLowerCase() === lower) {
-					event.headers[existing] = null;
-				}
+			const existingKeys = Object.keys(event.headers).filter((k) => k.toLowerCase() === lower);
+			const existingValue = existingKeys
+				.map((k) => event.headers[k])
+				.find((v): v is string => typeof v === "string" && v.trim().length > 0);
+
+			for (const existing of existingKeys) {
+				if (existing !== name) event.headers[existing] = null;
 			}
-			event.headers[name] = rawValue === null ? null : resolveTemplate(rawValue, tctx);
+
+			if (rawValue === null) {
+				event.headers[name] = null;
+				continue;
+			}
+
+			const resolved = resolveTemplate(rawValue, tctx);
+			if (lower === "anthropic-beta" && existingValue) {
+				event.headers[name] = mergeBetaFlags(existingValue, resolved);
+			} else {
+				event.headers[name] = resolved;
+			}
 		}
 	});
 
 	// ── Body patch ───────────────────────────────────────────────────────────
 
-	pi.on("before_provider_request", (event) => {
+	pi.on("before_provider_request", (event, ctx) => {
 		const profile = effectiveProfile();
 		if (!profile) return;
-		const keys = Object.keys(profile.bodyPatch);
-		if (!keys.length) return;
 
-		const payload = event.payload as Record<string, unknown>;
-		return { ...payload, ...profile.bodyPatch };
+		const payload = { ...(event.payload as Record<string, unknown>) };
+		let changed = false;
+
+		// 1. Shallow bodyPatch overrides (config-driven).
+		const patchKeys = Object.keys(profile.bodyPatch);
+		if (patchKeys.length) {
+			Object.assign(payload, profile.bodyPatch);
+			changed = true;
+		}
+
+		// 2. Claude Code metadata.user_id (JSON string with device/session).
+		if (profile.ensureMetadataUserId) {
+			const sid = ctx.sessionManager.getSessionId?.() ?? sessionId;
+			if (ensureClaudeMetadata(payload, deviceId, sid)) changed = true;
+		}
+
+		// 3. Claude Code billing/identity system preamble.
+		if (profile.prependBillingSystem) {
+			if (prependClaudeBillingSystem(payload, profile.version)) changed = true;
+		}
+
+		return changed ? payload : undefined;
 	});
 
 	// ── System prompt ──────────────────────────────────────────────────────────
@@ -414,6 +453,8 @@ export default function clientMimic(pi: ExtensionAPI) {
 		if (profile.stripHeaders.length) lines.push(`strip: ${profile.stripHeaders.join(", ")}`);
 		const bodyKeys = Object.keys(profile.bodyPatch);
 		if (bodyKeys.length) lines.push(`bodyPatch: ${JSON.stringify(profile.bodyPatch)}`);
+		lines.push(`ensureMetadataUserId: ${profile.ensureMetadataUserId}`);
+		lines.push(`prependBillingSystem: ${profile.prependBillingSystem}`);
 		const varKeys = Object.keys(profile.templateVars);
 		if (varKeys.length) lines.push(`templateVars: ${JSON.stringify(profile.templateVars)}`);
 		lines.push(`systemPrompt: ${describeSpec(profile.systemPrompt)}`);
@@ -427,4 +468,124 @@ function describeSpec(spec: { mode: string; file?: string; apply?: string }): st
 		return `file (${spec.apply ?? "replace"}: ${spec.file ?? "<unset>"})`;
 	}
 	return spec.mode;
+}
+
+/** Stable 64-char hex device id (sha256 of host+user), matching Claude Code's shape. */
+function stableDeviceId(): string {
+	const seed = `${hostname()}|${process.env.USER ?? process.env.USERNAME ?? ""}|${process.platform}|${process.arch}`;
+	return createHash("sha256").update(seed).digest("hex");
+}
+
+/** Union comma-separated anthropic-beta flags, preserving first-seen order. */
+function mergeBetaFlags(existing: string, incoming: string): string {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const part of `${existing},${incoming}`.split(",")) {
+		const flag = part.trim();
+		if (!flag || seen.has(flag)) continue;
+		seen.add(flag);
+		out.push(flag);
+	}
+	return out.join(",");
+}
+
+/**
+ * Ensure Anthropic Messages payload has Claude Code's metadata.user_id.
+ * Real Claude Code sends a JSON string:
+ *   {"device_id":"...","account_uuid":"","session_id":"..."}
+ * Returns true if the payload was modified.
+ */
+function ensureClaudeMetadata(
+	payload: Record<string, unknown>,
+	deviceId: string,
+	sessionId: string,
+): boolean {
+	const existingMeta =
+		payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
+			? ({ ...(payload.metadata as Record<string, unknown>) } as Record<string, unknown>)
+			: {};
+	if (typeof existingMeta.user_id === "string" && existingMeta.user_id.trim()) {
+		return false;
+	}
+	existingMeta.user_id = JSON.stringify({
+		device_id: deviceId,
+		account_uuid: "",
+		session_id: sessionId,
+	});
+	payload.metadata = existingMeta;
+	return true;
+}
+
+const CLAUDE_AGENT_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+/**
+ * Prepend Claude Code's billing-header + Agent SDK identity blocks onto the
+ * provider payload's `system` field. Handles both string and content-block
+ * array forms. Returns true if modified.
+ */
+function prependClaudeBillingSystem(payload: Record<string, unknown>, version: string): boolean {
+	const billing = "x-anthropic-billing-header: cc_version=" + version + "; cc_entrypoint=cli;";
+	const sys = payload.system;
+
+	// Only treat a leading system block that *starts with* the billing header as
+	// already present. A mere substring match is too broad (seed prompts may
+	// mention the header name in documentation text).
+	if (hasLeadingBillingHeader(sys)) return false;
+
+	if (sys == null || sys === "") {
+		payload.system = [
+			{ type: "text", text: billing },
+			{ type: "text", text: CLAUDE_AGENT_IDENTITY },
+		];
+		return true;
+	}
+
+	if (typeof sys === "string") {
+		// Keep as content blocks so the gateway can match the first block exactly
+		// the way the real CLI does (array of text blocks).
+		const rest = sys.startsWith(CLAUDE_AGENT_IDENTITY)
+			? [{ type: "text", text: sys }]
+			: [
+					{ type: "text", text: CLAUDE_AGENT_IDENTITY },
+					{ type: "text", text: sys },
+				];
+		payload.system = [{ type: "text", text: billing }, ...rest];
+		return true;
+	}
+
+	if (Array.isArray(sys)) {
+		const blocks = sys.slice();
+		const hasIdentity = systemContains(sys, "Claude Agent SDK");
+		const prepend: Array<Record<string, unknown>> = [{ type: "text", text: billing }];
+		if (!hasIdentity) prepend.push({ type: "text", text: CLAUDE_AGENT_IDENTITY });
+		payload.system = prepend.concat(blocks);
+		return true;
+	}
+
+	return false;
+}
+
+/** True only when the first system block/string starts with the billing header. */
+function hasLeadingBillingHeader(sys: unknown): boolean {
+	const prefix = "x-anthropic-billing-header:";
+	if (typeof sys === "string") return sys.trimStart().startsWith(prefix);
+	if (!Array.isArray(sys) || sys.length === 0) return false;
+	const first = sys[0];
+	if (typeof first === "string") return first.trimStart().startsWith(prefix);
+	if (first && typeof first === "object" && typeof (first as { text?: unknown }).text === "string") {
+		return (first as { text: string }).text.trimStart().startsWith(prefix);
+	}
+	return false;
+}
+
+function systemContains(sys: unknown, needle: string): boolean {
+	if (typeof sys === "string") return sys.includes(needle);
+	if (!Array.isArray(sys)) return false;
+	for (const block of sys) {
+		if (typeof block === "string" && block.includes(needle)) return true;
+		if (block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string") {
+			if (((block as { text: string }).text).includes(needle)) return true;
+		}
+	}
+	return false;
 }
