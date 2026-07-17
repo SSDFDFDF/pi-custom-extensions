@@ -8,7 +8,7 @@ Telegram is one adapter. No pi-telegram compatibility shims.
 ## Topology
 
 ```text
-adapters (telegram, …)  --ChannelEvent-->  core runtime  --Pi ports-->  Pi session
+adapters (telegram, qqbot, …)  --ChannelEvent-->  core runtime  --Pi ports-->  Pi session
 adapters <---OutboundIntent---  core runtime  <---agent_end text---  Pi session
 ```
 
@@ -28,16 +28,29 @@ adapters <---OutboundIntent---  core runtime  <---agent_end text---  Pi session
 - Pair first user if `allowedUserId` missing
 - Persist offset + pair id into `channels.json`
 
+## QQ Bot adapter
+
+- Gateway WebSocket (Identify + heartbeat + Dispatch)
+- Intents: `GROUP_AND_C2C` (`1<<25`)
+- C2C inbound → passive final with `msg_id` / `msg_seq`
+- Inbound attachments download to temp (images → multimodal)
+- Outbound attach: upload `file_data` base64 → `msg_type:7` media
+- Outbound text: `msg_type:2` custom markdown when `finalFormat` is native/compat; plain fallback
+- Progress: single status message (no edit API) → delete on clear/final; typing no-op
+- Progress updates after first send are ignored (passive reply budget)
+- Pair first openid if `allowedOpenId` missing
+- Optional group `@` when `enableGroup: true`
+
 ## Config
 
 `~/.pi/agent/channels.json` only.
 
 ## Phases
 
-1. Solo telegram text (current)
-2. Files + proactive push + structured actions
-3. Optional telegram UI extras
-4. Second channel (webhook/discord) to prove multi-channel
+1. Solo telegram text
+2. Files + progress draft + attach tool
+3. QQ Bot C2C companion (current)
+4. QQ media + group polish / webhook third channel
 5. Extension platform APIs
 
 ## Non-goals

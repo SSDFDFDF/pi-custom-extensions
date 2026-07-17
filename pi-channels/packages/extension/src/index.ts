@@ -16,20 +16,25 @@ import {
   loadChannelsFile,
   releaseChannelLock,
   resolveAgentDir,
+  resolveQqbotProfile,
   resolveTelegramProfile,
   saveChannelsFile,
+  updateQqbotAllowedOpenId,
   updateTelegramAllowedUserId,
   updateTelegramLastUpdateId,
   type LocalFile,
   type PiPromptContent,
 } from "../../core/src/index.ts";
 import { createTelegramAdapter } from "../../telegram/src/index.ts";
+import { createQqbotAdapter } from "../../qqbot/src/index.ts";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { access, readFile, stat } from "node:fs/promises";
 
 const STATUS_KEY = "channels";
+
+type ConnectedChannel = "telegram" | "qqbot";
 
 type ThemeLike = {
   fg(token: string, text: string): string;
@@ -60,42 +65,43 @@ function colorize(
 }
 
 /**
- * Compact footer: `chan:tg` with colored channel id.
- * e.g. chan:tg | chan:tg 2 | chan:tg!
+ * Compact footer: `chan:tg` / `chan:qq` with colored channel id.
+ * e.g. chan:tg | chan:qq 2 | chan:tg!
  */
 function formatStatusLine(
-  connected: boolean,
+  connected: ConnectedChannel | undefined,
   runtime: ChannelRuntime | undefined,
   theme?: ThemeLike,
 ): string | undefined {
   if (!connected || !runtime) return undefined;
   const snap = runtime.snapshot();
-  const adapter = snap.adapters.find((item) => item.channelId === "telegram");
+  const adapter = snap.adapters.find((item) => item.channelId === connected);
   const depth = snap.queued + (snap.activeTurn ? 1 : 0);
+  const short = connected === "telegram" ? "tg" : "qq";
 
   const prefix = colorize(theme, "muted", "chan:");
   if (adapter?.state === "error") {
-    return `${prefix}${colorize(theme, "error", "tg!")}`;
+    return `${prefix}${colorize(theme, "error", `${short}!`)}`;
   }
   if (adapter?.state === "connecting") {
-    return `${prefix}${colorize(theme, "warning", "tg…")}`;
+    return `${prefix}${colorize(theme, "warning", `${short}…`)}`;
   }
-  const channel = colorize(theme, "success", "tg");
+  const channel = colorize(theme, "success", short);
   return depth > 0
     ? `${prefix}${channel} ${colorize(theme, "dim", String(depth))}`
     : `${prefix}${channel}`;
 }
 
-const LOCK_CHANNEL = "telegram";
 const LOCK_PROFILE = "default";
 const HEARTBEAT_MS = 15_000;
 
 export default function piChannels(pi: ExtensionAPI) {
   const agentDir = resolveAgentDir();
   let runtime: ChannelRuntime | undefined;
-  let telegramConnected = false;
+  let connectedChannel: ConnectedChannel | undefined;
   let latestCtx: SessionCtx | undefined;
   let lockHeld = false;
+  let lockChannelId: ConnectedChannel | undefined;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
   const stopHeartbeat = () => {
@@ -105,29 +111,32 @@ export default function piChannels(pi: ExtensionAPI) {
     }
   };
 
-  const startHeartbeat = (instanceId: string) => {
+  const startHeartbeat = (instanceId: string, channelId: ConnectedChannel) => {
     stopHeartbeat();
+    lockChannelId = channelId;
+    lockHeld = true;
     heartbeatTimer = setInterval(() => {
       void heartbeatChannelLock({
         agentDir,
-        channelId: LOCK_CHANNEL,
+        channelId,
         profileId: LOCK_PROFILE,
         instanceId,
       }).then((ok) => {
-        if (!ok && telegramConnected) {
-          // Lost lock (stolen/force) — drop poll to avoid split-brain.
+        if (!ok && connectedChannel === channelId) {
+          // Lost lock (stolen/force) — drop poll/gateway to avoid split-brain.
           void (async () => {
             try {
-              await runtime?.getAdapter("telegram")?.disconnect("default");
+              await runtime?.getAdapter(channelId)?.disconnect("default");
             } catch {
               // ignore
             }
-            telegramConnected = false;
+            connectedChannel = undefined;
             lockHeld = false;
+            lockChannelId = undefined;
             stopHeartbeat();
             refreshStatus();
             console.error(
-              "[pi-channels] lost connect lock; disconnected telegram poll",
+              `[pi-channels] lost connect lock; disconnected ${channelId}`,
             );
           })();
         }
@@ -138,14 +147,16 @@ export default function piChannels(pi: ExtensionAPI) {
 
   const releaseLockSafe = async (instanceId: string | undefined) => {
     stopHeartbeat();
-    if (!lockHeld || !instanceId) {
+    const channelId = lockChannelId;
+    if (!lockHeld || !instanceId || !channelId) {
       lockHeld = false;
+      lockChannelId = undefined;
       return;
     }
     try {
       await releaseChannelLock({
         agentDir,
-        channelId: LOCK_CHANNEL,
+        channelId,
         profileId: LOCK_PROFILE,
         instanceId,
       });
@@ -153,13 +164,14 @@ export default function piChannels(pi: ExtensionAPI) {
       // ignore
     }
     lockHeld = false;
+    lockChannelId = undefined;
   };
 
   const refreshStatus = (ctx: SessionCtx | undefined = latestCtx) => {
     if (!ctx?.ui?.setStatus) return;
     ctx.ui.setStatus(
       STATUS_KEY,
-      formatStatusLine(telegramConnected, runtime, ctx.ui.theme),
+      formatStatusLine(connectedChannel, runtime, ctx.ui.theme),
     );
   };
 
@@ -192,11 +204,28 @@ export default function piChannels(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
-    const { profile } = await resolveTelegramProfile("default", agentDir);
+    // Progress policy: prefer whichever channel is configured; if both, union to progress when either wants it.
+    const tg = await resolveTelegramProfile("default", agentDir);
+    const qq = await resolveQqbotProfile("default", agentDir);
+    const tgProg = tg.profile.progress;
+    const qqProg = qq.profile.progress;
+    const wantProgress =
+      tgProg?.mode === "progress" || qqProg?.mode === "progress";
+    const progress = {
+      ...(tgProg ?? {}),
+      ...(qqProg ?? {}),
+      mode: (wantProgress ? "progress" : "off") as "progress" | "off",
+      // QQ-friendly: don't thrash; adapter only materializes once anyway
+      startDelayMs: Math.max(
+        tgProg?.startDelayMs ?? 0,
+        qqProg?.startDelayMs ?? 0,
+        2500,
+      ),
+    };
     runtime = new ChannelRuntime({
       instanceId: `pi-${process.pid}-${randomUUID().slice(0, 8)}`,
       ports,
-      progress: profile.progress,
+      progress,
     });
     refreshStatus(ctx);
   });
@@ -209,9 +238,9 @@ export default function piChannels(pi: ExtensionAPI) {
       } catch {
         // ignore
       }
-      if (telegramConnected) {
+      if (connectedChannel) {
         try {
-          await runtime.getAdapter("telegram")?.disconnect("default");
+          await runtime.getAdapter(connectedChannel)?.disconnect("default");
         } catch {
           // ignore
         }
@@ -219,7 +248,7 @@ export default function piChannels(pi: ExtensionAPI) {
     }
     await releaseLockSafe(instanceId);
     latestCtx?.ui.setStatus(STATUS_KEY, undefined);
-    telegramConnected = false;
+    connectedChannel = undefined;
     runtime = undefined;
     latestCtx = undefined;
   });
@@ -261,9 +290,9 @@ export default function piChannels(pi: ExtensionAPI) {
     name: "channel_attach",
     label: "Channel Attach",
     description:
-      "Send one or more local files to the active channel (Telegram). " +
+      "Send one or more local files to the active channel (Telegram / QQ Bot). " +
       "During a channel-originated turn files are queued and delivered after the final reply; " +
-      "otherwise they go to the last channel target. Images are sent as photos; other files as documents.",
+      "otherwise they go to the last channel target. Telegram: photos/documents; QQ Bot: rich media upload (image/video/voice/file).",
     parameters: Type.Object({
       paths: Type.Array(Type.String(), {
         description: "Absolute or cwd-relative file paths to send",
@@ -348,8 +377,10 @@ export default function piChannels(pi: ExtensionAPI) {
             (a) =>
               `- ${a.channelId}/${a.profileId}: ${a.state}${a.detail ? ` (${a.detail})` : ""}`,
           ),
-          telegramConnected ? "telegram: connected" : "telegram: not connected",
-          lockHeld ? "lock: held" : "lock: not held",
+          connectedChannel
+            ? `active: ${connectedChannel}`
+            : "active: none",
+          lockHeld ? `lock: held (${lockChannelId ?? "?"})` : "lock: not held",
         ].join("\n"),
         "info",
       );
@@ -357,12 +388,78 @@ export default function piChannels(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("channel-setup", {
-    description: "Save telegram bot token into channels.json",
+    description:
+      "Save channel credentials. Telegram: /channel-setup <botToken> | QQ: /channel-setup qqbot <appId> <clientSecret>",
     handler: async (args, ctx) => {
-      const token = args.trim().split(/\s+/)[0];
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const head = (parts[0] ?? "").toLowerCase();
+
+      // QQ Bot: /channel-setup qqbot <appId> <clientSecret> [sandbox]
+      if (head === "qqbot" || head === "qq") {
+        const appId = parts[1];
+        const clientSecret = parts[2];
+        const sandbox = parts.includes("sandbox");
+        if (!appId || !clientSecret) {
+          ctx.ui.notify(
+            "usage: /channel-setup qqbot <appId> <clientSecret> [sandbox]\nwrites channels.qqbot.profiles.default",
+            "error",
+          );
+          return;
+        }
+        const file = await loadChannelsFile(agentDir);
+        const profiles = {
+          ...(file.channels?.qqbot?.profiles ?? {}),
+        };
+        profiles.default = {
+          ...(profiles.default ?? {}),
+          enabled: true,
+          appId,
+          clientSecret,
+          sandbox: sandbox || profiles.default?.sandbox,
+          enableGroup: profiles.default?.enableGroup ?? false,
+          render: profiles.default?.render ?? {
+            finalFormat: "plain",
+            sanitizeMarkdown: true,
+            neutralizeMath: true,
+            draftPreviews: false,
+          },
+          progress: profiles.default?.progress ?? {
+            mode: "progress",
+            startDelayMs: 2500,
+            maxLines: 3,
+            maxLineChars: 80,
+            minEditIntervalMs: 2000,
+          },
+        };
+        const path = await saveChannelsFile(
+          {
+            ...file,
+            defaultChannel: file.defaultChannel ?? "qqbot",
+            proactivePush: file.proactivePush ?? false,
+            channels: {
+              ...file.channels,
+              qqbot: { profiles },
+            },
+          },
+          agentDir,
+        );
+        ctx.ui.notify(
+          `saved qqbot appId → ${path}${sandbox ? " (sandbox)" : ""}`,
+          "info",
+        );
+        return;
+      }
+
+      // Telegram: /channel-setup <botToken>  or  /channel-setup telegram <botToken>
+      const token =
+        head === "telegram" || head === "tg" ? parts[1] : parts[0];
       if (!token || !token.includes(":")) {
         ctx.ui.notify(
-          "usage: /channel-setup <botToken>\nwrites channels.telegram.profiles.default.botToken",
+          [
+            "usage:",
+            "  /channel-setup <telegramBotToken>",
+            "  /channel-setup qqbot <appId> <clientSecret> [sandbox]",
+          ].join("\n"),
           "error",
         );
         return;
@@ -394,13 +491,13 @@ export default function piChannels(pi: ExtensionAPI) {
         },
         agentDir,
       );
-      ctx.ui.notify(`saved bot token → ${path}`, "info");
+      ctx.ui.notify(`saved telegram bot token → ${path}`, "info");
     },
   });
 
   pi.registerCommand("channel-connect", {
     description:
-      "Connect telegram (default profile). Optional: force — steal lock from another session",
+      "Connect channel: /channel-connect [telegram|qqbot] [force]",
     handler: async (args, ctx) => {
       if (!runtime) {
         ctx.ui.notify("pi-channels: runtime not started", "error");
@@ -408,133 +505,308 @@ export default function piChannels(pi: ExtensionAPI) {
       }
       latestCtx = ctx;
       const tokens = args.trim().split(/\s+/).filter(Boolean);
-      const channel = (tokens[0] || "telegram").toLowerCase();
       const force =
         tokens.includes("force") ||
         tokens.includes("--force") ||
         tokens.includes("-f");
-      if (channel !== "telegram" && channel !== "force" && channel !== "--force" && channel !== "-f") {
-        ctx.ui.notify(`only telegram in phase1 (got ${channel})`, "error");
-        return;
+      const raw =
+        tokens.find(
+          (t) =>
+            !["force", "--force", "-f"].includes(t.toLowerCase()),
+        ) ?? "";
+      let channel = raw.toLowerCase();
+      if (!channel || channel === "default") {
+        const file = await loadChannelsFile(agentDir);
+        channel = (file.defaultChannel ?? "telegram").toLowerCase();
       }
-      if (telegramConnected) {
-        ctx.ui.notify("telegram already connected in this session", "info");
-        return;
-      }
+      if (channel === "tg") channel = "telegram";
+      if (channel === "qq") channel = "qqbot";
 
-      const { profile, path } = await resolveTelegramProfile(
-        "default",
-        agentDir,
-      );
-      if (!profile.botToken) {
+      if (channel !== "telegram" && channel !== "qqbot") {
         ctx.ui.notify(
-          `no botToken in ${path}\nrun: /channel-setup <token>`,
+          `unknown channel '${channel}'. use: telegram | qqbot`,
           "error",
         );
         return;
       }
 
-      const sessionHint =
-        typeof pi.getSessionName === "function"
-          ? pi.getSessionName()
-          : undefined;
-
-      const lock = await acquireChannelLock({
-        agentDir,
-        channelId: LOCK_CHANNEL,
-        profileId: LOCK_PROFILE,
-        instanceId: runtime.instanceId,
-        sessionHint: sessionHint || runtime.instanceId.slice(0, 16),
-        botToken: profile.botToken,
-        force,
-      });
-
-      if (!lock.ok) {
+      if (connectedChannel) {
         ctx.ui.notify(
-          [
-            "telegram connect blocked: another session holds the poll lock",
-            formatLockHolder(lock.holder),
-            `lock file: ${lock.path}`,
-            lock.holderAlive && !lock.holderStale
-              ? "In the other session run: /channel-disconnect"
-              : "Holder looks dead/stale — retry or use: /channel-connect force",
-            "Steal only if sure: /channel-connect force",
-          ].join("\n"),
-          "error",
-        );
-        return;
-      }
-
-      lockHeld = true;
-
-      try {
-        const adapter = createTelegramAdapter({
-          botToken: profile.botToken,
-          allowedUserId: profile.allowedUserId,
-          lastUpdateId: profile.lastUpdateId,
-          render: profile.render,
-          onPaired: async (userId) => {
-            await updateTelegramAllowedUserId(userId, "default", agentDir);
-          },
-          onOffset: async (lastUpdateId) => {
-            await updateTelegramLastUpdateId(lastUpdateId, "default", agentDir);
-          },
-        });
-        runtime.registerAdapter(adapter);
-        await adapter.connect("default", {
-          instanceId: runtime.instanceId,
-          tempDir: join(agentDir, "tmp", "channels", "telegram"),
-          onEvent: async (event) => {
-            await runtime?.handleEvent(event);
-            refreshStatus();
-          },
-        });
-        telegramConnected = true;
-        startHeartbeat(runtime.instanceId);
-        refreshStatus(ctx);
-        ctx.ui.notify(
-          [
-            "telegram connected (pi-channels)",
-            `config: ${path}`,
-            `lock: ${lock.path}`,
-            force ? "lock: forced acquire" : "lock: acquired",
-            `render: ${profile.render?.finalFormat ?? "compat"}`,
-            profile.allowedUserId
-              ? `owner: ${profile.allowedUserId}`
-              : "owner: first DM pairs",
-          ].join("\n"),
+          `${connectedChannel} already connected in this session (disconnect first)`,
           "info",
         );
-      } catch (error) {
-        await releaseLockSafe(runtime.instanceId);
-        telegramConnected = false;
-        ctx.ui.notify(
-          `connect failed: ${error instanceof Error ? error.message : String(error)}`,
-          "error",
-        );
+        return;
       }
+
+      if (channel === "telegram") {
+        await connectTelegram({
+          runtime,
+          agentDir,
+          pi,
+          ctx,
+          force,
+          startHeartbeat,
+          releaseLockSafe,
+          markLockHeld: (channelId) => {
+            lockHeld = true;
+            lockChannelId = channelId;
+          },
+          setConnected: (v) => {
+            connectedChannel = v;
+          },
+          refreshStatus,
+        });
+        return;
+      }
+
+      await connectQqbot({
+        runtime,
+        agentDir,
+        pi,
+        ctx,
+        force,
+        startHeartbeat,
+        releaseLockSafe,
+        markLockHeld: (channelId) => {
+          lockHeld = true;
+          lockChannelId = channelId;
+        },
+        setConnected: (v) => {
+          connectedChannel = v;
+        },
+        refreshStatus,
+      });
     },
   });
 
   pi.registerCommand("channel-disconnect", {
-    description: "Disconnect telegram adapter and release poll lock",
+    description: "Disconnect active channel adapter and release lock",
     handler: async (_args, ctx) => {
       if (!runtime) {
         ctx.ui.notify("pi-channels: runtime not started", "error");
         return;
       }
       const instanceId = runtime.instanceId;
-      try {
-        await runtime.getAdapter("telegram")?.disconnect("default");
-      } catch {
-        // ignore
+      const which = connectedChannel;
+      if (which) {
+        try {
+          await runtime.getAdapter(which)?.disconnect("default");
+        } catch {
+          // ignore
+        }
       }
-      telegramConnected = false;
+      connectedChannel = undefined;
       await releaseLockSafe(instanceId);
       refreshStatus(ctx);
-      ctx.ui.notify("telegram disconnected (lock released)", "info");
+      ctx.ui.notify(
+        which
+          ? `${which} disconnected (lock released)`
+          : "no channel connected (lock cleared)",
+        "info",
+      );
     },
   });
+}
+
+type ConnectHelpers = {
+  runtime: ChannelRuntime;
+  agentDir: string;
+  pi: ExtensionAPI;
+  // Pi command ctx — notify is present on channel commands
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ctx: any;
+  force: boolean;
+  startHeartbeat: (instanceId: string, channelId: ConnectedChannel) => void;
+  releaseLockSafe: (instanceId: string | undefined) => Promise<void>;
+  markLockHeld: (channelId: ConnectedChannel) => void;
+  setConnected: (channel: ConnectedChannel | undefined) => void;
+  refreshStatus: (ctx?: SessionCtx) => void;
+};
+
+async function connectTelegram(h: ConnectHelpers): Promise<void> {
+  const { runtime, agentDir, pi, ctx, force } = h;
+  const { profile, path } = await resolveTelegramProfile("default", agentDir);
+  if (!profile.botToken) {
+    ctx.ui.notify(
+      `no botToken in ${path}\nrun: /channel-setup <token>`,
+      "error",
+    );
+    return;
+  }
+
+  const sessionHint =
+    typeof pi.getSessionName === "function" ? pi.getSessionName() : undefined;
+
+  const lock = await acquireChannelLock({
+    agentDir,
+    channelId: "telegram",
+    profileId: LOCK_PROFILE,
+    instanceId: runtime.instanceId,
+    sessionHint: sessionHint || runtime.instanceId.slice(0, 16),
+    botToken: profile.botToken,
+    force,
+  });
+
+  if (!lock.ok) {
+    ctx.ui.notify(
+      [
+        "telegram connect blocked: another session holds the poll lock",
+        formatLockHolder(lock.holder),
+        `lock file: ${lock.path}`,
+        lock.holderAlive && !lock.holderStale
+          ? "In the other session run: /channel-disconnect"
+          : "Holder looks dead/stale — retry or use: /channel-connect telegram force",
+        "Steal only if sure: /channel-connect telegram force",
+      ].join("\n"),
+      "error",
+    );
+    return;
+  }
+
+  h.markLockHeld("telegram");
+
+  try {
+    const adapter = createTelegramAdapter({
+      botToken: profile.botToken,
+      allowedUserId: profile.allowedUserId,
+      lastUpdateId: profile.lastUpdateId,
+      render: profile.render,
+      onPaired: async (userId) => {
+        await updateTelegramAllowedUserId(userId, "default", agentDir);
+      },
+      onOffset: async (lastUpdateId) => {
+        await updateTelegramLastUpdateId(lastUpdateId, "default", agentDir);
+      },
+    });
+    runtime.registerAdapter(adapter);
+    await adapter.connect("default", {
+      instanceId: runtime.instanceId,
+      tempDir: join(agentDir, "tmp", "channels", "telegram"),
+      onEvent: async (event) => {
+        await runtime.handleEvent(event);
+        h.refreshStatus();
+      },
+    });
+    h.setConnected("telegram");
+    h.startHeartbeat(runtime.instanceId, "telegram");
+    h.refreshStatus(ctx);
+    ctx.ui.notify(
+      [
+        "telegram connected (pi-channels)",
+        `config: ${path}`,
+        `lock: ${lock.path}`,
+        force ? "lock: forced acquire" : "lock: acquired",
+        `render: ${profile.render?.finalFormat ?? "compat"}`,
+        profile.allowedUserId
+          ? `owner: ${profile.allowedUserId}`
+          : "owner: first DM pairs",
+      ].join("\n"),
+      "info",
+    );
+  } catch (error) {
+    await h.releaseLockSafe(runtime.instanceId);
+    h.setConnected(undefined);
+    ctx.ui.notify(
+      `connect failed: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
+  }
+}
+
+async function connectQqbot(h: ConnectHelpers): Promise<void> {
+  const { runtime, agentDir, pi, ctx, force } = h;
+  const { profile, path } = await resolveQqbotProfile("default", agentDir);
+  if (!profile.appId || !profile.clientSecret) {
+    ctx.ui.notify(
+      `no qqbot appId/clientSecret in ${path}\nrun: /channel-setup qqbot <appId> <clientSecret>`,
+      "error",
+    );
+    return;
+  }
+
+  const sessionHint =
+    typeof pi.getSessionName === "function" ? pi.getSessionName() : undefined;
+
+  const lock = await acquireChannelLock({
+    agentDir,
+    channelId: "qqbot",
+    profileId: LOCK_PROFILE,
+    instanceId: runtime.instanceId,
+    sessionHint: sessionHint || runtime.instanceId.slice(0, 16),
+    botToken: `${profile.appId}:${profile.clientSecret.slice(0, 8)}`,
+    force,
+  });
+
+  if (!lock.ok) {
+    ctx.ui.notify(
+      [
+        "qqbot connect blocked: another session holds the gateway lock",
+        formatLockHolder(lock.holder),
+        `lock file: ${lock.path}`,
+        lock.holderAlive && !lock.holderStale
+          ? "In the other session run: /channel-disconnect"
+          : "Holder looks dead/stale — retry or use: /channel-connect qqbot force",
+        "Steal only if sure: /channel-connect qqbot force",
+      ].join("\n"),
+      "error",
+    );
+    return;
+  }
+
+  h.markLockHeld("qqbot");
+
+  try {
+    const adapter = createQqbotAdapter({
+      appId: profile.appId,
+      clientSecret: profile.clientSecret,
+      allowedOpenId: profile.allowedOpenId,
+      enableGroup: profile.enableGroup === true,
+      sandbox: profile.sandbox === true,
+      apiBase: profile.apiBase,
+      render: profile.render,
+      onPaired: async (openid) => {
+        await updateQqbotAllowedOpenId(openid, "default", agentDir);
+      },
+      log: (message) => {
+        console.error(`[pi-channels:qqbot] ${message}`);
+      },
+    });
+    runtime.registerAdapter(adapter);
+    await adapter.connect("default", {
+      instanceId: runtime.instanceId,
+      tempDir: join(agentDir, "tmp", "channels", "qqbot"),
+      onEvent: async (event) => {
+        await runtime.handleEvent(event);
+        h.refreshStatus();
+      },
+    });
+    h.setConnected("qqbot");
+    h.startHeartbeat(runtime.instanceId, "qqbot");
+    h.refreshStatus(ctx);
+    ctx.ui.notify(
+      [
+        "qqbot connected (pi-channels)",
+        `config: ${path}`,
+        `lock: ${lock.path}`,
+        force ? "lock: forced acquire" : "lock: acquired",
+        profile.sandbox ? "env: sandbox" : "env: production",
+        profile.enableGroup ? "group: enabled" : "group: c2c only",
+        `render: ${profile.render?.finalFormat ?? "plain"} (plain default; compat→markdown)`,
+        profile.allowedOpenId
+          ? `owner openid: ${profile.allowedOpenId}`
+          : "owner: first C2C pairs",
+        "note: progress drafts off; passive replies use msg_id",
+      ].join("\n"),
+      "info",
+    );
+  } catch (error) {
+    await h.releaseLockSafe(runtime.instanceId);
+    h.setConnected(undefined);
+    ctx.ui.notify(
+      `qqbot connect failed: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
+  }
 }
 
 async function toPiContent(

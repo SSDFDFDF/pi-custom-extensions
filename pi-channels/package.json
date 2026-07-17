@@ -2,7 +2,7 @@
   "name": "pi-channels",
   "private": true,
   "version": "0.0.1",
-  "description": "Multi-channel runtime adapters for live Pi sessions (Telegram first)",
+  "description": "Multi-channel runtime adapters for live Pi sessions (Telegram + QQ Bot)",
   "type": "module",
   "pi": {
     "extensions": ["./index.ts"]

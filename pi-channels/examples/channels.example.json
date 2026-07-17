@@ -17,6 +17,31 @@
         }
       }
     },
+    "qqbot": {
+      "profiles": {
+        "default": {
+          "enabled": true,
+          "appId": "REPLACE_APP_ID",
+          "clientSecret": "REPLACE_CLIENT_SECRET",
+          "allowedOpenId": "",
+          "enableGroup": false,
+          "sandbox": false,
+          "render": {
+            "finalFormat": "plain",
+            "sanitizeMarkdown": true,
+            "neutralizeMath": true,
+            "draftPreviews": false
+          },
+          "progress": {
+            "mode": "progress",
+            "startDelayMs": 2500,
+            "maxLines": 3,
+            "maxLineChars": 80,
+            "minEditIntervalMs": 2000
+          }
+        }
+      }
+    },
     "webhook": {
       "profiles": {
         "default": {

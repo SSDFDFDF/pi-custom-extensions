@@ -2,7 +2,7 @@
 
 Multi-channel companion runtime for live Pi sessions.
 
-Telegram is **adapter #1**. Core does not know Bot API types.  
+Adapters: **Telegram** + **QQ Bot** (C2C). Core does not know Bot API types.  
 **Greenfield** — no migration layer from `@llblab/pi-telegram`. Delete the old package when you switch.
 
 ## Packages
@@ -11,6 +11,7 @@ Telegram is **adapter #1**. Core does not know Bot API types.
 | --- | --- |
 | `@kun/pi-channels-core` | Queue, turns, targets, runtime |
 | `@kun/pi-channels-telegram` | Telegram poller + **compat HTML** replies (Web-safe default) |
+| `@kun/pi-channels-qqbot` | QQ Bot Gateway WS + passive C2C replies |
 | `@kun/pi-channels` | Pi extension (`/channel-*`) |
 
 ## Config
@@ -36,6 +37,20 @@ Only `~/.pi/agent/channels.json`:
           }
         }
       }
+    },
+    "qqbot": {
+      "profiles": {
+        "default": {
+          "enabled": true,
+          "appId": "…",
+          "clientSecret": "…",
+          "allowedOpenId": "",
+          "enableGroup": false,
+          "sandbox": false,
+          "render": { "finalFormat": "plain" },
+          "progress": { "mode": "progress" }
+        }
+      }
     }
   }
 }
@@ -45,22 +60,41 @@ Only `~/.pi/agent/channels.json`:
 
 ```text
 /channel-setup <botToken>
-/channel-connect [telegram]     # acquire poll lock + start getUpdates
-/channel-connect force          # steal lock (only if sure other session is dead)
-/channel-disconnect             # stop poll + release lock
+/channel-setup qqbot <appId> <clientSecret> [sandbox]
+/channel-connect [telegram|qqbot]   # acquire lock + start transport
+/channel-connect qqbot force        # steal lock if sure other session is dead
+/channel-disconnect                 # stop + release lock
 /channel-status
 ```
 
-### Connect lock (no double getUpdates)
+### Connect lock (one transport owner per profile)
 
-Only one Pi session may poll a given telegram profile at a time.
+Only one Pi session may own a given channel profile at a time.
 
-- Lock file: `~/.pi/agent/tmp/channels/locks/telegram-default.json`
+- Lock files: `~/.pi/agent/tmp/channels/locks/<channel>-default.json`
 - Heartbeat every 15s; stale after ~45s or dead pid can be taken over
 - Second `/channel-connect` fails with holder info unless `force`
-- Always `/channel-disconnect` before connecting another session
+- Always `/channel-disconnect` before connecting another session / channel
 
-Telegram DM controls: `/abort` `/stop` `/next` `/continue`
+DM controls (Telegram + QQ C2C): `/abort` `/stop` `/next` `/continue`
+
+### QQ Bot notes
+
+- Register at [q.qq.com](https://q.qq.com/) → create bot → AppID + AppSecret
+- Prefer **passive** replies (`msg_id`); proactive C2C is ~4 msgs/user/month
+- Default progress drafts are **off** (passive reply quota)
+- First C2C message pairs `allowedOpenId` (solo operator)
+- Optional `enableGroup: true` for `GROUP_AT_MESSAGE_CREATE`
+- Sandbox: `/channel-setup qqbot <appId> <secret> sandbox`
+- **Inbound media**: image/file attachments download into temp and enter Pi (images as multimodal)
+- **Outbound media**: `channel_attach` uploads via `/v2/users|groups/.../files` then `msg_type:7`
+- **Text format**: default **`plain`** (`msg_type:0`). Optional markdown: set `render.finalFormat` to `compat`/`native` (`msg_type:2`, falls back to plain on reject).
+- **Progress**: not Telegram-style edit-in-place. **One** sticky bubble on first tool: `💪 正在执行中` (Unicode emoji; no recall on settle). Later progress ticks are ignored to save passive reply quota.
+- **Faces (C2C)**: real 小黄脸 embeds don't render in bot private chat. Instead:
+  - classic slash codes work: `/fendou` `/wx` `/微笑` `/gz` … → Unicode (💪 😊 …)
+  - `/fendou` alone is a fun command (not sent to the model)
+  - `<faceType=…>` / `<emoji:N>` auto-map to Unicode
+  - reserved: `/abort` `/stop` `/next` `/continue` `/help` (not faces)
 
 ## Install (local)
 
@@ -121,6 +155,6 @@ retry on 429/5xx/network, and fall back to **IPv4-only HTTPS** when dual-stack
 
 ## Phase
 
-- **Now:** solo Telegram, media in, progress draft, HTML final + reply anchor
-- **Next:** outbound attach tool, proactive push, second channel (webhook)
+- **Now:** Telegram (full) + QQ Bot C2C (passive final, progress off, media in/out)
+- **Next:** QQ group polish, stream_messages, proactive push policy
 - **Not v1:** Threaded multi-instance bus, full menu parity with pi-telegram

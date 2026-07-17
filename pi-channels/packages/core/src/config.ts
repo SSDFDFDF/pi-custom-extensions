@@ -20,12 +20,31 @@ export interface TelegramProfileConfig {
   progress?: Partial<ProgressPolicy>;
 }
 
+/** QQ Bot OpenAPI v2 (C2C / optional group @). */
+export interface QqbotProfileConfig {
+  enabled?: boolean;
+  appId?: string;
+  clientSecret?: string;
+  /** Paired operator openid; first C2C pairs if missing. */
+  allowedOpenId?: string;
+  /** Accept GROUP_AT_MESSAGE_CREATE (default false). */
+  enableGroup?: boolean;
+  /** Use sandbox.api.sgroup.qq.com */
+  sandbox?: boolean;
+  apiBase?: string;
+  render?: Partial<RenderPolicy>;
+  progress?: Partial<ProgressPolicy>;
+}
+
 export interface ChannelsFile {
   defaultChannel?: string;
   proactivePush?: boolean;
   channels?: {
     telegram?: {
       profiles?: Record<string, TelegramProfileConfig>;
+    };
+    qqbot?: {
+      profiles?: Record<string, QqbotProfileConfig>;
     };
     [channelId: string]:
       | {
@@ -179,6 +198,85 @@ export async function updateTelegramAllowedUserId(
       ...file.channels,
       telegram: {
         ...(file.channels?.telegram ?? {}),
+        profiles,
+      },
+    },
+  };
+  await saveChannelsFile(next, agentDir);
+}
+
+export async function resolveQqbotProfile(
+  profileId: ProfileId = "default",
+  agentDir?: string,
+): Promise<{ profile: QqbotProfileConfig; path: string }> {
+  const path = channelsConfigPath(agentDir);
+  const file = await loadChannelsFile(agentDir);
+  const fromChannels = file.channels?.qqbot?.profiles?.[profileId];
+  if (!fromChannels) {
+    return {
+      profile: {
+        enabled: false,
+        render: normalizeRenderPolicy({
+          // default plain (msg_type 0); set finalFormat compat/native for markdown
+          finalFormat: "plain",
+          sanitizeMarkdown: true,
+          neutralizeMath: true,
+          draftPreviews: false,
+        }),
+        progress: normalizeProgressPolicy({
+          mode: "progress",
+          startDelayMs: 2500,
+          maxLines: 3,
+          maxLineChars: 80,
+          minEditIntervalMs: 2000,
+        }),
+      },
+      path,
+    };
+  }
+  return {
+    profile: {
+      ...fromChannels,
+      render: normalizeRenderPolicy(
+        fromChannels.render ?? {
+          finalFormat: "plain",
+          sanitizeMarkdown: true,
+          neutralizeMath: true,
+          draftPreviews: false,
+        },
+      ),
+      progress: normalizeProgressPolicy(
+        fromChannels.progress ?? {
+          mode: "progress",
+          startDelayMs: 2500,
+          maxLines: 3,
+          maxLineChars: 80,
+          minEditIntervalMs: 2000,
+        },
+      ),
+    },
+    path,
+  };
+}
+
+/** Persist allowedOpenId after first C2C pairing. */
+export async function updateQqbotAllowedOpenId(
+  allowedOpenId: string,
+  profileId: ProfileId = "default",
+  agentDir?: string,
+): Promise<void> {
+  const file = await loadChannelsFile(agentDir);
+  const profiles = {
+    ...(file.channels?.qqbot?.profiles ?? {}),
+  };
+  const current = profiles[profileId] ?? {};
+  profiles[profileId] = { ...current, allowedOpenId };
+  const next: ChannelsFile = {
+    ...file,
+    channels: {
+      ...file.channels,
+      qqbot: {
+        ...(file.channels?.qqbot ?? {}),
         profiles,
       },
     },
