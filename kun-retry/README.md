@@ -5,9 +5,9 @@ Local Pi extension that replaces `@narumitw/pi-retry`.
 ## Features
 
 - **maxRetries / baseDelayMs override** — written into `~/.pi/agent/settings.json` so Pi’s built-in `_prepareRetry` uses your budget
-- **Extra HTTP status codes** in provider `errorMessage` (e.g. 401, 403)
+- **Extra HTTP status codes** in provider `errorMessage` (e.g. 401, 403, Cloudflare 520–524)
 - **Extra error regex patterns**
-- **Legacy pi-retry matchers** (empty-detail Unknown error, Codex WS limit, Codex generic retry)
+- **Legacy transport matchers** (empty-detail Unknown error, Codex WS limit, OpenAI Responses premature stream end, WebSocket stream closed before completion, no response body, network errno, bad gateway)
 - **Stall stream watchdog** (default 90s)
 - **Empty-response retry** — a completed-but-empty assistant turn (HTTP 200, no answer text and no tool calls; thinking-only turns count as empty too) is rewritten into a retryable error so Pi retries it
 - **`/retry-nl`** — unlimited mode: *any* assistant error becomes retryable, with a huge `maxRetries` written to settings
@@ -38,7 +38,7 @@ Then `/reload` or restart Pi.
   "enabled": true,
   "maxRetries": 10,
   "baseDelayMs": 2000,
-  "statusCodes": [401, 403, 408, 425, 429, 500, 502, 503, 504, 529],
+  "statusCodes": [401, 403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529],
   "errorPatterns": [],
   "stallTimeoutMs": 90000,
   "nl": false,

@@ -1,0 +1,29 @@
+{
+  "defaultChannel": "telegram",
+  "proactivePush": true,
+  "channels": {
+    "telegram": {
+      "profiles": {
+        "default": {
+          "enabled": true,
+          "botToken": "REPLACE_ME",
+          "allowedUserId": 0,
+          "render": {
+            "finalFormat": "compat",
+            "sanitizeMarkdown": true,
+            "neutralizeMath": true,
+            "draftPreviews": false
+          }
+        }
+      }
+    },
+    "webhook": {
+      "profiles": {
+        "default": {
+          "enabled": false,
+          "note": "phase 4 — proves multi-channel core"
+        }
+      }
+    }
+  }
+}

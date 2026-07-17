@@ -1,0 +1,21 @@
+{
+  "name": "@kun/pi-channels",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension: multi-channel companions (Telegram first)",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@kun/pi-channels-core": "0.0.1",
+    "@kun/pi-channels-telegram": "0.0.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.6"
+  },
+  "license": "MIT"
+}

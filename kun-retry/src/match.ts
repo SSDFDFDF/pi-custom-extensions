@@ -75,7 +75,11 @@ export function neutralizeNonRetryable(errorMessage: string): { text: string; ne
 	return { text, neutralized };
 }
 
-/** Legacy pi-retry patterns (always enabled). */
+/**
+ * Built-in transport / stream failures that Pi's classifier misses.
+ * Always enabled (not gated on user errorPatterns). Keep these conservative:
+ * only transient disconnect / empty-body style errors, not auth or quota.
+ */
 export const LEGACY_PATTERNS: Array<{ tag: string; label: string; re: RegExp }> = [
 	{
 		tag: "[unknown-error-retry]",
@@ -86,6 +90,44 @@ export const LEGACY_PATTERNS: Array<{ tag: string; label: string; re: RegExp }> 
 		tag: "[codex-websocket-limit-retry]",
 		label: "Codex websocket connection limit",
 		re: /websocket[_\s-]*connection[_\s-]*limit[_\s-]*reached|create a new websocket connection to continue/i,
+	},
+	// Pi builtin covers "ended without" and Anthropic "before message_stop",
+	// but not OpenAI Responses' "before a terminal response event".
+	{
+		tag: "[openai-responses-stream-retry]",
+		label: "OpenAI Responses premature stream end",
+		re: /stream ended before a terminal(?: response)? event/i,
+	},
+	// Codex WS: "WebSocket stream closed before response.completed".
+	// Builtin has websocket.?closed but that does not match "stream closed".
+	{
+		tag: "[websocket-stream-closed-retry]",
+		label: "WebSocket stream closed before completion",
+		re: /(?:web\s*socket\s+)?stream closed before response\.completed|websocket stream closed before/i,
+	},
+	// Empty HTTP/SSE body from Codex / Anthropic stream iterators.
+	{
+		tag: "[no-response-body-retry]",
+		label: "provider response with no body",
+		re: /\bNo response body\b|response with no body|iterate over an?\s+\w+\s+response with no body/i,
+	},
+	// Generic provider catch-alls that often wrap transient upstream failures.
+	{
+		tag: "[unknown-error-occurred-retry]",
+		label: "generic unknown provider error",
+		re: /\bAn unknown error occurred\b|Provider returned an error stop reason/i,
+	},
+	// Node/undici errno strings that are not wrapped as "connection error".
+	{
+		tag: "[network-errno-retry]",
+		label: "network errno / socket failure",
+		re: /\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ENOTFOUND|ETIMEDOUT|EPIPE|EHOSTUNREACH|ENETUNREACH|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET)\b/i,
+	},
+	// Plain gateway text without an HTTP status token.
+	{
+		tag: "[bad-gateway-retry]",
+		label: "bad gateway / cloudflare edge failure",
+		re: /\bbad\s*gateway\b|\bcloudflare\b.*\b(?:error|timeout|unavailable)\b|\borigin is unreachable\b/i,
 	},
 ];
 

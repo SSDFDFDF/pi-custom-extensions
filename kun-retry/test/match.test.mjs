@@ -56,6 +56,86 @@ test("legacy unknown error", () => {
 	assert.equal(m.tag, "[unknown-error-retry]");
 });
 
+test("legacy OpenAI Responses premature stream end", () => {
+	const m = matchRetryableError("OpenAI Responses stream ended before a terminal response event", {
+		nl: false,
+		statusCodes: [],
+		errorPatterns: [],
+	});
+	assert.ok(m);
+	assert.equal(m.tag, "[openai-responses-stream-retry]");
+});
+
+test("legacy WebSocket stream closed before completion", () => {
+	const m = matchRetryableError("WebSocket stream closed before response.completed", {
+		nl: false,
+		statusCodes: [],
+		errorPatterns: [],
+	});
+	assert.ok(m);
+	assert.equal(m.tag, "[websocket-stream-closed-retry]");
+});
+
+test("legacy no response body variants", () => {
+	for (const msg of [
+		"No response body",
+		"Attempted to iterate over an Anthropic response with no body",
+	]) {
+		const m = matchRetryableError(msg, { nl: false, statusCodes: [], errorPatterns: [] });
+		assert.ok(m, msg);
+		assert.equal(m.tag, "[no-response-body-retry]");
+	}
+});
+
+test("legacy generic unknown / error stop reason", () => {
+	for (const msg of ["An unknown error occurred", "Provider returned an error stop reason"]) {
+		const m = matchRetryableError(msg, { nl: false, statusCodes: [], errorPatterns: [] });
+		assert.ok(m, msg);
+		assert.equal(m.tag, "[unknown-error-occurred-retry]");
+	}
+});
+
+test("legacy network errno", () => {
+	for (const msg of ["read ECONNRESET", "connect ECONNREFUSED 127.0.0.1:1", "getaddrinfo ENOTFOUND api.example.com"]) {
+		const m = matchRetryableError(msg, { nl: false, statusCodes: [], errorPatterns: [] });
+		assert.ok(m, msg);
+		assert.equal(m.tag, "[network-errno-retry]");
+	}
+});
+
+test("legacy bad gateway text", () => {
+	const m = matchRetryableError("Bad gateway", {
+		nl: false,
+		statusCodes: [],
+		errorPatterns: [],
+	});
+	assert.ok(m);
+	assert.equal(m.tag, "[bad-gateway-retry]");
+});
+
+test("HTTP 520 is retryable via status codes", () => {
+	const m = matchRetryableError("520 status code (no body)", {
+		nl: false,
+		statusCodes: [520, 521, 522, 523, 524],
+		errorPatterns: [],
+	});
+	assert.ok(m);
+	assert.equal(m.tag, "[kun-retry-http-520]");
+});
+
+test("user abort / quota remain non-matching in bounded mode", () => {
+	for (const msg of [
+		"Operation aborted",
+		"Request was aborted",
+		"insufficient_quota",
+		"Monthly usage limit reached",
+		"No API key for provider: foo",
+	]) {
+		const m = matchRetryableError(msg, { nl: false, statusCodes: [401, 403, 520], errorPatterns: [] });
+		assert.equal(m, undefined, msg);
+	}
+});
+
 test("nl neutralizes non-retryable quota/billing tokens", () => {
 	const { text, neutralized } = neutralizeNonRetryable("insufficient_quota: billing problem");
 	assert.ok(neutralized.length >= 2);

@@ -1,0 +1,17 @@
+{
+  "name": "pi-channels",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Multi-channel runtime adapters for live Pi sessions (Telegram first)",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test packages/*/src/**/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "MIT"
+}

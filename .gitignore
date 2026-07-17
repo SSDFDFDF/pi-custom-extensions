@@ -17,5 +17,6 @@ tmp/
 *.key
 auth.json
 telegram.json
+channels.json
 .env
 .env.*

@@ -49,7 +49,8 @@ export const DEFAULT_CONFIG: KunRetryConfig = {
 	enabled: true,
 	maxRetries: 10,
 	baseDelayMs: 2000,
-	statusCodes: [401, 403, 408, 425, 429, 500, 502, 503, 504, 529],
+	// 520–524: Cloudflare edge/origin transient failures (524 also in Pi builtin).
+	statusCodes: [401, 403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529],
 	errorPatterns: [],
 	stallTimeoutMs: 90_000,
 	nl: false,
