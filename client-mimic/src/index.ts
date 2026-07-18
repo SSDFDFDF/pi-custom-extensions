@@ -32,9 +32,29 @@
  *   --mimic <profile>      activate a profile for this launch (session-only)
  */
 
-import { createHash, randomUUID } from "node:crypto";
-import { hostname } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	ensureClaudeMetadata,
+	mergeBetaFlags,
+	prependClaudeBillingSystem,
+} from "./claude-body.ts";
+import {
+	loadOrCreateDeviceId,
+	resolveClaudeSessionId,
+} from "./claude-identity.ts";
+import {
+	advanceWindowChain,
+	createInitialIdentityState,
+	ensureCodexIdentity,
+	loadIdentityStore,
+	loadOrCreateInstallationId,
+	persistIdentityState,
+	resolveCodexIdentityOnSessionStart,
+	saveIdentityStore,
+	uuidV7,
+	type CodexIdentityState,
+	type CodexIdentityStore,
+} from "./codex-identity.ts";
 import {
 	defaultConfigPath,
 	formatStatus,
@@ -65,10 +85,12 @@ export default function clientMimic(pi: ExtensionAPI) {
 	// user runs /mimic use, which clears the override), later sessions must not
 	// resurrect the flag and silently override an explicit config choice.
 	let flagConsumed = false;
-	// Stable per-session id reused for {session_id}. Regenerated on each session_start.
-	let sessionId = randomUUID();
-	// Stable per-machine device id for Claude Code metadata.user_id (hashed host+user).
-	const deviceId = stableDeviceId();
+	// Codex identity (session tree + window chain + turn). See codex-identity.ts.
+	const identityStore: CodexIdentityStore = loadIdentityStore();
+	let identity: CodexIdentityState = createInitialIdentityState(loadOrCreateInstallationId());
+	// Claude Code: stable device_id (persisted) + session_id as UUIDv4.
+	const deviceId = loadOrCreateDeviceId();
+	let claudeSessionId = resolveClaudeSessionId(undefined);
 
 	const refresh = () => {
 		cfg = loadConfig();
@@ -89,12 +111,37 @@ export default function clientMimic(pi: ExtensionAPI) {
 		return cfg.profiles[key] ?? null;
 	};
 
-	const templateCtx = (profile: MimicProfile, ctx: ExtensionContext): TemplateContext => ({
-		version: profile.version,
-		sessionId: ctx.sessionManager.getSessionId?.() ?? sessionId,
-		uuid: () => randomUUID(),
-		vars: profile.templateVars,
-	});
+	const persistCurrentIdentity = () => {
+		persistIdentityState(identityStore, identity);
+		saveIdentityStore(identityStore);
+	};
+
+	/** Session id exposed in headers/body: Claude profile wants v4; Codex keeps tree ids. */
+	const headerSessionId = (profileKey: string): string => {
+		if (profileKey === "claude-code") return claudeSessionId;
+		return identity.sessionId;
+	};
+
+	const templateCtx = (profile: MimicProfile, _ctx: ExtensionContext): TemplateContext => {
+		const key = effectiveActive();
+		const sessionId = headerSessionId(key);
+		return {
+			version: profile.version,
+			sessionId,
+			// Codex thread/window fields still come from identity; Claude ignores them.
+			threadId: identity.threadId,
+			parentThreadId: identity.parentThreadId,
+			windowId: identity.windowId,
+			firstWindowId: identity.firstWindowId,
+			previousWindowId: identity.previousWindowId,
+			windowNumber: identity.windowNumber,
+			turnId: identity.turnId,
+			installationId: identity.installationId,
+			uuid: () => crypto.randomUUID(),
+			uuidV7: () => uuidV7(),
+			vars: profile.templateVars,
+		};
+	};
 
 	const updateFooter = (ctx: Pick<ExtensionContext, "hasUI" | "ui">) => {
 		if (!ctx.hasUI) return;
@@ -108,9 +155,17 @@ export default function clientMimic(pi: ExtensionAPI) {
 
 	// ── Lifecycle ────────────────────────────────────────────────────────────
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		refresh();
-		sessionId = randomUUID();
+		const resolved = resolveCodexIdentityOnSessionStart(event, ctx.sessionManager, identityStore);
+		identity = {
+			...resolved,
+			turnId: uuidV7(),
+			installationId: identity.installationId,
+		};
+		// Claude session: UUIDv4 (real CLI). Mapped stably per pi session when pi uses v7.
+		claudeSessionId = resolveClaudeSessionId(ctx.sessionManager.getSessionId?.());
+		persistCurrentIdentity();
 
 		if (!flagConsumed) {
 			flagConsumed = true;
@@ -130,8 +185,28 @@ export default function clientMimic(pi: ExtensionAPI) {
 		if (ctx.hasUI) {
 			const p = effectiveProfile();
 			if (p) {
-				ctx.ui.notify(`client-mimic active: ${effectiveActive()} (${p.label} v${p.version})`, "info");
+				const tree =
+					identity.parentThreadId != null
+						? ` child thread=${identity.threadId.slice(0, 8)}… session=${identity.sessionId.slice(0, 8)}…`
+						: ` root=${identity.sessionId.slice(0, 8)}…`;
+				ctx.ui.notify(
+					`client-mimic active: ${effectiveActive()} (${p.label} v${p.version})${tree} win#${identity.windowNumber}`,
+					"info",
+				);
 			}
+		}
+	});
+
+	// Compact advances the Codex context-window chain (session/thread unchanged).
+	pi.on("session_compact", (_event, ctx) => {
+		const win = advanceWindowChain(identity);
+		identity = { ...identity, ...win };
+		persistCurrentIdentity();
+		if (ctx.hasUI && effectiveProfile()?.ensureCodexIdentity) {
+			ctx.ui.notify(
+				`client-mimic: context window advanced → #${identity.windowNumber} ${identity.windowId.slice(0, 8)}…`,
+				"info",
+			);
 		}
 	});
 
@@ -141,6 +216,10 @@ export default function clientMimic(pi: ExtensionAPI) {
 		const profile = effectiveProfile();
 		if (!profile) return;
 
+		// One turn_id per outbound request when mimicking Codex.
+		if (profile.ensureCodexIdentity) {
+			identity = { ...identity, turnId: uuidV7() };
+		}
 		const tctx = templateCtx(profile, ctx);
 
 		// 1. Strip pi's own identifying headers (case-insensitive match).
@@ -181,6 +260,11 @@ export default function clientMimic(pi: ExtensionAPI) {
 			}
 
 			const resolved = resolveTemplate(rawValue, tctx);
+			// Empty resolved values delete the header (e.g. parent_thread_id on root).
+			if (!resolved) {
+				event.headers[name] = null;
+				continue;
+			}
 			if (lower === "anthropic-beta" && existingValue) {
 				event.headers[name] = mergeBetaFlags(existingValue, resolved);
 			} else {
@@ -207,13 +291,31 @@ export default function clientMimic(pi: ExtensionAPI) {
 
 		// 2. Claude Code metadata.user_id (JSON string with device/session).
 		if (profile.ensureMetadataUserId) {
-			const sid = ctx.sessionManager.getSessionId?.() ?? sessionId;
-			if (ensureClaudeMetadata(payload, deviceId, sid)) changed = true;
+			if (ensureClaudeMetadata(payload, deviceId, claudeSessionId)) changed = true;
 		}
 
 		// 3. Claude Code billing/identity system preamble.
 		if (profile.prependBillingSystem) {
 			if (prependClaudeBillingSystem(payload, profile.version)) changed = true;
+		}
+
+		// 4. Codex Responses identity (prompt_cache_key + client_metadata).
+		if (profile.ensureCodexIdentity) {
+			if (
+				ensureCodexIdentity(payload, {
+					sessionId: identity.sessionId,
+					threadId: identity.threadId,
+					windowId: identity.windowId,
+					installationId: identity.installationId,
+					parentThreadId: identity.parentThreadId,
+					firstWindowId: identity.firstWindowId,
+					previousWindowId: identity.previousWindowId,
+					windowNumber: identity.windowNumber,
+					turnId: identity.turnId,
+				})
+			) {
+				changed = true;
+			}
 		}
 
 		return changed ? payload : undefined;
@@ -438,11 +540,7 @@ export default function clientMimic(pi: ExtensionAPI) {
 			ctx.ui.notify(`Unknown profile "${key}". Available: ${Object.keys(cfg.profiles).join(", ")}`, "error");
 			return;
 		}
-		const tctx: TemplateContext = {
-			version: profile.version,
-			sessionId: ctx.sessionManager.getSessionId?.() ?? sessionId,
-			uuid: () => "<uuid>",
-		};
+		const tctx = templateCtx(profile, ctx);
 		const lines: string[] = [`${key} — ${profile.label} v${profile.version}`];
 		if (profile.npmPackage) lines.push(`npm: ${profile.npmPackage}`);
 		lines.push("headers:");
@@ -455,6 +553,19 @@ export default function clientMimic(pi: ExtensionAPI) {
 		if (bodyKeys.length) lines.push(`bodyPatch: ${JSON.stringify(profile.bodyPatch)}`);
 		lines.push(`ensureMetadataUserId: ${profile.ensureMetadataUserId}`);
 		lines.push(`prependBillingSystem: ${profile.prependBillingSystem}`);
+		lines.push(`ensureCodexIdentity: ${profile.ensureCodexIdentity}`);
+		lines.push(
+			`ids: session=${identity.sessionId} thread=${identity.threadId}` +
+				(identity.parentThreadId ? ` parent_thread=${identity.parentThreadId}` : ""),
+		);
+		lines.push(
+			`window: #${identity.windowNumber} current=${identity.windowId}` +
+				` first=${identity.firstWindowId}` +
+				(identity.previousWindowId ? ` previous=${identity.previousWindowId}` : ""),
+		);
+		lines.push(`turn_id: ${identity.turnId}`);
+		lines.push(`installation_id: ${identity.installationId}`);
+		lines.push(`tree: ${identity.parentThreadId ? "child" : "root"}`);
 		const varKeys = Object.keys(profile.templateVars);
 		if (varKeys.length) lines.push(`templateVars: ${JSON.stringify(profile.templateVars)}`);
 		lines.push(`systemPrompt: ${describeSpec(profile.systemPrompt)}`);
@@ -468,124 +579,4 @@ function describeSpec(spec: { mode: string; file?: string; apply?: string }): st
 		return `file (${spec.apply ?? "replace"}: ${spec.file ?? "<unset>"})`;
 	}
 	return spec.mode;
-}
-
-/** Stable 64-char hex device id (sha256 of host+user), matching Claude Code's shape. */
-function stableDeviceId(): string {
-	const seed = `${hostname()}|${process.env.USER ?? process.env.USERNAME ?? ""}|${process.platform}|${process.arch}`;
-	return createHash("sha256").update(seed).digest("hex");
-}
-
-/** Union comma-separated anthropic-beta flags, preserving first-seen order. */
-function mergeBetaFlags(existing: string, incoming: string): string {
-	const seen = new Set<string>();
-	const out: string[] = [];
-	for (const part of `${existing},${incoming}`.split(",")) {
-		const flag = part.trim();
-		if (!flag || seen.has(flag)) continue;
-		seen.add(flag);
-		out.push(flag);
-	}
-	return out.join(",");
-}
-
-/**
- * Ensure Anthropic Messages payload has Claude Code's metadata.user_id.
- * Real Claude Code sends a JSON string:
- *   {"device_id":"...","account_uuid":"","session_id":"..."}
- * Returns true if the payload was modified.
- */
-function ensureClaudeMetadata(
-	payload: Record<string, unknown>,
-	deviceId: string,
-	sessionId: string,
-): boolean {
-	const existingMeta =
-		payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
-			? ({ ...(payload.metadata as Record<string, unknown>) } as Record<string, unknown>)
-			: {};
-	if (typeof existingMeta.user_id === "string" && existingMeta.user_id.trim()) {
-		return false;
-	}
-	existingMeta.user_id = JSON.stringify({
-		device_id: deviceId,
-		account_uuid: "",
-		session_id: sessionId,
-	});
-	payload.metadata = existingMeta;
-	return true;
-}
-
-const CLAUDE_AGENT_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
-
-/**
- * Prepend Claude Code's billing-header + Agent SDK identity blocks onto the
- * provider payload's `system` field. Handles both string and content-block
- * array forms. Returns true if modified.
- */
-function prependClaudeBillingSystem(payload: Record<string, unknown>, version: string): boolean {
-	const billing = "x-anthropic-billing-header: cc_version=" + version + "; cc_entrypoint=cli;";
-	const sys = payload.system;
-
-	// Only treat a leading system block that *starts with* the billing header as
-	// already present. A mere substring match is too broad (seed prompts may
-	// mention the header name in documentation text).
-	if (hasLeadingBillingHeader(sys)) return false;
-
-	if (sys == null || sys === "") {
-		payload.system = [
-			{ type: "text", text: billing },
-			{ type: "text", text: CLAUDE_AGENT_IDENTITY },
-		];
-		return true;
-	}
-
-	if (typeof sys === "string") {
-		// Keep as content blocks so the gateway can match the first block exactly
-		// the way the real CLI does (array of text blocks).
-		const rest = sys.startsWith(CLAUDE_AGENT_IDENTITY)
-			? [{ type: "text", text: sys }]
-			: [
-					{ type: "text", text: CLAUDE_AGENT_IDENTITY },
-					{ type: "text", text: sys },
-				];
-		payload.system = [{ type: "text", text: billing }, ...rest];
-		return true;
-	}
-
-	if (Array.isArray(sys)) {
-		const blocks = sys.slice();
-		const hasIdentity = systemContains(sys, "Claude Agent SDK");
-		const prepend: Array<Record<string, unknown>> = [{ type: "text", text: billing }];
-		if (!hasIdentity) prepend.push({ type: "text", text: CLAUDE_AGENT_IDENTITY });
-		payload.system = prepend.concat(blocks);
-		return true;
-	}
-
-	return false;
-}
-
-/** True only when the first system block/string starts with the billing header. */
-function hasLeadingBillingHeader(sys: unknown): boolean {
-	const prefix = "x-anthropic-billing-header:";
-	if (typeof sys === "string") return sys.trimStart().startsWith(prefix);
-	if (!Array.isArray(sys) || sys.length === 0) return false;
-	const first = sys[0];
-	if (typeof first === "string") return first.trimStart().startsWith(prefix);
-	if (first && typeof first === "object" && typeof (first as { text?: unknown }).text === "string") {
-		return (first as { text: string }).text.trimStart().startsWith(prefix);
-	}
-	return false;
-}
-
-function systemContains(sys: unknown, needle: string): boolean {
-	if (typeof sys === "string") return sys.includes(needle);
-	if (!Array.isArray(sys)) return false;
-	for (const block of sys) {
-		if (typeof block === "string" && block.includes(needle)) return true;
-		if (block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string") {
-			if (((block as { text: string }).text).includes(needle)) return true;
-		}
-	}
-	return false;
 }

@@ -17,67 +17,172 @@ fingerprint.
 Intended for **interop with your own gateway**, not for evading a third-party
 service's client checks.
 
+## Architecture
+
+```
+src/
+  index.ts                 # pi hooks + /mimic commands only
+  config.ts                # profiles, config load/save, resolveTemplate
+  codex-identity.ts        # Codex session/thread/window/turn + store + body inject
+  claude-identity.ts       # Claude session v4 + device_id
+  claude-body.ts           # Claude metadata.user_id + billing system + beta merge
+  fs-util.ts               # atomic write + exclusive lockfile
+  ids.ts                   # shared UUID helpers
+  *.test.ts                # unit tests (node:test)
+  system-prompt.ts         # neutral / file prompt modes
+  update.ts                # /mimic update via npm registry
+prompts/
+  codex.md
+  claude-code.md
+```
+
+| module | responsibility |
+|--------|----------------|
+| `codex-identity.ts` | UUIDv7, tree resolve, window chain, locked store I/O, `ensureCodexIdentity` |
+| `claude-identity.ts` / `claude-body.ts` | Claude session/device + body helpers |
+| `fs-util.ts` | Atomic write + cross-process lock (`.lock` via `O_EXCL`) |
+| `config.ts` | Profile schema, defaults, placeholder resolution |
+| `index.ts` | Wire `pi.on(...)` and commands only |
+
+Identity stores use **atomic write** and **exclusive lockfiles** (with merge-on-write
+for the Codex identity map) so parallel pi/subagent processes are less likely to
+clobber mappings.
+
+Codex runtime state is a single `CodexIdentityState` object (session/thread/window/turn).
+Mapping is persisted under:
+
+| path | purpose |
+|------|---------|
+| `~/.pi/agent/client-mimic.identity.json` | pi session id → Codex session/thread/window chain |
+| `~/.pi/agent/client-mimic.device_id` | Claude Code device_id (64 hex, machine-stable) |
+| `~/.pi/agent/client-mimic.claude-sessions.json` | pi session id → Claude session UUIDv4 when pi is not v4 |
+| `~/.codex/installation_id` (preferred) or `~/.pi/agent/client-mimic.installation_id` | machine-stable installation id |
+
+Identity store writes use temp file + `rename` (atomic on the same filesystem).
+
+### Dev commands
+
+```bash
+cd ~/.pi/agent/extensions/client-mimic
+npm test    # node --test codex-identity tests
+npm run check
+```
+
 ## Profiles
 
-Two built-in profiles, both starting inactive (`active: "off"`):
+Two built-in profiles (default `active` may be set in your live config):
 
-| key           | client                          | notable headers |
-|---------------|---------------------------------|-----------------|
-| `codex`       | OpenAI Codex CLI (`codex_cli_rs`) | `originator`, `User-Agent: codex_cli_rs/{version} ({os_type} {os_version}; {uname_arch}) {terminal}`, `OpenAI-Beta: responses=experimental`, `version`, `session-id`. Empty `bodyPatch` by default. |
-| `claude-code` | Anthropic Claude Code           | `User-Agent: claude-cli/{version} (external, cli)`, `x-app: cli`, `X-Claude-Code-Session-Id`, `anthropic-version`, `anthropic-dangerous-direct-browser-access`, `anthropic-beta` (Claude Code identity flags, merged with any betas pi already set), and the `X-Stainless-*` SDK header set. Also rewrites the Anthropic body: injects `metadata.user_id` and prepends the billing/identity system blocks. |
+| key           | client                          | notable behavior |
+|---------------|---------------------------------|------------------|
+| `codex`       | OpenAI Codex CLI (`codex_cli_rs`) | Full identity stack (below) + UA / originator / version / OpenAI-Beta |
+| `claude-code` | Anthropic Claude Code           | CLI-shaped headers + Stainless set + body `metadata.user_id` + billing system blocks |
 
-The header sets are modeled on what the real clients actually send on the wire:
+### Codex identity model (aligned with openai/codex)
 
-- **Codex** builds `User-Agent` as
-  `codex_cli_rs/<version> (<OS type> <OS version>; <uname arch>) <terminal>` in
-  `codex-rs/login/src/auth/default_client.rs` (e.g.
-  `codex_cli_rs/0.144.4 (Linux 6.8.0; x86_64) unknown`). It also sends a bare
-  `version` header on Responses requests, which some gateways validate
-  (Sub2API PR #2494). The old bare `codex_cli_rs/{version}` form was trivially
-  fingerprinted as non-CLI.
-- **Claude Code** sends `User-Agent: claude-cli/<version> (external, cli)` —
-  **not** `claude-code/<version>` — plus `x-app: cli`,
-  `X-Claude-Code-Session-Id`, `anthropic-version: 2023-06-01`,
-  `anthropic-dangerous-direct-browser-access: true`, a Claude-Code-shaped
-  `anthropic-beta` list, and the `X-Stainless-*` metadata from the bundled
-  `@anthropic-ai/sdk` (captured from Claude Code v2.1.198 on the wire).
-  Body-side, the real CLI also sends `metadata.user_id` (JSON string with
-  `device_id` / `account_uuid` / `session_id`) and a system preamble whose
-  first block is `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli;`.
-  Gateways that return *"this group only allows Claude Code clients"* typically
-  check those body fields, not just the User-Agent — so the profile enables
-  `ensureMetadataUserId` + `prependBillingSystem` by default.
+Modeled on codex-rs `AgentControl` + `AutoCompactWindowIds` + Responses client headers:
+
+| id | meaning | stability |
+|----|---------|-----------|
+| `session_id` | Agent tree / cache key | Shared by root + child threads; used as `prompt_cache_key` |
+| `thread_id` | One conversation/agent | Root: equals `session_id`. Child (fork/parentSession): **new** id |
+| `parent_thread_id` | Parent agent thread | Set only on children → header `x-codex-parent-thread-id` |
+| `window_id` | Context window segment | Advances on pi `session_compact` |
+| `first_window_id` / `previous_window_id` / `window_number` | Window chain | First fixed for thread life; previous set after compact |
+| `turn_id` | One outbound LLM request | New UUIDv7 per provider call |
+| `installation_id` | This machine | Stable; prefers real Codex file |
+
+**Tree rules**
+
+| event | session_id | thread_id | window |
+|-------|------------|-----------|--------|
+| `session_start` root (startup/new) | = this pi session (UUIDv7) | = session_id | fresh chain `#0` |
+| fork / parentSession child | **inherit parent** | **new** (this pi session) | fresh chain for child |
+| resume / reload | restore from store | restore | **reuse** last chain (no new window) |
+| `session_compact` | unchanged | unchanged | advance: prev←cur, new cur, number++ |
+
+**Wire surface (codex profile)**
+
+Headers (defaults):
+
+- `originator: codex_cli_rs`
+- `User-Agent: codex_cli_rs/{version} ({os_type} {os_version}; {uname_arch}) {terminal}`
+- `OpenAI-Beta: responses=experimental`
+- `version: {version}`
+- `session-id`, `thread-id`
+- `x-codex-installation-id`, `x-codex-window-id`
+- `x-codex-parent-thread-id` only when child (empty → header removed)
+
+Body when `ensureCodexIdentity: true`:
+
+- `prompt_cache_key` = `session_id` (if missing)
+- `metadata`: `session_id`, `thread_id`, `x-codex-installation-id`, `x-codex-window-id`,
+  `first_window_id`, `previous_window_id` (if any), `window_number`, `turn_id`,
+  optional `x-codex-parent-thread-id`
+
+Do **not** force `stream` / `store` via `bodyPatch` — mismatches break pi response parsing.
+
+### Claude Code identity model
+
+Aligned with local Claude Code **2.1.198** (telemetry + restored source maps).
+Unlike Codex, Claude uses **one session_id (UUIDv4)** per conversation — no
+thread/window chain.
+
+| id | shape | notes |
+|----|-------|-------|
+| `session_id` | **UUIDv4** | Header `X-Claude-Code-Session-Id` + `metadata.user_id.session_id`. If pi's session is already v4, reuse it; if pi uses UUIDv7, map to a stable v4 in `client-mimic.claude-sessions.json`. |
+| `device_id` | 64 hex | Persisted in `client-mimic.device_id` (sha256 seed once). |
+| `account_uuid` | empty string by default | Real CLI fills from OAuth; we leave `""`. |
+| `parent_session_id` | optional | Real CLI sets on teammate/sidechain; not emitted yet. |
+
+**Default `anthropic-beta` (core set, merged with pi):**
+`claude-code-20250219`, `interleaved-thinking-2025-05-14`,
+`redact-thinking-2026-02-12`, `thinking-token-count-2026-05-13`,
+`context-management-2025-06-27`, `prompt-caching-scope-2026-01-05`,
+`mid-conversation-system-2026-04-07`, `effort-2025-11-24`.
+
+Optional flags seen on the wire (`context-1m-…`, `advisor-tool-…`,
+`advanced-tool-use-…`) can be appended in live config if a gateway requires them.
+
+Body helpers:
+
+| flag | effect |
+|------|--------|
+| `ensureMetadataUserId` | Inject Claude Code `metadata.user_id` JSON string when missing |
+| `prependBillingSystem` | Prepend billing-header + Agent SDK identity system blocks when missing |
+
+See [Claude Code gateways](#claude-code-gateways-triage--upgrade-playbook) for triage.
 
 ### Placeholders
 
 Header values support placeholders resolved at request time:
 
-| placeholder        | value |
-|--------------------|-------|
-| `{version}`        | profile `version` (client version) |
-| `{session_id}`     | pi's session id (stable per session) |
-| `{uuid}`           | fresh random UUID per request |
+| placeholder | value |
+|-------------|-------|
+| `{version}` | profile `version` (client version) |
+| `{session_id}` | Codex session id (tree root id; shared by children) |
+| `{thread_id}` | thread id (root: = session_id; child: this pi session) |
+| `{parent_thread_id}` | parent thread; empty on root (header omitted) |
+| `{window_id}` | current context-window id (advances on compact) |
+| `{first_window_id}` | first window in this thread's chain |
+| `{previous_window_id}` | previous window after compact; empty before first compact |
+| `{window_number}` | monotonic window index (0-based) |
+| `{turn_id}` | per outbound request UUIDv7 |
+| `{installation_id}` | machine-stable installation id |
+| `{uuid}` | fresh random UUID per request |
+| `{uuid_v7}` | fresh UUIDv7 per request |
 | `{os}` / `{stainless_os}` | Stainless OS token: `Linux`, `MacOS`, `Windows` |
-| `{arch}` / `{stainless_arch}` | Stainless arch token: `x64`, `arm64`, `x32` |
-| `{os_type}`        | Codex OS type: `Linux`, `Mac OS`, `Windows` |
-| `{os_version}`     | kernel/OS version (`os.release()`) |
-| `{uname_arch}`     | uname machine arch: `x86_64`, `arm64`/`aarch64` |
-| `{terminal}`       | Codex terminal token from `TERM_PROGRAM`/`TERM`, else `unknown` |
-| `{node_version}`   | `process.version` |
-| `{platform}`       | raw `process.platform` |
-| any key in `templateVars` | profile-defined constant (overrides built-ins) |
+| `{arch}` / `{stainless_arch}` | Stainless arch: `x64`, `arm64`, `x32` |
+| `{os_type}` | Codex OS type: `Linux`, `Mac OS`, `Windows` |
+| `{os_version}` | kernel/OS version (`os.release()`) |
+| `{uname_arch}` | uname machine: `x86_64`, `arm64`/`aarch64` |
+| `{terminal}` | `TERM_PROGRAM`/`TERM`, else `unknown` |
+| `{node_version}` | `process.version` |
+| `{platform}` | raw `process.platform` |
+| any key in `templateVars` | profile constant (overrides built-ins) |
 
-Profiles can define extra constants under `templateVars` and use them as
-`{key}`. The `claude-code` profile ships `templateVars.stainless_version`
-(`0.94.0`, captured from Claude Code 2.1.198 on the wire) so
-`X-Stainless-Package-Version` reflects the bundled SDK version; refresh it by
-hand if your gateway checks it (npm update only refreshes the CLI `version`).
-
-A header value of `null` deletes that header. `stripHeaders` removes pi's own
-headers (case-insensitive) before the profile's headers apply. When a profile
-header and a provider-configured header collide (even under different casing,
-e.g. `user-agent` vs `User-Agent`), the profile wins and only its canonical
-spelling is sent — no duplicate headers.
+A header value of `null` deletes the header. Empty resolved values also delete
+(e.g. parent on root). `stripHeaders` removes pi headers case-insensitively
+before profile headers apply; profile spelling wins on case collisions.
 
 ## Commands
 
@@ -86,7 +191,7 @@ spelling is sent — no duplicate headers.
 /mimic on | off           master switch
 /mimic use <profile>      activate codex | claude-code | off
 /mimic list               list profiles
-/mimic show [profile]     print resolved headers + body patch + prompt mode
+/mimic show [profile]     print resolved headers + ids + body flags + prompt mode
 /mimic prompt                                show system-prompt config (all levels)
 /mimic prompt <off|neutral>                  set the global default
 /mimic prompt <profile> <inherit|off|neutral|file> [path]   set per-profile mode
@@ -102,127 +207,101 @@ pi --mimic codex
 
 ## Auto-update from npm
 
-`/mimic update` queries the npm registry `/latest` endpoint for each profile's
-`npmPackage` (`@openai/codex`, `@anthropic-ai/claude-code`) and refreshes the
-stored `version`, which flows into the `{version}` placeholder in `User-Agent`.
+`/mimic update` queries the npm registry `/latest` for each profile's
+`npmPackage` (`@openai/codex`, `@anthropic-ai/claude-code`) and refreshes
+`version` → `{version}` in headers.
 
 ```
-/mimic update            # all profiles
-/mimic update codex      # one profile
+/mimic update
+/mimic update codex
 ```
 
 ## Config
 
-Stored at `~/.pi/agent/client-mimic.config.json` (auto-created). You can edit
-profiles by hand — add headers, change `stripHeaders`, extend `bodyPatch`, or
-define new profiles. Unknown/user-defined profile keys are preserved.
-
-The live config lives **outside** this git repo (it may hold environment-
-specific values), so it is not backed up by cloning the extensions repo. A
-tracked starting point ships as `config.example.json` in this directory — copy
-it to `~/.pi/agent/client-mimic.config.json` on a new machine and adjust. The
-seed prompt files under `prompts/` *are* tracked and restore with the repo.
+Live file: `~/.pi/agent/client-mimic.config.json` (not git-tracked).  
+Template: `config.example.json` in this directory.
 
 ### bodyPatch safety
 
-Both profiles ship `bodyPatch: {}` on purpose. `before_provider_request` spreads
-`bodyPatch` over pi's payload verbatim, so forcing fields like `stream` or
-`store` can break the round-trip: if `stream` disagrees with pi's actual request
-mode, response parsing fails (SSE vs JSON), and `store`/`stream` are
-OpenAI-Responses-specific and may `400` on other providers. Only add body fields
-your gateway genuinely requires, and make sure `stream` matches pi's real mode.
+Default `bodyPatch: {}`. Do not force `stream`/`store` unless you know pi's
+request mode and the provider accepts those fields.
 
-For Claude Code body fingerprints, use the dedicated flags instead of
-`bodyPatch`:
-
-| flag | effect |
-|------|--------|
-| `ensureMetadataUserId` | Inject Claude Code's `metadata.user_id` JSON string when missing. |
-| `prependBillingSystem` | Prepend the billing-header + Agent SDK identity system blocks when missing. |
+Claude body fingerprints → use `ensureMetadataUserId` / `prependBillingSystem`.  
+Codex body identity → use `ensureCodexIdentity` (default true on codex profile).
 
 ## System prompt
 
-client-mimic also owns pi's system prompt (folding in the old standalone
-`neutral-system-prompt.ts` extension, which is now a no-op shim). Behavior is
-driven by a `SystemPromptSpec` at two levels:
+Two levels of `SystemPromptSpec`:
 
-- **Global** `systemPrompt` in the config file — the default when no profile
-  overrides it. Ships as `{ "mode": "neutral" }`, preserving the previous
-  "kun / π" identity rewrite.
-- **Per-profile** `systemPrompt` — each profile has its own spec. Ships as
-  `{ "mode": "inherit" }`, meaning "use the global default".
+- **Global** `systemPrompt` — default when profile uses `inherit` (ships `neutral`)
+- **Per-profile** — ships `inherit` unless you set `file` / `off` / `neutral`
 
-`mode` values:
+| mode | effect |
+|------|--------|
+| `inherit` | (profile only) use global |
+| `off` | leave pi's built-in prompt |
+| `neutral` | "kun / π" rewrite; keep tools/guidelines/skills/context |
+| `file` | load `file` with `apply`: `replace` \| `prepend` \| `append` |
 
-| mode      | effect |
-|-----------|--------|
-| `inherit` | (profile only) defer to the global `systemPrompt` |
-| `off`     | leave pi's built-in prompt untouched |
-| `neutral` | apply the neutral "kun / π" identity rewrite; keeps pi's generated tool list, guidelines, skills, context, date, and cwd intact |
-| `file`    | load prompt text from `file` and combine per `apply` |
-
-When `mode` is `file`, set `file` (absolute, or relative to `~/.pi/agent`) and
-`apply`:
-
-- `replace` (default) — send the file as the entire system prompt.
-- `prepend` — put the file text before pi's prompt.
-- `append` — put the file text after pi's prompt.
-
-Ready-to-edit seed files ship **inside this extension** at
-`client-mimic/prompts/codex.md` and `client-mimic/prompts/claude-code.md`, so
-they travel with the git-backed extensions repo (unlike the config file, which
-lives outside it).
-
-### Switching prompts by command
-
-All levels can be toggled without editing the config file:
+Seeds: `prompts/codex.md`, `prompts/claude-code.md` (paths relative to `~/.pi/agent`
+when referenced as `extensions/client-mimic/prompts/...`).
 
 ```
-/mimic prompt                       show every level (global + per-profile)
-/mimic prompt off                   global default: leave pi's prompt untouched
-/mimic prompt neutral               global default: neutral kun/π rewrite
-/mimic prompt codex file            codex profile → its seed file (replace)
-/mimic prompt codex file <path>     codex profile → a custom file path
-/mimic prompt codex neutral         codex profile → neutral, regardless of global
-/mimic prompt codex inherit         codex profile → follow the global default
+/mimic prompt
+/mimic prompt neutral
+/mimic prompt codex file
+/mimic prompt codex inherit
 ```
-
-`/mimic prompt <profile> file` with no path defaults to the tracked seed file
-`extensions/client-mimic/prompts/<profile>.md`. The `apply` mode is preserved
-from the profile's previous file spec (or `replace` on first switch); edit the
-config to change it to `prepend`/`append`.
-
-Equivalently, edit a profile in the config — paths are relative to `~/.pi/agent`:
-
-```json
-"systemPrompt": {
-  "mode": "file",
-  "file": "extensions/client-mimic/prompts/codex.md",
-  "apply": "replace"
-}
-```
-
-Use `apply: "replace"` when your gateway inspects the prompt for a matching
-client identity; use `prepend`/`append` to keep pi's real instructions and just
-add a client preamble. To keep only the current neutral prompt everywhere, leave
-the global at `neutral` and every profile at `inherit` (the defaults).
 
 ## Caveats
 
-- These header/body sets model the real clients but target a gateway that checks
-  these fields; they are not byte-perfect parity with the official backends.
-- The real clients send more that this does not attempt: Codex's `ChatGPT-Account-ID`
-  (derived from an OAuth `id_token`), Claude Code's full beta flag list / adaptive
-  thinking / `context_management` / tool naming, and transport-layer TLS/HTTP2
-  fingerprints. Add extra headers/body fields via config if your gateway needs them.
-- For `claude-code`, `anthropic-beta` **is** forced (and merged with any betas pi
-  already set) because many Claude-Code-only gateways reject requests that lack
-  `claude-code-20250219`. Override the header value in the profile if your
-  gateway wants a different set.
+- Header/body sets model real clients for **gateway checks**, not byte-perfect
+  parity with official backends.
+- Not mimicked: Codex ChatGPT account headers, full Claude beta/thinking matrix,
+  tool naming quirks, TLS/HTTP2 fingerprints.
+- Parallel pi/subagent processes share `client-mimic.identity.json` without a
+  cross-process lock; rare races can drop a mapping (see Future work).
+- `turn_id` is minted in `before_provider_headers`; body hook reuses the same
+  in-memory state. If hook ordering ever changes, revisit request-scoped ids.
+
+## Future work (backlog)
+
+Ordered by likely value. **Do not implement until a gateway or bug forces it.**
+
+### Done recently
+
+- Cross-process lock + merge-on-write for Codex identity / Claude session map / device id
+- Claude body helpers extracted to `claude-body.ts`
+- Shared `ids.ts` + `fs-util.ts`
+
+### Medium priority (remaining)
+
+1. **`originator` by entrypoint**  
+   Real Codex uses `codex_cli_rs` / `codex-tui` / `codex_exec`. Today the profile
+   hardcodes `codex_cli_rs`. Add a config/template switch if the gateway cares.
+
+2. **Subagent marker header**  
+   Emit a light marker for child threads only when a target gateway distinguishes them.
+
+3. **Request-scoped `turn_id`**  
+   Bind turn id once per logical provider request (headers + body) if hook order changes.
+
+### Low priority
+
+4. `/mimic tree` — print identity store parent/child chains for debugging.
+5. Optional headers for `first_window_id` / `previous_window_id` (body already has them).
+6. Richer `x-codex-turn-metadata` JSON blob (only if a gateway validates the full shape).
+7. Hooks-level integration tests (mock `before_provider_*` end-to-end).
+
+### Out of scope
+
+- TLS/JA3, HTTP2 framing, OAuth account binding  
+- Full multi-agent v2 / guardian protocol parity  
+- Forcing Responses-only body fields that break pi streaming  
 
 ## Claude Code gateways: triage & upgrade playbook
 
-Generic guide for any gateway that gates on Claude Code client fingerprints.
+Generic guide for gateways that gate on Claude Code fingerprints.
 Header-only mimic is often not enough — many checks are **body-aware**.
 
 ### 1. Capture the real client
@@ -236,7 +315,7 @@ claude -p "hi" --settings /tmp/claude-dump-settings.json --dangerously-skip-perm
 #   ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN = dummy
 ```
 
-Compare against what pi+mimic sends. Typical Claude Code wire shape:
+Typical wire shape:
 
 | field | notes |
 |-------|-------|
@@ -251,15 +330,8 @@ Compare against what pi+mimic sends. Typical Claude Code wire shape:
 
 ### 2. Find what the gateway actually checks
 
-A/B one field at a time against the target. Common hard gates:
-
-- non-empty Claude-Code-shaped `system`
-- `metadata.user_id`
-- `anthropic-beta`
-- `x-app: cli` + Claude-CLI-like `User-Agent`
-
-Optional / gateway-specific: session header, billing-header block, Stainless
-version, full beta list, adaptive thinking, TLS/JA3 (out of extension scope).
+A/B one field at a time. Common hard gates: non-empty Claude-shaped `system`,
+`metadata.user_id`, `anthropic-beta`, `x-app` + CLI User-Agent.
 
 ### 3. How client-mimic covers it
 
@@ -269,49 +341,31 @@ version, full beta list, adaptive thinking, TLS/JA3 (out of extension scope).
 | `before_provider_request` | `ensureMetadataUserId`, `prependBillingSystem`, `bodyPatch` |
 | `before_agent_start` | seed system prompt (`prompts/claude-code.md`) |
 
-Profile knobs:
-
-```json
-{
-  "ensureMetadataUserId": true,
-  "prependBillingSystem": true,
-  "templateVars": { "stainless_version": "0.94.0" },
-  "systemPrompt": {
-    "mode": "file",
-    "file": "extensions/client-mimic/prompts/claude-code.md",
-    "apply": "replace"
-  }
-}
-```
-
 `prependBillingSystem` only skips when a **leading** system block *starts with*
-`x-anthropic-billing-header:`. Do not put that literal in seed-prompt notes, or
-injection may be skipped.
+`x-anthropic-billing-header:`. Do not put that literal in seed-prompt notes.
 
 ### 4. Config footguns
 
-- `systemPrompt.file` is relative to `~/.pi/agent`  
-  good: `extensions/client-mimic/prompts/claude-code.md`  
-  bad path → prompt left unchanged (warning only)
-- seed identity: prefer `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
+- `systemPrompt.file` is relative to `~/.pi/agent`
 - two versions: CLI → `version` / `/mimic update`; Stainless → `templateVars.stainless_version` (manual)
 - `anthropic-beta` is **merged** with pi’s betas (do not wipe thinking flags)
 
 ### 5. Upgrade checklist
 
-1. `claude --version`; capture one real request and diff.
+1. Capture one real request and diff against pi+mimic.
 2. `/mimic update claude-code` (CLI `{version}`).
 3. Update `templateVars.stainless_version` if the wire SDK version changed.
-4. Append new required beta flags to profile `anthropic-beta` if needed.
-5. Update `prompts/claude-code.md` if identity text changed (keep billing via flag, not seed text).
-6. `/reload` or restart pi; dump pi+mimic, then smoke the real gateway.
+4. Append new required beta flags if needed.
+5. Update `prompts/claude-code.md` if identity text changed.
+6. `/reload` or restart pi; smoke the real gateway.
 
 ### 6. Files
 
 | path | role |
 |------|------|
 | `~/.pi/agent/client-mimic.config.json` | live config |
+| `~/.pi/agent/client-mimic.identity.json` | Codex session/thread/window map |
 | `extensions/client-mimic/config.example.json` | tracked template |
-| `src/index.ts` / `src/config.ts` | hooks + defaults |
-| `prompts/claude-code.md` | seed system prompt |
+| `src/index.ts` / `src/config.ts` / `src/codex-identity.ts` | hooks + identity |
+| `prompts/claude-code.md` / `prompts/codex.md` | seed system prompts |
 | `~/.pi/agent/models.json` | provider endpoint / key |

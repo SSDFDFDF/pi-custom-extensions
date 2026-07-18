@@ -16,9 +16,11 @@ export interface MimicProfile {
 	/**
 	 * Headers to add/override on every outgoing provider request.
 	 * Values support placeholders (see resolveTemplate): {version}, {session_id},
-	 * {uuid}, {os}, {arch}, {node_version}, {platform}, {os_type}, {os_version},
-	 * {uname_arch}, {terminal}, {stainless_os}, {stainless_arch}, plus any key
-	 * defined in `templateVars`.
+	 * {thread_id}, {window_id}, {first_window_id}, {previous_window_id},
+	 * {window_number}, {turn_id}, {installation_id}, {parent_thread_id},
+	 * {uuid}, {uuid_v7}, {os}, {arch}, {node_version}, {platform}, {os_type},
+	 * {os_version}, {uname_arch}, {terminal}, {stainless_os}, {stainless_arch},
+	 * plus any key defined in `templateVars`.
 	 * A value of null deletes the header instead of setting it.
 	 */
 	headers: Record<string, string | null>;
@@ -54,6 +56,13 @@ export interface MimicProfile {
 	 * injection when a billing-header block is already present.
 	 */
 	prependBillingSystem: boolean;
+	/**
+	 * When true, inject Codex Responses identity into the request body:
+	 * `prompt_cache_key` (= session_id) and flat `metadata` keys matching
+	 * codex-rs (`session_id`, `thread_id`, `x-codex-installation-id`,
+	 * `x-codex-window-id`). Existing user-set keys are left alone.
+	 */
+	ensureCodexIdentity: boolean;
 	/** Client version string used to fill {version} in headers. */
 	version: string;
 	/**
@@ -200,8 +209,16 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 			// Codex also sends a bare `version` header on Responses requests; some
 			// gateways (see Sub2API PR #2494) validate it. Mirror the CLI version.
 			version: "{version}",
-			// hyphenated form only — underscored aliases are rejected by some proxies
+			// Root sessions set session_id == thread_id (UUIDv7). Subagent trees
+			// would share session_id across different thread_ids; pi has no subagent
+			// tree here, so both map to the same per-session UUIDv7.
 			"session-id": "{session_id}",
+			"thread-id": "{thread_id}",
+			// Machine-stable + context-window identity from codex-rs client.rs.
+			"x-codex-installation-id": "{installation_id}",
+			"x-codex-window-id": "{window_id}",
+			// Present only on child threads (fork/parentSession). Empty → header deleted.
+			"x-codex-parent-thread-id": "{parent_thread_id}",
 		},
 		stripHeaders: ["x-stainless-lang", "x-stainless-package-version"],
 		// Intentionally empty. Do NOT force stream/store here: `before_provider_request`
@@ -212,6 +229,8 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 		bodyPatch: {},
 		ensureMetadataUserId: false,
 		prependBillingSystem: false,
+		// Inject prompt_cache_key + Responses client_metadata shaped like codex-rs.
+		ensureCodexIdentity: true,
 		templateVars: {},
 		systemPrompt: { mode: "inherit" },
 	},
@@ -230,12 +249,12 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 			// API version + the direct-browser-access flag the real CLI sends.
 			"anthropic-version": "2023-06-01",
 			"anthropic-dangerous-direct-browser-access": "true",
-			// Claude Code identity beta. Gateways that "only allow Claude Code
-			// clients" commonly require at least claude-code-20250219. We force
-			// the core set here; pi may already contribute interleaved-thinking.
-			// Existing beta values are merged (not replaced) at request time.
+			// Claude Code identity betas (from local 2.1.198 telemetry). Core set
+			// always present; pi may add more (thinking/tool). Merged at request
+			// time — not replaced. Optional flags (context-1m, advisor, …) can be
+			// appended in the live config if a gateway requires them.
 			"anthropic-beta":
-				"claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24",
+				"claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24",
 			// Stainless SDK metadata (the underlying @anthropic-ai/sdk).
 			"X-Stainless-Lang": "js",
 			"X-Stainless-Package-Version": "{stainless_version}",
@@ -252,6 +271,7 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 		// gateways (e.g. "this group only allows Claude Code clients").
 		ensureMetadataUserId: true,
 		prependBillingSystem: true,
+		ensureCodexIdentity: false,
 		// Version of the bundled @anthropic-ai/sdk that recent Claude Code
 		// builds ship (captured from 2.1.198 on the wire: 0.94.0). Not the
 		// same as the CLI version; refresh by hand if your gateway checks it.
@@ -365,6 +385,10 @@ function normalizeProfile(key: string, raw: Partial<MimicProfile> | undefined): 
 			typeof src.prependBillingSystem === "boolean"
 				? src.prependBillingSystem
 				: (base?.prependBillingSystem ?? false),
+		ensureCodexIdentity:
+			typeof src.ensureCodexIdentity === "boolean"
+				? src.ensureCodexIdentity
+				: (base?.ensureCodexIdentity ?? false),
 		templateVars,
 		systemPrompt: normalizeSystemPrompt(src.systemPrompt, base?.systemPrompt ?? { mode: "inherit" }, true),
 	};
@@ -401,8 +425,27 @@ export function resolveTemplate(value: string, ctx: TemplateContext): string {
 				return ctx.version;
 			case "session_id":
 				return ctx.sessionId;
+			case "thread_id":
+				return ctx.threadId ?? ctx.sessionId;
+			case "window_id":
+				return ctx.windowId ?? ctx.sessionId;
+			case "first_window_id":
+				return ctx.firstWindowId ?? ctx.windowId ?? ctx.sessionId;
+			case "previous_window_id":
+				return ctx.previousWindowId ?? "";
+			case "window_number":
+				return ctx.windowNumber != null ? String(ctx.windowNumber) : "0";
+			case "turn_id":
+				return ctx.turnId ?? "";
+			case "installation_id":
+				return ctx.installationId ?? "";
+			case "parent_thread_id":
+				// Root has no parent; empty string lets header apply treat it as delete.
+				return ctx.parentThreadId ?? "";
 			case "uuid":
 				return ctx.uuid();
+			case "uuid_v7":
+				return ctx.uuidV7 ? ctx.uuidV7() : ctx.uuid();
 			case "os":
 				return STAINLESS_OS_MAP[process.platform] ?? "Unknown";
 			case "stainless_os":
@@ -432,7 +475,25 @@ export function resolveTemplate(value: string, ctx: TemplateContext): string {
 export interface TemplateContext {
 	version: string;
 	sessionId: string;
+	/** Thread id; root Codex sessions use sessionId. */
+	threadId?: string;
+	/** Parent thread id for child/subagent threads. */
+	parentThreadId?: string;
+	/** Current context-window id (UUIDv7); advances on compact. */
+	windowId?: string;
+	/** First window in this thread's chain. */
+	firstWindowId?: string;
+	/** Previous window after compact. */
+	previousWindowId?: string;
+	/** Monotonic window index (0-based). */
+	windowNumber?: number;
+	/** Per outbound-request turn id. */
+	turnId?: string;
+	/** Machine-stable installation id (Codex ~/.codex/installation_id shape). */
+	installationId?: string;
 	uuid: () => string;
+	/** Optional UUIDv7 factory (Codex SessionId/ThreadId/window_id). */
+	uuidV7?: () => string;
 	/** Profile-defined template vars, overriding built-in placeholders. */
 	vars?: Record<string, string>;
 }
