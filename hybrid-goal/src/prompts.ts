@@ -69,6 +69,8 @@ function goalModeRules(goalLabel: string) {
 		"- Derive concrete requirements from the objective and any referenced files, plans, specifications, issues, or user instructions.",
 		"- Treat the current worktree, command output, tests, runtime behavior, PR state, rendered artifacts, and external state as authoritative. Previous conversation, plans, and summaries are context, not proof; inspect the current state before relying on them.",
 		`- Keep working until ${goalLabel} is completely resolved end-to-end. Do not stop at analysis, a plan, TODO list, partial fixes, or suggested next steps.`,
+		"- When multi-step work benefits from a structured checklist or plan board and such tools are available in this session, use them to track steps and keep at most one step in progress. If no planning tools are available, continue with ordinary notes or files—do not block on a missing extension.",
+		"- Checklist or plan-board progress is organizational only; it is not proof that the goal is complete. goal_complete still requires authoritative, requirement-by-requirement evidence from the worktree, commands, tests, and other real artifacts.",
 		"- Autonomously implement and verify the work. If a tool fails, try reasonable alternatives instead of yielding early.",
 		"- Before completion, treat completion as unproven and audit requirement by requirement. For every explicit requirement, artifact, command, test, gate, invariant, and deliverable, inspect authoritative evidence and match verification scope to requirement scope.",
 		"- Weak, indirect, missing, or merely consistent evidence is not enough; gather stronger evidence and keep working.",
@@ -76,7 +78,7 @@ function goalModeRules(goalLabel: string) {
 		"- An independent judge reviews goal_complete against the transcript (including tool outputs). Optimistic claims without transcript evidence will be rejected; keep working and put verification in the conversation.",
 		"- Use goal_blocked only at a true impasse after the same blocker recurs for at least three consecutive goal turns, with concrete evidence that user or external action is required. Never use it merely because work is hard, slow, uncertain, incomplete, needs ordinary clarification, or hit a recoverable failure.",
 		"- After a blocked goal is resumed, start a fresh three-turn blocker audit before using goal_blocked again.",
-		"- If the goal is incomplete at the end of a turn, expect automatic continuation and keep working from the current state. Automatic re-entries are capped; treat each continuation as progress toward verifiable completion.",
+		"- If the goal is incomplete at the end of a turn, expect automatic continuation and keep working from the current state. Automatic re-entries may be capped by configuration (and are unlimited by default); treat each continuation as progress toward verifiable completion.",
 	].join("\n");
 }
 

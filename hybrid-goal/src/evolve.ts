@@ -21,9 +21,11 @@ import {
 	cpSync,
 } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { spawnSync } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { HybridGoalConfig } from "./config.js";
 import { resolveEvolCacheDir } from "./config.js";
+import { pruneEvolCache } from "./evol-cache.js";
 
 export interface UpstreamSnapshot {
 	repo: "pi-goal" | "mimo";
@@ -55,7 +57,6 @@ const PI_GOAL_SRC_MAP: Array<{ upstream: string; local: string }> = [
 	{ upstream: "extensions/pi-goal/src/accounting.ts", local: "src/accounting.ts" },
 	{ upstream: "extensions/pi-goal/src/command.ts", local: "src/command.ts" },
 	{ upstream: "extensions/pi-goal/src/persistence.ts", local: "src/persistence.ts" },
-	{ upstream: "extensions/pi-goal/src/prompts.ts", local: "src/prompts.ts" },
 ];
 
 const MIMO_GOAL_PATHS = [
@@ -268,6 +269,14 @@ export async function runEvolutionCheck(
 	].join("\n");
 	writeFileSync(join(cacheDir, "latest-report.md"), md);
 
+	// Bounded cleanup after a successful check (keeps latest + recent history).
+	pruneEvolCache(cacheDir, {
+		keepSnapshotNames: new Set([
+			piSnap.commit.slice(0, 12),
+			`mimo-${mimoSnap.commit.slice(0, 12)}`,
+		]),
+	});
+
 	return report;
 }
 
@@ -280,7 +289,7 @@ export interface ApplyResult {
 
 /**
  * Apply upstream pi-goal base modules into this package.
- * Hybrid layers (index/judge/evolve/config) are never replaced from upstream.
+ * Hybrid layers (index/judge/evolve/config/prompts) are never replaced from upstream.
  */
 export async function applyEvolutionBase(
 	pi: ExtensionAPI,
@@ -327,6 +336,7 @@ export async function applyEvolutionBase(
 		"src/judge.ts",
 		"src/evolve.ts",
 		"src/config.ts",
+		"src/prompts.ts",
 		"package.json",
 	]);
 
@@ -347,29 +357,75 @@ export async function applyEvolutionBase(
 		updated.push(mapping.local);
 	}
 
-	// Also refresh goal-base.ts alias if present as separate hybrid bridge
-	const goalBaseSrc = join(report.piGoal.path, "extensions/pi-goal/src/goal.ts");
-	if (existsSync(goalBaseSrc)) {
-		const dest = join(packageRoot, "src/goal-base.ts");
-		if (existsSync(dest)) {
-			const backupDest = join(backupRoot, "src/goal-base.ts");
-			ensureDir(dirname(backupDest));
-			cpSync(dest, backupDest);
-		}
-		cpSync(goalBaseSrc, dest);
-		if (!updated.includes("src/goal-base.ts")) updated.push("src/goal-base.ts");
-	}
-
 	writeFileSync(
 		join(backupRoot, "MANIFEST.json"),
 		`${JSON.stringify({ updated, fromCommit: report.piGoal.commit, at: new Date().toISOString() }, null, 2)}\n`,
 	);
 
+	const verify = verifyAppliedBase(packageRoot);
+	if (!verify.ok) {
+		// Roll base modules back so a bad upstream snapshot never becomes the live
+		// runtime. Hybrid-only files were never written, so leave them alone.
+		for (const relativePath of updated) {
+			const dest = join(packageRoot, relativePath);
+			const backup = join(backupRoot, relativePath);
+			if (existsSync(backup)) {
+				cpSync(backup, dest);
+			}
+		}
+		return {
+			ok: false,
+			message: `Apply rolled back after post-verify failed. Backup: ${backupRoot}. ${verify.message}`,
+			backedUpTo: backupRoot,
+			updated: [],
+		};
+	}
+
+	// Bound backups/reports/snapshots after a successful apply as well.
+	const keepSnap = new Set<string>();
+	if (report.piGoal?.commit) keepSnap.add(report.piGoal.commit.slice(0, 12));
+	if (report.mimo?.commit) keepSnap.add(`mimo-${report.mimo.commit.slice(0, 12)}`);
+	pruneEvolCache(cacheDir, {
+		keepSnapshotNames: keepSnap.size ? keepSnap : undefined,
+	});
+
 	return {
 		ok: true,
-		message: `Applied ${updated.length} base file(s) from pi-goal@${report.piGoal.commit.slice(0, 12)}. Backup: ${backupRoot}. Hybrid layers (judge/evol/index) untouched. Run /reload.`,
+		message: `Applied ${updated.length} base file(s) from pi-goal@${report.piGoal.commit.slice(0, 12)}. Backup: ${backupRoot}. Post-verify: ${verify.message}. Hybrid layers (judge/evol/index/config/prompts) untouched. Run /reload.`,
 		backedUpTo: backupRoot,
 		updated,
+	};
+}
+
+/**
+ * Post-apply gate: run the package test suite so an upstream signature drift
+ * cannot ship as a silent runtime break after /reload.
+ */
+function verifyAppliedBase(packageRoot: string): { ok: boolean; message: string } {
+	const result = spawnSync("npm", ["test"], {
+		cwd: packageRoot,
+		encoding: "utf8",
+		timeout: 120_000,
+		env: process.env,
+	});
+	if (result.error) {
+		return {
+			ok: false,
+			message: `could not run npm test: ${result.error.message}`,
+		};
+	}
+	if (result.status === 0) {
+		return { ok: true, message: "npm test passed" };
+	}
+	const tail = [result.stdout, result.stderr]
+		.filter(Boolean)
+		.join("\n")
+		.split("\n")
+		.slice(-20)
+		.join("\n");
+	return {
+		ok: false,
+		message: `npm test failed (exit ${result.status ?? "?"})${tail ? `:\n${tail}` : ""}`,
 	};
 }
 

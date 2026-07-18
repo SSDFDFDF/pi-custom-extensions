@@ -64,6 +64,8 @@ export interface QqbotAdapterOptions {
   apiBase?: string;
   render?: Partial<RenderPolicy>;
   onPaired?: (openid: string) => void | Promise<void>;
+  /** Called when gateway connection state changes (for TUI status bar). */
+  onStatusChange?: () => void;
   log?: (message: string) => void;
 }
 
@@ -97,6 +99,7 @@ export class QqbotChannelAdapter implements ChannelAdapter {
   private readonly enableGroup: boolean;
   private readonly render: RenderPolicy;
   private readonly onPaired?: QqbotAdapterOptions["onPaired"];
+  private readonly onStatusChange?: QqbotAdapterOptions["onStatusChange"];
   private readonly logFn?: QqbotAdapterOptions["log"];
   private owner?: TransportOwner;
   private gateway?: QqbotGateway;
@@ -140,6 +143,7 @@ export class QqbotChannelAdapter implements ChannelAdapter {
       },
     );
     this.onPaired = options.onPaired;
+    this.onStatusChange = options.onStatusChange;
     this.logFn = options.log;
   }
 
@@ -191,11 +195,16 @@ export class QqbotChannelAdapter implements ChannelAdapter {
           this.detail = detail ?? "connecting";
         } else if (state === "reconnecting") {
           this.state = "connecting";
-          this.detail = `reconnecting: ${detail ?? ""}`;
+          this.detail = detail?.includes("Session timed out")
+            ? "reconnecting (timeout)"
+            : detail
+              ? `reconnecting (${detail})`
+              : "reconnecting";
         } else if (state === "closed") {
           this.state = "disconnected";
           this.detail = detail ?? "closed";
         }
+        this.onStatusChange?.();
       },
       log: (message) => this.log(`gw ${message}`),
     });

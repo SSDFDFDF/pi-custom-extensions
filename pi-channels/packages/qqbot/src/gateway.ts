@@ -101,7 +101,7 @@ export class QqbotGateway {
     this.ws = ws;
 
     ws.addEventListener("open", () => {
-      this.log("ws open");
+      // quiet: routine reconnects spam TUI
     });
 
     ws.addEventListener("message", (ev) => {
@@ -172,8 +172,7 @@ export class QqbotGateway {
         // Heartbeat ACK
         break;
       case 7:
-        // Reconnect
-        this.log("server requested reconnect");
+        // Reconnect (server-requested; resume path is normal)
         try {
           this.ws?.close(4000, "reconnect");
         } catch {
@@ -200,11 +199,9 @@ export class QqbotGateway {
           this.reconnectAttempt = 0;
           const name = ready?.user?.username ?? ready?.user?.id ?? "bot";
           this.options.onState?.("ready", name);
-          this.log(`READY session=${this.sessionId ?? "?"} bot=${name}`);
         } else if (t === "RESUMED") {
           this.reconnectAttempt = 0;
           this.options.onState?.("ready", "resumed");
-          this.log("RESUMED");
         }
         if (t) {
           try {
@@ -256,7 +253,10 @@ export class QqbotGateway {
       30_000,
       1000 * 2 ** Math.min(this.reconnectAttempt, 5),
     );
-    this.log(`reconnect in ${delay}ms (${reason})`);
+    // Only log when resume is unlikely or retries pile up (avoid TUI spam)
+    if (!this.sessionId || this.reconnectAttempt >= 3) {
+      this.log(`reconnect in ${delay}ms (${reason})`);
+    }
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;

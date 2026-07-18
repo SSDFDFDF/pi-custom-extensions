@@ -226,11 +226,24 @@ export async function evaluateGoalJudge(input: JudgeInput): Promise<JudgeVerdict
 }
 
 function resolveJudgeModel(ctx: ExtensionContext, config: HybridGoalConfig) {
-	const ref = parseModelRef(config.judgeModel);
+	const configured = config.judgeModel?.trim() ?? "";
+	const ref = parseModelRef(configured);
 	if (ref) {
 		const found = ctx.modelRegistry.find(ref.provider, ref.modelId);
 		if (found) return found;
+		// Explicit judgeModel was configured but could not be resolved. Do not
+		// silently fall back to the working model — that weakens cold verification.
+		try {
+			ctx.ui?.notify?.(
+				`Judge model ${configured} not found; completion remains closed until judgeModel is fixed or cleared.`,
+				"warning",
+			);
+		} catch {
+			/* non-UI contexts */
+		}
+		return undefined;
 	}
+	// Empty/invalid judgeModel → use the current session model.
 	return ctx.model ?? undefined;
 }
 

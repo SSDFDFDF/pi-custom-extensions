@@ -107,9 +107,10 @@ export default function hybridGoal(pi: ExtensionAPI) {
 					"Apply upstream base modules?",
 					[
 						"This rewrites hybrid-goal base modules from the latest /goal-evol check cache.",
-						"Hybrid layers (judge, evol, index, config) are NOT replaced.",
+						"Hybrid layers (judge, evol, index, config, prompts) are NOT replaced.",
 						"A backup is written under cache/backups/.",
-						"You must /reload after apply.",
+						"npm test runs after apply; failed apply rolls back base modules.",
+						"You must /reload after a successful apply.",
 						force ? "Force mode: re-sync even if no diff." : "",
 					]
 						.filter(Boolean)

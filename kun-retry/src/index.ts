@@ -106,6 +106,11 @@ export default function kunRetry(pi: ExtensionAPI) {
 	let stallTimer: NodeJS.Timeout | undefined;
 	let providerWatchdogActive = false;
 	let waitingForStallAbortMessage = false;
+	/** Throttle stream-driven UI + timer re-arms so high-token streams stay cheap. */
+	let lastIncomingUiAt = 0;
+	let lastStallRearmAt = 0;
+	const INCOMING_UI_MIN_MS = 250;
+	const STALL_REARM_MIN_MS = 1_000;
 
 	const refreshConfig = () => {
 		cfg = loadConfig();
@@ -201,8 +206,17 @@ export default function kunRetry(pi: ExtensionAPI) {
 			clearIncomingStatus(ctx);
 			return;
 		}
-		if (ctx.hasUI) showIncomingStatus(ctx);
-		armStallWatchdog(ctx);
+		const now = Date.now();
+		// Status text is cosmetic; avoid setStatus on every token.
+		if (ctx.hasUI && now - lastIncomingUiAt >= INCOMING_UI_MIN_MS) {
+			lastIncomingUiAt = now;
+			showIncomingStatus(ctx);
+		}
+		// Stall timer only needs second-level precision; re-arming every token is pure overhead.
+		if (now - lastStallRearmAt >= STALL_REARM_MIN_MS || !stallTimer) {
+			lastStallRearmAt = now;
+			armStallWatchdog(ctx);
+		}
 	};
 
 	const updateFooterStatus = (ctx: StatusContext) => {
@@ -237,12 +251,16 @@ export default function kunRetry(pi: ExtensionAPI) {
 		disarmStallWatchdog();
 		providerWatchdogActive = false;
 		waitingForStallAbortMessage = false;
+		lastIncomingUiAt = 0;
+		lastStallRearmAt = 0;
 		clearStatus(ctx);
 	});
 
 	pi.on("before_provider_request", (_event, ctx) => {
 		if (!cfg.enabled) return;
 		if (ctx.hasUI) clearIncomingStatus(ctx);
+		lastIncomingUiAt = 0;
+		lastStallRearmAt = 0;
 		armStallWatchdog(ctx);
 	});
 

@@ -58,8 +58,10 @@ Then `/reload` or restart `pi`.
 
 - Never touches `~/.pi/agent/npm/*`.
 - Only rewrites mapped **base** modules from upstream pi-goal.
-- Does **not** overwrite hybrid layers: `index.ts`, `judge.ts`, `evolve.ts`, `config.ts`.
+- Does **not** overwrite hybrid layers: `index.ts`, `judge.ts`, `evolve.ts`, `config.ts`, `prompts.ts`.
 - Writes backups under `cache/backups/`.
+- Runs `npm test` after apply; if tests fail, rewrites of base modules are rolled back from the backup.
+- After check/apply, prunes evol cache to bounds: newest 3 snapshot dirs (+ current), 10 `reports/evol-*.json`, 5 backup dirs. `repos/` clones and `latest-report.*` are kept.
 - Requires explicit confirmation.
 
 ## Config
@@ -81,24 +83,25 @@ Then `/reload` or restart `pi`.
 ## Status line
 
 Shown in the footer (extension status line, below the model row) once a `/goal`
-has run. Prefixed with a colored `◆ goal` marker and **persists after completion**
+has run. Prefixed with a colored `◉goal` marker and **persists after completion**
 until the next goal starts or `/goal clear`.
 
-Format: `◆ goal <base> c<continuations>/<cap> [x<judgeRejects>/<cap>] [nb] [j:*]`
+Format: `◉goal <base> c<continuations>/<cap> [x<judgeRejects>/<cap>] [nb] [j:*]`
 
-Colors (theme-aware): `accent` while active, `success` on complete/`j:ok`,
-`warning` on paused/budget/usage/`j:no`, `error` on blocked/`j:imp`/`j:err`,
-`dim` for `j:off`, `muted` for counters.
+Colors (theme-aware): `◉` uses a contrasting color (`success`, or `accent` when
+status text is already `success`); status text `accent` while active, `success`
+on complete/`j:ok`, `warning` on paused/budget/usage/`j:no`, `error` on
+blocked/`j:imp`/`j:err`, `dim` for `j:off`, `muted` for counters.
 
-- `◆ goal` — always-present prefix so the row is easy to spot.
+- `◉goal` — always-present prefix (`◉` + `goal`, no space) so the row is easy to spot.
 - `c3/∞` — 3 automatic working turns, unlimited cap (default).
 - `c3/50` — capped at `maxContinuations=50`.
 - `x2/12` — judge rejected completion twice (cap `maxReact=12`); only shown when > 0.
 - `nb` — never-block mode on.
 - `j:ok` / `j:no` / `j:imp` / `j:err` / `j:off` — last judge verdict.
 
-Examples: `◆ goal active 3m c2/∞`, `◆ goal active 18k/100k c1/∞ x1/12 j:no`,
-`◆ goal blocked c50/50`, `◆ goal complete` (stays until next goal).
+Examples: `◉goal active 3m c2/∞`, `◉goal active 18k/100k c1/∞ x1/12 j:no`,
+`◉goal blocked c50/50`, `◉goal complete` (stays until next goal).
 
 > Pi renders extension statuses on their own footer line, not inline with the
 > model name. Putting it literally beside the model would require replacing the
@@ -141,6 +144,16 @@ transient network/provider failures should never end a long run.
 | Self-evolution | hybrid `/goal-evol` |
 
 Judge reads `sessionManager.buildSessionContext()` → `convertToLlm` → `serializeConversation`, same spirit as MiMo transcript verification.
+
+### Session runtime cleanup
+
+On `session_shutdown`, hybrid-goal flushes any dirty goal snapshot, then drops process-local continuation/recovery/verdict/persist caches and footer status. Session JSONL history is not rewritten or GC'd.
+
+### Optional planning tools
+
+Goal mode owns **lifecycle** (continue / pause / complete / block / judge). It does **not** ship or require a checklist extension.
+
+If the session happens to expose structured planning tools (any package), goal prompts soft-encourage using them for multi-step work and keep “checklist progress ≠ goal complete.” If those tools are absent, the agent should keep going with ordinary notes or files—no package name is hard-coded, so removing a plan/task extension never breaks hybrid-goal.
 
 ## Development
 

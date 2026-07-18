@@ -10,7 +10,7 @@
     "extensions": ["./src/index.ts"]
   },
   "scripts": {
-    "test": "node --test ./test/*.test.mjs"
+    "test": "node --experimental-strip-types --test ./test/*.test.mjs"
   },
   "dependencies": {
     "typebox": "^1.3.3"

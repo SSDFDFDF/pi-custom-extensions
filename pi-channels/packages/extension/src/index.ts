@@ -84,11 +84,12 @@ function formatStatusLine(
     return `${prefix}${colorize(theme, "error", `${short}!`)}`;
   }
   if (adapter?.state === "connecting") {
-    return `${prefix}${colorize(theme, "warning", `${short}…`)}`;
+    const re = adapter.detail?.startsWith("reconnecting") === true;
+    return `${prefix}${colorize(theme, "warning", re ? `${short}↻` : `${short}…`)}`;
   }
   const channel = colorize(theme, "success", short);
   return depth > 0
-    ? `${prefix}${channel} ${colorize(theme, "dim", String(depth))}`
+    ? `${prefix}${channel}${colorize(theme, "dim", `·${depth}`)}`
     : `${prefix}${channel}`;
 }
 
@@ -766,6 +767,9 @@ async function connectQqbot(h: ConnectHelpers): Promise<void> {
       render: profile.render,
       onPaired: async (openid) => {
         await updateQqbotAllowedOpenId(openid, "default", agentDir);
+      },
+      onStatusChange: () => {
+        h.refreshStatus();
       },
       log: (message) => {
         console.error(`[pi-channels:qqbot] ${message}`);

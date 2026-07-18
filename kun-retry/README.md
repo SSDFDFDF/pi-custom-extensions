@@ -83,6 +83,7 @@ PI_RETRY_STALL_TIMEOUT_MS=10000 pi
 
 ## Notes
 
+- On `session_shutdown`, stall/status timers and footer status are cleared; throttle clocks reset. No session files are written by this extension.
 - Context overflow is **not** turned into auto-retry (Pi compaction path).
 - Escape still cancels an in-progress backoff.
 - `nl` mode retries *every* `stopReason: "error"`; use carefully.

@@ -123,6 +123,8 @@ const GOAL_STATE_ENTRY_TYPE = "goal-state";
 const MAX_BLOCKER_REASON_LENGTH = 1_000;
 const MAX_BLOCKER_EVIDENCE_LENGTH = 4_000;
 const MAX_CANCELLED_CONTINUATION_PROMPTS = 20;
+/** Minimum interval between usage-only goal-state appends on tool_execution_end. */
+const GOAL_USAGE_PERSIST_MIN_MS = 5_000;
 const CONTINUATION_MARKER_PREFIX = "pi-goal-continuation:";
 const BUDGET_WRAP_UP_MESSAGE_TYPE = "goal-budget-wrap-up";
 const BUDGET_WRAP_UP_PROMPT =
@@ -167,6 +169,11 @@ interface GoalRuntime {
 	/** Automatic continuation counter (normal working turns); capped by config.maxContinuations (0 = unlimited). */
 	continuationCount: number;
 	lastVerdict?: JudgeVerdict;
+	/** Last serialized goal-state payload written via appendEntry (dedupe/throttle). */
+	lastPersistedGoalSnapshot?: string;
+	lastPersistedGoalAt?: number;
+	/** True when a throttled usage-only persist was skipped and still needs flush. */
+	goalPersistDirty: boolean;
 }
 
 function createGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions): GoalRuntime {
@@ -180,6 +187,7 @@ function createGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions): GoalR
 		cancelledContinuationMarkers: new Set(),
 		judgeRejectCount: 0,
 		continuationCount: 0,
+		goalPersistDirty: false,
 	};
 }
 
@@ -553,12 +561,17 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		if (runtime.activeGoal) {
 			updateGoalUsage(runtime.activeGoal, ctx, false);
-			persistGoal(runtime.activeGoal);
+			persistGoal(runtime.activeGoal, { force: true });
 		}
+		// Drop session-scoped runtime only. Goal snapshot stays in session JSONL for resume.
 		clearContinuationTracking();
 		clearGoalRecovery();
 		clearBudgetWrapUp();
 		clearStaleGoalToolCallBlock();
+		runtime.lastPersistedGoalSnapshot = undefined;
+		runtime.lastPersistedGoalAt = undefined;
+		runtime.goalPersistDirty = false;
+		runtime.lastVerdict = undefined;
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		clearCompletionStatusTimer();
 	});
@@ -654,7 +667,9 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		// AgentSession persists assistant message_end before tool execution events,
 		// so the completed assistant call's usage is authoritative at this boundary.
 		updateGoalUsage(runtime.activeGoal, ctx);
-		persistGoal(runtime.activeGoal);
+		// Usage-only snapshots are throttled — a real session showed hundreds of
+		// near-duplicate goal-state entries from every tool_execution_end.
+		persistGoal(runtime.activeGoal, { force: false });
 		updateStatus(ctx, runtime.activeGoal);
 		limitActiveGoalForBudget(ctx, true);
 	});
@@ -675,7 +690,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 			runtime.budgetWrapUp?.goalId === runtime.activeGoal.id
 		) {
 			updateGoalUsage(runtime.activeGoal, ctx);
-			persistGoal(runtime.activeGoal);
+			persistGoal(runtime.activeGoal, { force: true });
 			updateStatus(ctx, runtime.activeGoal);
 			clearBudgetWrapUp();
 			return;
@@ -688,6 +703,8 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 
 		if (!alreadyAwaitingContinuation) runtime.activeGoal = incrementGoal(runtime.activeGoal);
 		updateGoalUsage(runtime.activeGoal, ctx);
+		// Flush any throttled usage-only writes before turn boundary decisions.
+		if (runtime.goalPersistDirty) persistGoal(runtime.activeGoal, { force: true });
 
 		if (finalAssistant?.stopReason === "aborted") {
 			clearGoalRecoveryForGoal(goalId);
@@ -1240,11 +1257,35 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		if (runtime.continuationDelivery?.marker === marker) runtime.continuationDelivery = undefined;
 	}
 
-	function persistGoal(goal: ActiveGoal) {
+	function persistGoal(goal: ActiveGoal, options?: { force?: boolean }) {
+		const force = options?.force ?? true;
+		const snapshot = serializeGoalPersistSnapshot(goal);
+		const now = Date.now();
+		if (!force) {
+			if (snapshot === runtime.lastPersistedGoalSnapshot) {
+				runtime.goalPersistDirty = false;
+				return;
+			}
+			// Throttle usage accounting writes (tool_execution_end). Status / id /
+			// iteration changes always use force:true (default).
+			if (
+				runtime.lastPersistedGoalAt !== undefined &&
+				now - runtime.lastPersistedGoalAt < GOAL_USAGE_PERSIST_MIN_MS
+			) {
+				runtime.goalPersistDirty = true;
+				return;
+			}
+		}
+		runtime.lastPersistedGoalSnapshot = snapshot;
+		runtime.lastPersistedGoalAt = now;
+		runtime.goalPersistDirty = false;
 		runtime.pi.appendEntry<GoalStateEntryData>(GOAL_STATE_ENTRY_TYPE, { goal });
 	}
 
 	function clearPersistedGoal(cwd: string) {
+		runtime.lastPersistedGoalSnapshot = undefined;
+		runtime.lastPersistedGoalAt = undefined;
+		runtime.goalPersistDirty = false;
 		runtime.pi.appendEntry<GoalStateEntryData>(GOAL_STATE_ENTRY_TYPE, { goal: null });
 		clearLegacyPersistedGoal(cwd);
 	}
@@ -1266,11 +1307,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		// Persistent: keep the colored "goal complete" marker in the footer until the
 		// next goal starts or the user clears it (no auto-clear timer).
 		clearCompletionStatusTimer();
-		const theme = ctx.ui.theme;
-		const text = theme
-			? `${theme.fg("success", "◆ goal")} ${theme.fg("success", "complete")}`
-			: "◆ goal complete";
-		ctx.ui.setStatus(STATUS_KEY, text);
+		ctx.ui.setStatus(STATUS_KEY, formatStatus({ status: "complete" } as ActiveGoal, undefined, ctx.ui.theme));
 	}
 
 	function clearCompletionStatusTimer() {
@@ -1278,6 +1315,18 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		clearTimeout(runtime.completionStatusTimer);
 		runtime.completionStatusTimer = undefined;
 	}
+}
+
+/** Stable enough for dedupe: ignore high-churn timeUsedSeconds alone when status/id/iteration/tokens match. */
+function serializeGoalPersistSnapshot(goal: ActiveGoal): string {
+	return JSON.stringify({
+		id: goal.id,
+		status: goal.status,
+		iteration: goal.iteration,
+		tokensUsed: Math.round(goal.tokensUsed),
+		tokenBudget: goal.tokenBudget ?? null,
+		text: goal.text,
+	});
 }
 
 function createGoal(
@@ -1357,6 +1406,12 @@ async function sendPrompt(pi: ExtensionAPI, ctx: StatusContext, prompt: string) 
 	}
 }
 
+/** ◉ marker color: contrast against the status text color. */
+function statusMarkerColor(baseColor: ThemeColor): ThemeColor {
+	// Prefer success for the glyph; when status is already success, flip to accent.
+	return baseColor === "success" ? "accent" : "success";
+}
+
 export function formatStatus(
 	goal: ActiveGoal | undefined,
 	runtime?: Pick<GoalRuntime, "judgeRejectCount" | "continuationCount" | "config" | "lastVerdict">,
@@ -1364,8 +1419,11 @@ export function formatStatus(
 ) {
 	if (!goal) return undefined;
 	const color = (c: ThemeColor, text: string) => (theme ? theme.fg(c, text) : text);
+	// ◉ in a contrasting color; "goal" + status share baseColor; no space after ◉.
+	const prefix = (baseColor: ThemeColor) =>
+		`${color(statusMarkerColor(baseColor), "◉")}${color(baseColor, "goal")}`;
 	if (goal.status === "complete") {
-		return `${color("success", "◆ goal")} ${color("success", "complete")}`;
+		return `${prefix("success")} ${color("success", "complete")}`;
 	}
 	let base: string;
 	let baseColor: ThemeColor;
@@ -1388,14 +1446,14 @@ export function formatStatus(
 		base = `active ${formatDuration(goal.timeUsedSeconds)}`;
 		baseColor = "accent";
 	}
-	const prefix = color(baseColor, "◆ goal");
-	if (!runtime) return `${prefix} ${color(baseColor, base)}`;
+	const head = prefix(baseColor);
+	if (!runtime) return `${head} ${color(baseColor, base)}`;
 	const contCap =
 		runtime.config.neverBlock || runtime.config.maxContinuations <= 0
 			? "∞"
 			: String(runtime.config.maxContinuations);
 	const rejectCap = runtime.config.neverBlock ? "∞" : String(runtime.config.maxReact);
-	const bits = [`${prefix} ${color(baseColor, base)}`, color("muted", `c${runtime.continuationCount}/${contCap}`)];
+	const bits = [`${head} ${color(baseColor, base)}`, color("muted", `c${runtime.continuationCount}/${contCap}`)];
 	if (runtime.judgeRejectCount > 0)
 		bits.push(color("warning", `x${runtime.judgeRejectCount}/${rejectCap}`));
 	if (runtime.config.neverBlock) bits.push(color("muted", "nb"));
