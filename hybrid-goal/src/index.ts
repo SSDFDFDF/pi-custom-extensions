@@ -37,7 +37,7 @@ export default function hybridGoal(pi: ExtensionAPI) {
 		getArgumentCompletions: (prefix: string) => {
 			const items = [
 				{ value: "check", label: "check", description: "Fetch upstream and write a report" },
-				{ value: "apply", label: "apply", description: "Apply base modules after confirmation" },
+				{ value: "apply", label: "apply", description: "Apply accounting helper after confirmation" },
 				{
 					value: "apply --force",
 					label: "apply --force",
@@ -104,12 +104,13 @@ export default function hybridGoal(pi: ExtensionAPI) {
 				const force = tokens.includes("--force");
 				const cfg = loadConfig(PACKAGE_ROOT);
 				const ok = await ctx.ui.confirm(
-					"Apply upstream base modules?",
+					"Apply upstream helpers?",
 					[
-						"This rewrites hybrid-goal base modules from the latest /goal-evol check cache.",
-						"Hybrid layers (judge, evol, index, config, prompts) are NOT replaced.",
+						"This rewrites only apply-safe helpers (currently src/accounting.ts) from the latest /goal-evol check cache.",
+						"Hybrid runtime/forks are NOT replaced: goal, command, persistence, judge, evol, index, config, prompts.",
+						"Upstream queue/runtime modules stay in cache/upstream-snapshots for review only.",
 						"A backup is written under cache/backups/.",
-						"npm test runs after apply; failed apply rolls back base modules.",
+						"npm test runs after apply; failed apply rolls back written files.",
 						"You must /reload after a successful apply.",
 						force ? "Force mode: re-sync even if no diff." : "",
 					]

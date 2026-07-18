@@ -45,7 +45,7 @@ Then `/reload` or restart `pi`.
 ```text
 /goal-evol status
 /goal-evol check          # fetch upstream clones, write cache/latest-report.md
-/goal-evol apply          # confirm, backup, rewrite base modules only
+/goal-evol apply          # confirm, backup, rewrite apply-safe modules only
 /goal-evol apply --force
 /goal-evol config
 /goal-evol config judgeEnabled=true maxReact=12 judgeFailPolicy=fail-closed
@@ -57,10 +57,12 @@ Then `/reload` or restart `pi`.
 **Apply safety**
 
 - Never touches `~/.pi/agent/npm/*`.
-- Only rewrites mapped **base** modules from upstream pi-goal.
-- Does **not** overwrite hybrid layers: `index.ts`, `judge.ts`, `evolve.ts`, `config.ts`, `prompts.ts`.
+- Auto-apply only maps pure shared helpers currently safe to overwrite (`src/accounting.ts`).
+- Does **not** overwrite hybrid runtime or forks: `goal.ts`, `command.ts`, `persistence.ts`, `judge.ts`, `evolve.ts`, `config.ts`, `prompts.ts`, `index.ts`.
+- Upstream modular pi-goal (`runtime` / `queue` / `settings` / composition `goal.ts`) is cached under `cache/upstream-snapshots/` for review only — not merged live.
+- There is no live `src/goal-base.ts` snapshot; use evol cache for upstream diffs.
 - Writes backups under `cache/backups/`.
-- Runs `npm test` after apply; if tests fail, rewrites of base modules are rolled back from the backup.
+- Runs `npm test` after apply; if tests fail, applied files are rolled back from the backup.
 - After check/apply, prunes evol cache to bounds: newest 3 snapshot dirs (+ current), 10 `reports/evol-*.json`, 5 backup dirs. `repos/` clones and `latest-report.*` are kept.
 - Requires explicit confirmation.
 
@@ -131,17 +133,36 @@ transient network/provider failures should never end a long run.
 
 ## Design notes
 
+### Ownership model (single-goal)
+
+Hybrid is a **single active goal** product. Live runtime is **not** a thin wrapper over upstream `pi-goal` modules:
+
+| Area | Owner | Notes |
+|------|--------|--------|
+| Lifecycle + tools + events | hybrid `src/goal.ts` | Continuations, budget wrap-up, stale `goal_id`, status line |
+| `/goal` parse / completions | hybrid `src/command.ts` | Single-goal only (`start/edit/pause/resume/clear/status`) |
+| Session snapshot load/save | hybrid `src/persistence.ts` | `{ goal }` only — no ordered queue |
+| Prompts + `GoalStatus` | hybrid `src/prompts.ts` | No `queued` status |
+| Independent judge | hybrid `src/judge.ts` | MiMo-style cold verify |
+| Config | hybrid `src/config.ts` + `hybrid-goal.config.json` | |
+| Shared token helpers | `src/accounting.ts` | Only module auto-applied by `/goal-evol apply` |
+| Evol tooling | `src/evolve.ts`, `src/evol-cache.ts` | Check/snapshot/apply gate |
+
+There is **no** live `src/goal-base.ts`. Upstream composition/runtime/queue/settings live only under `cache/upstream-snapshots/` (review). Experimental ordered goals from upstream are **not** wired.
+
+### Capability lineage
+
 | Concern | Source |
 |---------|--------|
-| Continuation + settled dispatch | pi-goal |
-| Budget wrap-up | pi-goal |
-| Stale tool / goal_id rotation | pi-goal |
+| Continuation + settled dispatch | pi-goal lineage (reimplemented in hybrid `goal.ts`) |
+| Budget wrap-up | pi-goal lineage |
+| Stale tool / goal_id rotation | pi-goal lineage |
 | Cold independent judge | MiMo |
 | Bounded judge-reject retry (`maxReact`) | MiMo |
 | Split continuation vs judge-reject counters | hybrid |
 | Never-block retry mode | hybrid |
 | fail-open/closed policy | hybrid (default closed) |
-| Self-evolution | hybrid `/goal-evol` |
+| Self-evolution (review + narrow apply) | hybrid `/goal-evol` |
 
 Judge reads `sessionManager.buildSessionContext()` → `convertToLlm` → `serializeConversation`, same spirit as MiMo transcript verification.
 
@@ -160,5 +181,23 @@ If the session happens to expose structured planning tools (any package), goal p
 ```bash
 cd ~/.pi/agent/extensions/hybrid-goal
 npm install   # typebox
-node --test ./test/*.test.mjs
+npm test      # node --experimental-strip-types --test ./test/*.test.mjs
 ```
+
+### Live package layout
+
+```text
+src/
+  index.ts         # extension entry + /goal-evol
+  goal.ts          # live single-goal runtime
+  command.ts       # hybrid-owned parser
+  persistence.ts   # hybrid-owned session goal snapshot
+  prompts.ts       # hybrid prompts + GoalStatus
+  judge.ts         # independent completion judge
+  accounting.ts    # shared token helpers (apply-safe)
+  config.ts        # hybrid-goal.config.json
+  evolve.ts        # /goal-evol check|apply
+  evol-cache.ts    # cache prune bounds
+```
+
+Do not reintroduce a live `goal-base.ts` snapshot; use `cache/repos/` and `cache/upstream-snapshots/` for upstream diffs.

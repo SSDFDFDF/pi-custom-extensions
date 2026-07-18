@@ -52,11 +52,27 @@ export interface EvolutionReport {
 	applyReady: boolean;
 }
 
+/**
+ * Live modules that may be overwritten by `/goal-evol apply`.
+ * Only pure shared helpers that hybrid still consumes unchanged.
+ * command/persistence stay hybrid-owned (single-goal); upstream queue-aware
+ * variants are review-only. goal.ts / judge / evol / config / prompts never apply.
+ */
 const PI_GOAL_SRC_MAP: Array<{ upstream: string; local: string }> = [
-	{ upstream: "extensions/pi-goal/src/goal.ts", local: "src/goal-base.ts" },
 	{ upstream: "extensions/pi-goal/src/accounting.ts", local: "src/accounting.ts" },
-	{ upstream: "extensions/pi-goal/src/command.ts", local: "src/command.ts" },
-	{ upstream: "extensions/pi-goal/src/persistence.ts", local: "src/persistence.ts" },
+];
+
+/** Upstream paths copied into cache snapshots only (never applied live). */
+const PI_GOAL_REVIEW_ONLY: string[] = [
+	"extensions/pi-goal/src/goal.ts",
+	"extensions/pi-goal/src/runtime.ts",
+	"extensions/pi-goal/src/commands.ts",
+	"extensions/pi-goal/src/command.ts",
+	"extensions/pi-goal/src/persistence.ts",
+	"extensions/pi-goal/src/queue.ts",
+	"extensions/pi-goal/src/settings.ts",
+	"extensions/pi-goal/src/prompts.ts",
+	"extensions/pi-goal/src/accounting.ts",
 ];
 
 const MIMO_GOAL_PATHS = [
@@ -162,7 +178,7 @@ function buildRecommendations(
 	const recs: string[] = [];
 	const changed = diffs.filter((d) => d.status !== "same");
 	if (changed.length === 0) {
-		recs.push("pi-goal upstream sources match local base modules (or base snapshots).");
+		recs.push("Apply-safe upstream helpers match local (currently accounting.ts).");
 	} else {
 		recs.push(
 			`pi-goal upstream differs in ${changed.length} mapped file(s): ${changed
@@ -170,7 +186,10 @@ function buildRecommendations(
 				.join(", ")}.`,
 		);
 		recs.push(
-			"Review upstream delta carefully before apply. hybrid-goal keeps judge/evol layers outside goal-base.",
+			"Review upstream delta carefully before apply. hybrid live runtime is src/goal.ts; only src/accounting.ts may auto-apply.",
+		);
+		recs.push(
+			"command/persistence are hybrid single-goal forks; upstream queue-aware versions are review-only under cache/upstream-snapshots.",
 		);
 	}
 	if (mimoSnap) {
@@ -201,13 +220,20 @@ export async function runEvolutionCheck(
 	const piSnap = await ensureClone(pi, cacheDir, "pi-extensions", config.piGoalUpstream);
 	const mimoSnap = await ensureClone(pi, cacheDir, "mimo-code", config.mimoUpstream);
 
-	// Refresh goal-base snapshot for readable diffs without clobbering live hybrid layers.
+	// Cache upstream sources for offline review; never treat these as live hybrid modules.
 	const baseDir = join(cacheDir, "upstream-snapshots", piSnap.commit.slice(0, 12));
 	ensureDir(baseDir);
 	for (const mapping of PI_GOAL_SRC_MAP) {
 		const src = join(piSnap.path, mapping.upstream);
 		if (!existsSync(src)) continue;
 		const dest = join(baseDir, mapping.local);
+		ensureDir(dirname(dest));
+		cpSync(src, dest);
+	}
+	for (const rel of PI_GOAL_REVIEW_ONLY) {
+		const src = join(piSnap.path, rel);
+		if (!existsSync(src)) continue;
+		const dest = join(baseDir, "review", rel.replace(/^extensions\/pi-goal\//, ""));
 		ensureDir(dirname(dest));
 		cpSync(src, dest);
 	}
@@ -252,7 +278,7 @@ export async function runEvolutionCheck(
 		`- pi-goal: ${piSnap.url} @ \`${piSnap.commit}\``,
 		`- MiMo-Code: ${mimoSnap.url} @ \`${mimoSnap.commit}\``,
 		``,
-		`## Diffs (mapped pi-goal files)`,
+		`## Diffs (apply-safe mapped files)`,
 		...diffs.map(
 			(d) =>
 				`- \`${d.path}\`: **${d.status}** (local=${d.localHash ?? "-"} upstream=${d.upstreamHash ?? "-"})`,
@@ -263,7 +289,7 @@ export async function runEvolutionCheck(
 		``,
 		`## Next`,
 		`- Review snapshots under \`${relative(packageRoot, join(cacheDir, "upstream-snapshots"))}\``,
-		`- Apply carefully: \`/goal-evol apply\` (requires confirmation; rewrites base modules only)`,
+		`- Apply carefully: \`/goal-evol apply\` (requires confirmation; rewrites apply-safe helpers only, currently accounting.ts)`,
 		`- Then \`/reload\``,
 		``,
 	].join("\n");
@@ -288,8 +314,9 @@ export interface ApplyResult {
 }
 
 /**
- * Apply upstream pi-goal base modules into this package.
- * Hybrid layers (index/judge/evolve/config/prompts) are never replaced from upstream.
+ * Apply upstream pi-goal helpers listed in PI_GOAL_SRC_MAP (currently accounting only).
+ * Hybrid runtime and single-goal forks (goal/command/persistence/judge/evol/config/prompts)
+ * are never replaced from upstream; queue/runtime modules are review-only snapshots.
  */
 export async function applyEvolutionBase(
 	pi: ExtensionAPI,
@@ -330,11 +357,15 @@ export async function applyEvolutionBase(
 	ensureDir(backupRoot);
 	const updated: string[] = [];
 
-	// Protect hybrid-only files
+	// Protect hybrid-only files (defense in depth; not in PI_GOAL_SRC_MAP either)
 	const hybridOnly = new Set([
 		"src/index.ts",
+		"src/goal.ts",
+		"src/command.ts",
+		"src/persistence.ts",
 		"src/judge.ts",
 		"src/evolve.ts",
+		"src/evol-cache.ts",
 		"src/config.ts",
 		"src/prompts.ts",
 		"package.json",
@@ -364,8 +395,8 @@ export async function applyEvolutionBase(
 
 	const verify = verifyAppliedBase(packageRoot);
 	if (!verify.ok) {
-		// Roll base modules back so a bad upstream snapshot never becomes the live
-		// runtime. Hybrid-only files were never written, so leave them alone.
+		// Roll applied helpers back so a bad upstream snapshot never becomes live.
+		// Hybrid-only files were never written, so leave them alone.
 		for (const relativePath of updated) {
 			const dest = join(packageRoot, relativePath);
 			const backup = join(backupRoot, relativePath);
@@ -391,7 +422,7 @@ export async function applyEvolutionBase(
 
 	return {
 		ok: true,
-		message: `Applied ${updated.length} base file(s) from pi-goal@${report.piGoal.commit.slice(0, 12)}. Backup: ${backupRoot}. Post-verify: ${verify.message}. Hybrid layers (judge/evol/index/config/prompts) untouched. Run /reload.`,
+		message: `Applied ${updated.length} apply-safe file(s) from pi-goal@${report.piGoal.commit.slice(0, 12)}. Backup: ${backupRoot}. Post-verify: ${verify.message}. Hybrid runtime/forks (goal/command/persistence/judge/evol/index/config/prompts) untouched. Run /reload.`,
 		backedUpTo: backupRoot,
 		updated,
 	};
@@ -434,7 +465,7 @@ export function formatReportSummary(report: EvolutionReport): string {
 	return [
 		`Evolution check @ ${report.generatedAt}`,
 		`pi-goal: ${report.piGoal?.commit.slice(0, 12) ?? "?"} | MiMo: ${report.mimo?.commit.slice(0, 12) ?? "?"}`,
-		`Base diffs: ${changed.length === 0 ? "none" : changed.map((d) => `${d.path}:${d.status}`).join(", ")}`,
+		`Apply-safe diffs: ${changed.length === 0 ? "none" : changed.map((d) => `${d.path}:${d.status}`).join(", ")}`,
 		...report.recommendations.slice(0, 5).map((r) => `• ${r}`),
 		`Report: cache/latest-report.md`,
 	].join("\n");

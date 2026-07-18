@@ -157,7 +157,6 @@ interface GoalRuntime {
 	readonly packageRoot: string;
 	config: HybridGoalConfig;
 	activeGoal?: ActiveGoal;
-	completionStatusTimer?: NodeJS.Timeout;
 	continuationIntent?: ContinuationTicket;
 	continuationDelivery?: ContinuationTicket;
 	goalRecovery?: GoalRecovery;
@@ -542,7 +541,6 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		clearCompletionStatusTimer();
 		clearContinuationTracking();
 		clearGoalRecovery();
 		clearBudgetWrapUp();
@@ -573,7 +571,6 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		runtime.goalPersistDirty = false;
 		runtime.lastVerdict = undefined;
 		ctx.ui.setStatus(STATUS_KEY, undefined);
-		clearCompletionStatusTimer();
 	});
 
 	pi.on("session_before_compact", (event, ctx) => {
@@ -1112,7 +1109,6 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 	}
 
 	function updateStatus(ctx: StatusContext, goal: ActiveGoal) {
-		clearCompletionStatusTimer();
 		ctx.ui.setStatus(STATUS_KEY, formatStatus(goal, runtime, ctx.ui.theme));
 	}
 
@@ -1306,14 +1302,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 	function showCompletionStatus(ctx: StatusContext) {
 		// Persistent: keep the colored "goal complete" marker in the footer until the
 		// next goal starts or the user clears it (no auto-clear timer).
-		clearCompletionStatusTimer();
 		ctx.ui.setStatus(STATUS_KEY, formatStatus({ status: "complete" } as ActiveGoal, undefined, ctx.ui.theme));
-	}
-
-	function clearCompletionStatusTimer() {
-		if (!runtime.completionStatusTimer) return;
-		clearTimeout(runtime.completionStatusTimer);
-		runtime.completionStatusTimer = undefined;
 	}
 }
 
@@ -1675,23 +1664,3 @@ function truncateNotification(value: string) {
 export default function goal(pi: ExtensionAPI, options?: HybridGoalOptions) {
 	registerGoalRuntime(pi, options);
 }
-
-export function getHybridPackageRoot() {
-	return packageRootFromUrl(import.meta.url);
-}
-
-export {
-	assistantUsageTokens,
-	cumulativeAssistantTokens,
-	formatDuration,
-	formatTokenCount,
-} from "./accounting.js";
-
-export {
-	completeGoalArguments,
-	parseCommand,
-	parseTokenBudget,
-	validateObjective,
-} from "./command.js";
-
-export { buildGoalSystemPrompt } from "./prompts.js";
