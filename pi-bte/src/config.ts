@@ -15,7 +15,9 @@ export function loadConfig(): BteConfig {
 	const path = configPath();
 	if (!existsSync(path)) return { ...DEFAULT_CONFIG };
 	try {
-		const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<BteConfig>;
+		const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<BteConfig> & {
+			widgetMaxTasks?: unknown;
+		};
 		return {
 			injectContext:
 				typeof raw.injectContext === "boolean"
@@ -25,10 +27,6 @@ export function loadConfig(): BteConfig {
 				typeof raw.showWidget === "boolean"
 					? raw.showWidget
 					: DEFAULT_CONFIG.showWidget,
-			widgetMaxTasks:
-				typeof raw.widgetMaxTasks === "number" && Number.isFinite(raw.widgetMaxTasks) && raw.widgetMaxTasks > 0
-					? Math.floor(raw.widgetMaxTasks)
-					: DEFAULT_CONFIG.widgetMaxTasks,
 		};
 	} catch {
 		return { ...DEFAULT_CONFIG };
@@ -38,5 +36,16 @@ export function loadConfig(): BteConfig {
 export function saveConfig(config: BteConfig): void {
 	const path = configPath();
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+	// Drop unknown legacy keys (e.g. widgetMaxTasks) on write.
+	writeFileSync(
+		path,
+		`${JSON.stringify(
+			{
+				injectContext: config.injectContext,
+				showWidget: config.showWidget,
+			},
+			null,
+			2,
+		)}\n`,
+	);
 }

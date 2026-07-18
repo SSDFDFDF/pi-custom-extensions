@@ -23,20 +23,17 @@ function theme() {
 }
 
 describe("registerTools", () => {
-	it("registers board, checklist, task, board_doc only", () => {
+	it("registers board, task, board_doc only", () => {
 		const { tools } = captureTools();
-		assert.deepEqual(
-			[...tools.keys()].sort(),
-			["board", "board_doc", "checklist", "task"],
-		);
+		assert.deepEqual([...tools.keys()].sort(), ["board", "board_doc", "task"]);
 	});
 
-	it("task-first naming; checklist stresses full replace", () => {
+	it("task-first naming; replace is full snapshot", () => {
 		const { tools } = captureTools();
-		assert.match(tools.get("task").promptSnippet, /Primary/i);
+		assert.match(tools.get("task").promptSnippet, /items\[\]/i);
 		assert.match(tools.get("board").promptSnippet, /advanced|Optional/i);
-		assert.match(tools.get("checklist").label, /Replace Checklist/i);
-		assert.match(tools.get("checklist").promptSnippet, /FULL REPLACE/i);
+		assert.match(tools.get("task").description, /replace/i);
+		assert.match(tools.get("task").description, /items\[\]/i);
 	});
 
 	it("board switch requires boardId; empty clears", async () => {
@@ -53,15 +50,21 @@ describe("registerTools", () => {
 		assert.equal(store.getState().activeBoardId, undefined);
 	});
 
-	it("checklist empty items rejected", async () => {
+	it("replace empty items rejected", async () => {
 		const { tools, store } = captureTools();
-		await tools.get("task").execute("1", { action: "create", subject: "Keep" });
-		const wiped = await tools.get("checklist").execute("2", { items: [] });
+		await tools.get("task").execute("1", {
+			action: "create",
+			items: [{ subject: "Keep" }],
+		});
+		const wiped = await tools.get("task").execute("2", {
+			action: "replace",
+			items: [],
+		});
 		assert.equal(wiped.isError, true);
 		assert.equal(store.listTasks("*").length, 1);
 	});
 
-	it("checklist on non-active board sets focusTasks", async () => {
+	it("replace on non-active board sets focusTasks", async () => {
 		const { tools, store } = captureTools();
 		await tools.get("board").execute("1", { action: "create", title: "Auth" });
 		await tools.get("board").execute("2", {
@@ -71,23 +74,25 @@ describe("registerTools", () => {
 		});
 		const authId = store.getState().activeBoardId;
 		const uiId = store.listBoards().find((b) => b.id !== authId)?.id;
-		await tools.get("checklist").execute("3", {
+		await tools.get("task").execute("3", {
+			action: "replace",
 			boardId: authId,
 			items: [
-				{ step: "Auth A", status: "pending" },
-				{ step: "Auth B", status: "pending" },
+				{ subject: "Auth A", status: "pending" },
+				{ subject: "Auth B", status: "pending" },
 			],
 		});
-		const written = await tools.get("checklist").execute("4", {
+		const written = await tools.get("task").execute("4", {
+			action: "replace",
 			boardId: uiId,
-			items: [{ step: "UI only", status: "in_progress" }],
+			items: [{ subject: "UI only", status: "in_progress" }],
 		});
 		assert.equal(written.details.focusBoardId, uiId);
 		assert.deepEqual(
 			written.details.focusTasks.map((t) => t.subject),
 			["UI only"],
 		);
-		const rendered = tools.get("checklist").renderResult(
+		const rendered = tools.get("task").renderResult(
 			written,
 			{ expanded: true },
 			theme(),
@@ -96,17 +101,18 @@ describe("registerTools", () => {
 		assert.doesNotMatch(String(rendered.text ?? rendered), /Auth A/);
 	});
 
-	it("checklist standalone alias while board active", async () => {
+	it("replace standalone alias while board active", async () => {
 		const { tools, store } = captureTools();
 		await tools.get("board").execute("1", { action: "create", title: "P" });
 		await tools.get("task").execute("2", {
 			action: "create",
-			subject: "InBoard",
+			items: [{ subject: "InBoard" }],
 		});
-		const written = await tools.get("checklist").execute("3", {
+		const written = await tools.get("task").execute("3", {
+			action: "replace",
 			boardId: "standalone",
 			explanation: "solo",
-			items: [{ step: "Loose only", status: "pending" }],
+			items: [{ subject: "Loose only", status: "pending" }],
 		});
 		assert.equal(written.isError, undefined);
 		assert.equal(written.details.focusBoardId, null);
@@ -114,27 +120,22 @@ describe("registerTools", () => {
 		assert.equal(store.getState().note, "solo");
 	});
 
-	it("task-only happy path", async () => {
+	it("task-only happy path with batch create/update", async () => {
 		const { tools, store } = captureTools();
-		const a = await tools.get("task").execute("1", {
+		const created = await tools.get("task").execute("1", {
 			action: "create",
-			subject: "Step one",
+			items: [{ subject: "Step one" }, { subject: "Step two" }],
 		});
-		const b = await tools.get("task").execute("2", {
-			action: "create",
-			subject: "Step two",
-		});
-		const idA = a.content[0].text.match(/Created (t\d+)/)?.[1];
-		const idB = b.content[0].text.match(/Created (t\d+)/)?.[1];
-		await tools.get("task").execute("3", {
+		assert.match(created.content[0].text, /Created 2/);
+		const ids = [...created.content[0].text.matchAll(/(t\d+)/g)].map((m) => m[1]);
+		const idA = ids[0];
+		const idB = ids[1];
+		await tools.get("task").execute("2", {
 			action: "update",
-			taskId: idA,
-			status: "completed",
-		});
-		await tools.get("task").execute("4", {
-			action: "update",
-			taskId: idB,
-			status: "in_progress",
+			items: [
+				{ taskId: idA, status: "completed" },
+				{ taskId: idB, status: "in_progress" },
+			],
 		});
 		assert.equal(store.getTask(idA).status, "completed");
 		assert.equal(store.getTask(idB).status, "in_progress");
@@ -153,7 +154,7 @@ describe("registerTools", () => {
 		const { tools } = captureTools();
 		const result = await tools.get("task").execute("1", {
 			action: "create",
-			subject: "Nope",
+			items: [{ subject: "Nope" }],
 			boardId: "*",
 		});
 		assert.equal(result.isError, true);
@@ -164,8 +165,8 @@ describe("registerTools", () => {
 		const { tools, store } = captureTools();
 		const a = store.createBoard({ title: "A" });
 		const b = store.createBoard({ title: "B", activate: false });
-		store.createTask({ subject: "InA", boardId: a.board.id });
-		store.createTask({ subject: "InB", boardId: b.board.id });
+		store.createTasks({ items: [{ subject: "InA" }], boardId: a.board.id });
+		store.createTasks({ items: [{ subject: "InB" }], boardId: b.board.id });
 		const listed = await tools.get("task").execute("1", {
 			action: "list",
 			boardId: b.board.id,
@@ -187,15 +188,95 @@ describe("registerTools", () => {
 		assert.match(result.content[0].text, /not found/i);
 	});
 
-	it("checklist boardId=* explains list/clear only", async () => {
+	it("replace boardId=* explains list/clear only", async () => {
 		const { tools, store } = captureTools();
-		store.createTask({ subject: "Keep" });
-		const result = await tools.get("checklist").execute("1", {
+		store.createTasks({ items: [{ subject: "Keep" }] });
+		const result = await tools.get("task").execute("1", {
+			action: "replace",
 			boardId: "*",
-			items: [{ step: "Nope", status: "pending" }],
+			items: [{ subject: "Nope", status: "pending" }],
 		});
 		assert.equal(result.isError, true);
 		assert.match(result.content[0].text, /list\/clear/i);
 		assert.equal(store.listTasks("*").length, 1);
+	});
+
+	it("get accepts taskIds array", async () => {
+		const { tools, store } = captureTools();
+		const c = store.createTasks({
+			items: [{ subject: "A" }, { subject: "B" }],
+		});
+		const result = await tools.get("task").execute("1", {
+			action: "get",
+			taskIds: [c.tasks[0].id, c.tasks[1].id],
+		});
+		assert.equal(result.isError, undefined);
+		const parsed = JSON.parse(result.content[0].text);
+		assert.equal(parsed.length, 2);
+	});
+
+	it("create with taskId-shaped items errors helpfully", async () => {
+		const { tools } = captureTools();
+		const result = await tools.get("task").execute("1", {
+			action: "create",
+			items: [{ taskId: "t1", status: "completed" }],
+		});
+		assert.equal(result.isError, true);
+		assert.match(result.content[0].text, /action=update|taskId/i);
+	});
+
+	it("update with subject-only items points to create", async () => {
+		const { tools } = captureTools();
+		const result = await tools.get("task").execute("1", {
+			action: "update",
+			items: [{ subject: "New step", status: "pending" }],
+		});
+		assert.equal(result.isError, true);
+		assert.match(result.content[0].text, /action=create|taskId/i);
+	});
+
+	it("replace with taskId field errors helpfully", async () => {
+		const { tools } = captureTools();
+		const result = await tools.get("task").execute("1", {
+			action: "replace",
+			items: [{ taskId: "t1", subject: "X", status: "pending" }],
+		});
+		assert.equal(result.isError, true);
+		assert.match(result.content[0].text, /id \(not taskId\)|taskId/i);
+	});
+
+	it("get missing task id is error", async () => {
+		const { tools, store } = captureTools();
+		store.createTasks({ items: [{ subject: "A" }] });
+		const result = await tools.get("task").execute("1", {
+			action: "get",
+			taskIds: ["t1", "t99"],
+		});
+		assert.equal(result.isError, true);
+		assert.match(result.content[0].text, /t99/);
+	});
+
+	it("failed create does not leave tasks", async () => {
+		const { tools, store } = captureTools();
+		const result = await tools.get("task").execute("1", {
+			action: "create",
+			items: [
+				{ subject: "A", status: "in_progress" },
+				{ subject: "B", status: "in_progress" },
+			],
+		});
+		assert.equal(result.isError, true);
+		assert.equal(store.listTasks("*").length, 0);
+	});
+
+	it("task items schema is not Type.Any", () => {
+		const { tools } = captureTools();
+		const schema = tools.get("task").parameters;
+		const items = schema?.properties?.items ?? schema?.items;
+		// TypeBox stores as object; ensure description mentions create/update shapes.
+		const raw = JSON.stringify(schema);
+		assert.match(raw, /subject|taskId/);
+		assert.doesNotMatch(raw, /"type":"any"|Type\.Any/);
+		void items;
 	});
 });

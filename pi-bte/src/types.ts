@@ -29,7 +29,7 @@ export interface Board {
 	id: string;
 	title: string;
 	doc?: BoardDoc;
-	/** Last checklist-replace note for this board. */
+	/** Last replace-note for this board (from task replace explanation). */
 	note?: string;
 	createdAt: number;
 	updatedAt: number;
@@ -40,7 +40,7 @@ export interface BteState {
 	/** Default scope for tools; undefined = standalone tasks. */
 	activeBoardId?: string;
 	tasks: Task[];
-	/** Last checklist-replace note when scope was standalone. */
+	/** Last replace-note when scope was standalone (from task replace explanation). */
 	note?: string;
 	nextTaskSeq: number;
 	nextBoardSeq: number;
@@ -50,18 +50,16 @@ export interface BteState {
 export interface BteConfig {
 	injectContext: boolean;
 	showWidget: boolean;
-	widgetMaxTasks: number;
 }
 
 export const DEFAULT_CONFIG: BteConfig = {
 	injectContext: true,
 	showWidget: true,
-	widgetMaxTasks: 12,
 };
 
 export const BTE_STATE_ENTRY = "bte-state";
 
-export type ToolDetailsKind = "board" | "checklist" | "task" | "board_doc" | "state";
+export type ToolDetailsKind = "board" | "task" | "board_doc" | "state";
 
 export interface BoardDetails {
 	kind: ToolDetailsKind;
@@ -209,7 +207,7 @@ export function isTaskStatus(value: unknown): value is TaskStatus {
 }
 
 /**
- * Board association for create/update/checklist scope.
+ * Board association for create/update/replace scope.
  * undefined = inherit active; null = standalone; string = board id.
  */
 export function parseBoardRef(

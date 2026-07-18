@@ -2,7 +2,8 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig, saveConfig } from "./config.ts";
-import { BteStore, renderAgentContext } from "./store.ts";
+import { renderAgentContext } from "./agent-context.ts";
+import { BteStore } from "./store.ts";
 import { registerTools } from "./tools.ts";
 import type { BteConfig } from "./types.ts";
 import { formatStatusText, refreshUi } from "./ui.ts";
@@ -108,12 +109,11 @@ export default function piBte(pi: ExtensionAPI): void {
 					}
 					next[key] = raw === "true" || raw === "1" || raw === "yes";
 				} else if (key === "widgetMaxTasks") {
-					const value = Number(raw);
-					if (!Number.isFinite(value) || value < 1) {
-						ctx.ui.notify("widgetMaxTasks must be a positive number", "error");
-						return;
-					}
-					next.widgetMaxTasks = Math.floor(value);
+					ctx.ui.notify(
+						"widgetMaxTasks removed — widget uses Pi's 10-line budget only",
+						"warning",
+					);
+					return;
 				} else {
 					ctx.ui.notify(`Unknown config key: ${key}`, "error");
 					return;

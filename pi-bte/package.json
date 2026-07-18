@@ -1,7 +1,7 @@
 {
   "name": "pi-bte",
-  "version": "0.1.0",
-  "description": "Structured board/task tools for Pi: primary task checklist, optional multi-board, full checklist replace.",
+  "version": "0.2.0",
+  "description": "Structured board/task tools for Pi: items[] create/update/replace, optional multi-board.",
   "type": "module",
   "private": true,
   "keywords": [
@@ -9,7 +9,7 @@
     "pi-extension",
     "board",
     "task",
-    "checklist",
+    "items",
     "agent"
   ],
   "license": "MIT",
