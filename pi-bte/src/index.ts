@@ -1,17 +1,17 @@
-/** pi-pte — structured plan/task tools for Pi. */
+/** pi-bte — structured board/task tools for Pi. */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig, saveConfig } from "./config.ts";
-import { PteStore, renderAgentContext } from "./store.ts";
+import { BteStore, renderAgentContext } from "./store.ts";
 import { registerTools } from "./tools.ts";
-import type { PteConfig } from "./types.ts";
+import type { BteConfig } from "./types.ts";
 import { formatStatusText, refreshUi } from "./ui.ts";
 
-export default function piPte(pi: ExtensionAPI): void {
-	const store = new PteStore();
+export default function piBte(pi: ExtensionAPI): void {
+	const store = new BteStore();
 	store.setPersist((customType, data) => pi.appendEntry(customType, data));
 
-	let config: PteConfig = loadConfig();
+	let config: BteConfig = loadConfig();
 	let lastUiCtx: ExtensionContext | undefined;
 
 	const paint = (ctx?: ExtensionContext) => {
@@ -23,14 +23,16 @@ export default function piPte(pi: ExtensionAPI): void {
 
 	registerTools(pi, store, () => paint());
 
-	pi.registerCommand("pte", {
-		description: "Plan-Task tools: status | clear | show | config",
+	pi.registerCommand("bte", {
+		description: "Board/task tools: status | clear | show | boards | config",
 		getArgumentCompletions: (prefix: string) => {
 			const items = [
 				{ value: "status", label: "status", description: "Show task state" },
-				{ value: "clear", label: "clear", description: "Clear tasks" },
-				{ value: "clear --doc", label: "clear --doc", description: "Clear tasks and plan doc" },
+				{ value: "clear", label: "clear", description: "Clear tasks in scope" },
+				{ value: "clear --doc", label: "clear --doc", description: "Clear tasks and board doc" },
+				{ value: "clear --all", label: "clear --all", description: "Clear all tasks" },
 				{ value: "show", label: "show", description: "Show task state" },
+				{ value: "boards", label: "boards", description: "List boards" },
 				{ value: "config", label: "config", description: "Show or set config" },
 			];
 			const query = prefix.trimStart();
@@ -48,10 +50,40 @@ export default function piPte(pi: ExtensionAPI): void {
 				return;
 			}
 
+			if (sub === "boards") {
+				const boards = store.listBoards();
+				ctx.ui.notify(
+					boards.length
+						? boards
+								.map(
+									(b) =>
+										`${b.active ? "*" : " "} ${b.id}: ${b.title} (${b.taskCount} tasks)`,
+								)
+								.join("\n")
+						: "No boards",
+					"info",
+				);
+				return;
+			}
+
 			if (sub === "clear") {
-				const clearPlanDoc = text.split(/\s+/).slice(1).includes("--doc");
-				store.clearTasks({ clearPlanDoc });
-				ctx.ui.notify(clearPlanDoc ? "Tasks and plan document cleared." : "Tasks cleared.", "info");
+				const flags = text.split(/\s+/).slice(1);
+				const clearDoc = flags.includes("--doc");
+				const all = flags.includes("--all");
+				const result = store.clearTasks({
+					clearDoc,
+					scope: all ? "*" : undefined,
+				});
+				if (!result.ok) {
+					ctx.ui.notify(result.error, "error");
+					return;
+				}
+				ctx.ui.notify(
+					clearDoc
+						? `Cleared ${result.removed} task(s) and document(s).`
+						: `Cleared ${result.removed} task(s).`,
+					"info",
+				);
 				paint(ctx);
 				return;
 			}
@@ -64,7 +96,7 @@ export default function piPte(pi: ExtensionAPI): void {
 				}
 				const match = /^(\w+)=(.*)$/.exec(rest);
 				if (!match) {
-					ctx.ui.notify("Usage: /pte config key=value", "warning");
+					ctx.ui.notify("Usage: /bte config key=value", "warning");
 					return;
 				}
 				const [, key, raw] = match;
@@ -93,14 +125,17 @@ export default function piPte(pi: ExtensionAPI): void {
 				return;
 			}
 
-			ctx.ui.notify("Usage: /pte [status|show|clear [--doc]|config]", "warning");
+			ctx.ui.notify(
+				"Usage: /bte [status|show|boards|clear [--doc|--all]|config]",
+				"warning",
+			);
 		},
 	});
 
 	pi.on("before_agent_start", async (event) => {
 		if (!config.injectContext) return;
 		const state = store.getState();
-		if (state.tasks.length === 0 && !state.planDoc) return;
+		if (state.tasks.length === 0 && state.boards.length === 0) return;
 		const content = renderAgentContext(state);
 		if (!content) return;
 		return { systemPrompt: `${event.systemPrompt}\n\n${content}` };
@@ -119,9 +154,8 @@ export default function piPte(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		// UI + process-local caches only. Board state remains in session JSONL for resume.
-		ctx.ui.setStatus("pte", undefined);
-		ctx.ui.setWidget("pte", undefined);
+		ctx.ui.setStatus("bte", undefined);
+		ctx.ui.setWidget("bte", undefined);
 		lastUiCtx = undefined;
 		store.resetRuntimeCaches();
 	});

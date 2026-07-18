@@ -1,0 +1,6 @@
+{
+  "name": "@earendil-works/pi-tui",
+  "version": "0.0.0-test",
+  "type": "module",
+  "exports": "./index.mjs"
+}
