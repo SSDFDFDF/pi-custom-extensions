@@ -43,7 +43,19 @@ export function buildGoalSystemPrompt(goal: GoalPromptContext) {
 }
 
 export function buildContinuePrompt(goal: GoalPromptContext, marker: string) {
-	return `Continue the active /goal until it is complete:\n\n${goalContextBlock(goal)}\n\nThis is automatic continuation #${goal.iteration}. The full objective persists across turns; continue from the authoritative current state.\n\n${goalModeRules("this goal")}\n\n${continuationMarkerComment(marker)}`;
+	// Keep continuation short: full goal rules already live in the system prompt via
+	// before_agent_start. Long repeated continue prompts inflate context and fight compaction.
+	const budgetLine =
+		goal.tokenBudget === undefined
+			? ""
+			: `\nToken budget: ${formatBudget(goal)} used.`;
+	return [
+		`Continue the active /goal (automatic continuation #${goal.iteration}) until it is complete.`,
+		"The objective is unchanged. Use the current worktree, tests, and external state as authoritative; do not shrink the objective to what fits this turn.",
+		goalContextBlock(goal) + budgetLine,
+		"Before goal_complete, audit requirement-by-requirement with real evidence. Weak or missing evidence means keep working.",
+		continuationMarkerComment(marker),
+	].join("\n\n");
 }
 
 function goalContextBlock(goal: GoalPromptContext) {

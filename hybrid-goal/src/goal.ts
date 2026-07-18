@@ -1,21 +1,32 @@
 import { randomUUID } from "node:crypto";
-import {
-	isContextOverflow,
-	type AssistantMessage as PiAssistantMessage,
-	type Usage,
-} from "@earendil-works/pi-ai";
-import { defineTool, type ExtensionAPI, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-	assistantUsageTokens,
 	checkpointGoalActiveTime,
 	currentTokenTotal,
-	formatDuration,
 	formatTokenCount,
 	nonNegativeFiniteNumber,
 	updateGoalUsage,
 } from "./accounting.js";
 import { completeGoalArguments, parseCommand, validateObjective } from "./command.js";
+import {
+	DEFAULT_MAX_COMPACT_FAILS_WHILE_DEFERRED,
+	isOverTokenBudget,
+	planAfterCompactAction,
+	shouldCancelCompactionForGoal,
+	shouldDeferContinuationForContext,
+	shouldGiveUpAutoCompactRetries,
+} from "./compact-policy.js";
+import {
+	loadConfig,
+	packageRootFromUrl,
+} from "./config.js";
+import {
+	evaluateGoalJudge,
+	formatVerdictForAgent,
+	shouldAllowCompletionOnJudgeError,
+	type JudgeVerdict,
+} from "./judge.js";
 import {
 	type ActiveGoal,
 	clearLegacyPersistedGoal,
@@ -31,30 +42,80 @@ import {
 	type GoalStatus,
 } from "./prompts.js";
 import {
-	type HybridGoalConfig,
-	loadConfig,
-	packageRootFromUrl,
-} from "./config.js";
+	findFinalAssistantMessage,
+	goalIdRejectionReason,
+	isContradictoryCompletionSummary,
+	isGoalContextOverflow,
+	isRetryableGoalInterruption,
+	isUsageLimitedGoalInterruption,
+} from "./goal-interruptions.js";
 import {
-	evaluateGoalJudge,
-	formatVerdictForAgent,
-	shouldAllowCompletionOnJudgeError,
-	type JudgeVerdict,
-} from "./judge.js";
+	blocksStaleGoalToolCalls,
+	formatStatus,
+	goalSummary,
+	isResumableGoalStatus,
+	stoppedStatusLabel,
+} from "./goal-status.js";
+import {
+	BUDGET_WRAP_UP_MESSAGE_TYPE,
+	BUDGET_WRAP_UP_PROMPT,
+	CONTINUATION_MARKER_PREFIX,
+	GOAL_STATE_ENTRY_TYPE,
+	GOAL_USAGE_PERSIST_MIN_MS,
+	type GoalRuntime,
+	type HybridGoalOptions,
+	type StatusContext,
+	MAX_BLOCKER_EVIDENCE_LENGTH,
+	MAX_BLOCKER_REASON_LENGTH,
+	MAX_CANCELLED_CONTINUATION_PROMPTS,
+	STATUS_KEY,
+	notifyGoal,
+	type AssistantMessageLike,
+	type ContinuationTicket,
+} from "./goal-types.js";
 
-type AgentStopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+export {
+	isOverTokenBudget,
+	planAfterCompactAction,
+	shouldCancelCompactionForGoal,
+	shouldDeferContinuationForContext,
+	shouldGiveUpAutoCompactRetries,
+} from "./compact-policy.js";
+export {
+	findFinalAssistantMessage,
+	isContradictoryCompletionSummary,
+	isRetryableGoalInterruption,
+	isUsageLimitedGoalInterruption,
+} from "./goal-interruptions.js";
+export { formatStatus } from "./goal-status.js";
+export type { HybridGoalOptions, StatusContext } from "./goal-types.js";
 
-export interface HybridGoalOptions {
-	packageRoot?: string;
-	config?: HybridGoalConfig;
+// Orchestration remains in this file: tools, commands, event hooks, continuation.
+// Pure helpers live in goal-status / goal-interruptions / compact-policy / accounting.
+
+
+function continuationMarker(goal: { id: string; iteration: number }) {
+	return `${goal.id}:${goal.iteration}:${randomUUID()}`;
 }
 
-// Per-factory GoalRuntime owns mutable goal/continuation/budget/recovery state
-// so concurrent in-process AgentSessions cannot clobber each other. Pure helpers
-// live at module scope (single source of truth). registerGoalRuntime still keeps
-// the orchestration handlers together so mutable ownership does not fragment
-// across files; a file-size split is deferred until that ownership boundary is
-// stable under isolation tests.
+function escapeRegExpText(value: string) {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractContinuationMarker(prompt: string) {
+	const match = new RegExp(
+		`<!--\\s*${escapeRegExpText(CONTINUATION_MARKER_PREFIX)}([^\\s-]+)\\s*-->`,
+	).exec(prompt);
+	return match?.[1];
+}
+
+function hasContinuationWork(
+	goalId: string,
+	intentGoalId?: string,
+	deliveryGoalId?: string,
+) {
+	return intentGoalId === goalId || deliveryGoalId === goalId;
+}
 
 interface GoalCompleteDetails {
 	goal: string;
@@ -71,110 +132,6 @@ interface GoalBlockedDetails {
 	repeated_turns: number;
 }
 
-interface ContinuationTicket {
-	goalId: string;
-	iteration: number;
-	marker: string;
-	prompt: string;
-}
-
-interface BudgetWrapUp {
-	goalId: string;
-	delivered: boolean;
-}
-
-type GoalRecoveryKind = "provider_retry" | "compaction_retry";
-
-interface GoalRecovery {
-	goalId: string;
-	kind: GoalRecoveryKind;
-}
-
-interface AssistantMessageLike {
-	role: "assistant";
-	stopReason?: AgentStopReason;
-	errorMessage?: string;
-	content?: PiAssistantMessage["content"];
-	api?: PiAssistantMessage["api"];
-	provider?: PiAssistantMessage["provider"];
-	model?: string;
-	usage?: Usage;
-	timestamp?: number;
-}
-
-type StatusTheme = { fg: (color: ThemeColor, text: string) => string };
-
-interface StatusContext {
-	cwd: string;
-	ui: {
-		confirm: (title: string, message: string) => Promise<boolean>;
-		notify: (message: string, level?: "info" | "warning" | "error") => void;
-		setStatus: (key: string, value: string | undefined) => void;
-		theme?: StatusTheme;
-	};
-	isIdle?: () => boolean;
-	hasPendingMessages?: () => boolean;
-	abort?: () => void;
-	sessionManager?: unknown;
-}
-
-const STATUS_KEY = "goal";
-const GOAL_STATE_ENTRY_TYPE = "goal-state";
-const MAX_BLOCKER_REASON_LENGTH = 1_000;
-const MAX_BLOCKER_EVIDENCE_LENGTH = 4_000;
-const MAX_CANCELLED_CONTINUATION_PROMPTS = 20;
-/** Minimum interval between usage-only goal-state appends on tool_execution_end. */
-const GOAL_USAGE_PERSIST_MIN_MS = 5_000;
-const CONTINUATION_MARKER_PREFIX = "pi-goal-continuation:";
-const BUDGET_WRAP_UP_MESSAGE_TYPE = "goal-budget-wrap-up";
-const BUDGET_WRAP_UP_PROMPT =
-	"The active /goal token budget is exhausted. Stop substantive work and do not call substantive tools. Summarize progress, verified results, remaining work, and blockers concisely. Treat completion as unproven. Do not call goal_complete unless authoritative, requirement-by-requirement evidence already proves every requirement is complete. Weak, indirect, or missing evidence is not enough. Budget exhaustion is not completion.";
-const CONTRADICTORY_COMPLETION_PATTERNS = [
-	/(?<!could\s)\bnot\s+(?:yet\s+)?(?:complete|completed|done|finished)\b/i,
-	/\bstill\s+(?:incomplete|failing|failing\s+tests?|fails?)\b/i,
-	/\btests?\s+(?:still\s+)?fail(?:ing)?\b/i,
-] as const;
-const USAGE_LIMIT_GOAL_ERROR_PATTERNS = [
-	/usage[_\s-]*(?:limit|cap)|chatgpt.{0,32}usage/i,
-	/quota.{0,32}(?:reached|exceeded|exhausted|depleted)|(?:reached|exceeded|exhausted|depleted).{0,32}quota/i,
-	/insufficient[_\s-]*(?:quota|credits?)|out of credits|out of budget|available balance|payment required/i,
-	/(?:credit|balance).{0,32}(?:low|exhausted|depleted)|billing/i,
-] as const;
-const NON_RETRYABLE_GOAL_ERROR_RE =
-	/multi-auth rotation failed|credentials tried|unauthori[sz]ed|invalid api key/i;
-// Pi 0.79 does not export its assistant-error retry classifier. Keep this
-// compatibility mirror aligned with Pi's public retry utility in newer versions.
-const RETRYABLE_GOAL_ERROR_PATTERNS = [
-	/overloaded|rate.?limit|too many requests|\b(?:429|500|502|503|504)\b|service.?unavailable|server.?error|internal.?error/i,
-	/provider.?returned.?error|you can retry your request|try your request again|please retry your request/i,
-	/network.?error|connection.?(?:error|refused|lost)|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up/i,
-	/timed? out|timeout|terminated|websocket.?(?:closed|error)|ended without|stream ended before message_stop|http2 request did not get a response|retry delay/i,
-	/context[_\s-]*length[_\s-]*exceeded|input exceeds the context window/i,
-] as const;
-
-interface GoalRuntime {
-	readonly pi: ExtensionAPI;
-	readonly packageRoot: string;
-	config: HybridGoalConfig;
-	activeGoal?: ActiveGoal;
-	continuationIntent?: ContinuationTicket;
-	continuationDelivery?: ContinuationTicket;
-	goalRecovery?: GoalRecovery;
-	budgetWrapUp?: BudgetWrapUp;
-	staleGoalToolCallsBlocked: boolean;
-	cancelledContinuationMarkers: Set<string>;
-	/** Judge rejection counter (MiMo react); capped by config.maxReact. */
-	judgeRejectCount: number;
-	/** Automatic continuation counter (normal working turns); capped by config.maxContinuations (0 = unlimited). */
-	continuationCount: number;
-	lastVerdict?: JudgeVerdict;
-	/** Last serialized goal-state payload written via appendEntry (dedupe/throttle). */
-	lastPersistedGoalSnapshot?: string;
-	lastPersistedGoalAt?: number;
-	/** True when a throttled usage-only persist was skipped and still needs flush. */
-	goalPersistDirty: boolean;
-}
-
 function createGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions): GoalRuntime {
 	const packageRoot = options?.packageRoot ?? packageRootFromUrl(import.meta.url);
 	const config = options?.config ?? loadConfig(packageRoot);
@@ -187,6 +144,7 @@ function createGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions): GoalR
 		judgeRejectCount: 0,
 		continuationCount: 0,
 		goalPersistDirty: false,
+		continuationDeferredForContext: undefined,
 	};
 }
 
@@ -574,39 +532,122 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 	});
 
 	pi.on("session_before_compact", (event, ctx) => {
-		if (runtime.activeGoal?.status === "budget_limited") {
-			if ((event as { willRetry?: boolean }).willRetry === true) return { cancel: true as const };
-			return;
-		}
-		if (runtime.activeGoal?.status !== "active") return;
-		updateGoalUsage(runtime.activeGoal, ctx);
+		// Context compaction must never be cancelled for goal token-budget reasons.
+		// Budget is a work-stop signal; compact is a context-window rescue (Codex-aligned).
+		const compactEvent = event as {
+			reason?: unknown;
+			willRetry?: unknown;
+		};
+		const reason =
+			typeof compactEvent.reason === "string" ? compactEvent.reason : "unknown";
+		const willRetry = compactEvent.willRetry === true;
+
+		if (!runtime.activeGoal) return;
+
+		// Always drop our own pending continuation so compact is not racing a large continue prompt.
 		cancelContinuationWork();
-		persistGoal(runtime.activeGoal);
-		updateStatus(ctx, runtime.activeGoal);
-		if (limitActiveGoalForBudget(ctx, false)) return { cancel: true as const };
+
+		if (shouldCancelCompactionForGoal(runtime.activeGoal.status, willRetry)) {
+			// budget_limited + overflow willRetry: do not re-drive the model after the goal stopped.
+			// Threshold/manual compact (willRetry=false) remains allowed.
+			notifyGoal(
+				ctx,
+				`Goal is budget-limited; cancelled overflow compact-and-retry (${reason}). Compact without retry is still allowed.`,
+				"warning",
+			);
+			return { cancel: true as const };
+		}
+
+		if (runtime.activeGoal.status === "active") {
+			updateGoalUsage(runtime.activeGoal, ctx);
+			// Snapshot only — do not transition to budget_limited here (would previously cancel compact).
+			persistGoal(runtime.activeGoal);
+			updateStatus(ctx, runtime.activeGoal);
+		} else {
+			updateGoalUsage(runtime.activeGoal, ctx, false);
+			persistGoal(runtime.activeGoal);
+			updateStatus(ctx, runtime.activeGoal);
+		}
+
+		// Routine compact start is silent; warnings cover cancel/defer/budget paths.
 	});
 
 	pi.on("session_compact", (event, ctx) => {
-		if (runtime.activeGoal?.status !== "active") {
+		const compactEvent = event as { reason?: unknown; willRetry?: unknown };
+		const reason =
+			typeof compactEvent.reason === "string" ? compactEvent.reason : "unknown";
+
+		if (!runtime.activeGoal) {
 			clearGoalRecovery();
 			return;
 		}
 
+		// Restore snapshot if present, then recompute usage after history rewrite.
+		// Monotonic accounting: compact may shrink branch billable, but tokensUsed does not refill.
 		const restoredGoal = loadGoalFromSession(ctx);
-		if (restoredGoal?.id === runtime.activeGoal.id) runtime.activeGoal = restoredGoal;
-		updateGoalUsage(runtime.activeGoal, ctx);
-		persistGoal(runtime.activeGoal);
-		updateStatus(ctx, runtime.activeGoal);
-		if (limitActiveGoalForBudget(ctx, false)) return;
+		if (restoredGoal?.id === runtime.activeGoal.id) {
+			// Keep the higher in-memory spend if session snapshot lagged.
+			const memUsed = runtime.activeGoal.tokensUsed;
+			runtime.activeGoal = restoredGoal;
+			if (memUsed > runtime.activeGoal.tokensUsed) {
+				runtime.activeGoal.tokensUsed = memUsed;
+			}
+		}
 
 		const wasPiRetry = isPiOwnedCompactionRetry(event, runtime.activeGoal.id);
-		clearGoalRecoveryForGoal(runtime.activeGoal.id);
-		if (wasPiRetry) return;
-		requestContinuation(runtime.activeGoal);
-		// Manual compaction does not emit agent_settled. This common dispatcher is
-		// therefore the narrow fallback; threshold compaction leaves the intent for
-		// agent_settled when Pi is still busy.
-		dispatchContinuationIfSettled(ctx);
+		updateGoalUsage(
+			runtime.activeGoal,
+			ctx,
+			runtime.activeGoal.status === "active",
+		);
+
+		const action = planAfterCompactAction({
+			status: runtime.activeGoal.status,
+			overBudget: isOverTokenBudget(
+				runtime.activeGoal.tokensUsed,
+				runtime.activeGoal.tokenBudget,
+			),
+			wasPiRetry,
+		});
+
+		// Successful compact always clears context-pressure deferral for this goal.
+		clearContinuationContextDeferral(runtime.activeGoal.id);
+
+		if (action === "budget_stop") {
+			// Apply budget after compact succeeds — never cancel compact for budget.
+			limitActiveGoalForBudget(ctx, false);
+			clearGoalRecoveryForGoal(runtime.activeGoal.id);
+			notifyGoal(
+				ctx,
+				`Compact finished (${reason}); goal token budget reached, no auto-continuation.`,
+				"warning",
+			);
+			return;
+		}
+
+		persistGoal(runtime.activeGoal);
+		updateStatus(ctx, runtime.activeGoal);
+
+		if (action === "pi_retry") {
+			clearGoalRecoveryForGoal(runtime.activeGoal.id);
+			// Silent success: Pi owns recovery.
+			return;
+		}
+
+		if (action === "continue") {
+			clearGoalRecoveryForGoal(runtime.activeGoal.id);
+			requestContinuation(runtime.activeGoal);
+			// Manual compaction does not emit agent_settled. This common dispatcher is
+			// therefore the narrow fallback; threshold compaction leaves the intent for
+			// agent_settled when Pi is still busy.
+			dispatchContinuationIfSettled(ctx);
+			// Silent success path; status line reflects continuation counters.
+			return;
+		}
+
+		// refresh_only: non-active goals — accounting/status only; never re-continue.
+		clearGoalRecovery();
+		// Silent refresh for non-active goals.
 	});
 
 	pi.on("input", (event) => {
@@ -1072,6 +1113,118 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		return true;
 	}
 
+	function clearContinuationContextDeferral(goalId?: string) {
+		const deferred = runtime.continuationDeferredForContext;
+		if (!deferred) return;
+		if (goalId && deferred.goalId !== goalId) return;
+		runtime.continuationDeferredForContext = undefined;
+	}
+
+	function readContextPercent(ctx: StatusContext): number | null {
+		try {
+			const usage = ctx.getContextUsage?.();
+			const percent = usage?.percent;
+			return typeof percent === "number" && Number.isFinite(percent) ? percent : null;
+		} catch {
+			return null;
+		}
+	}
+
+	function noteCompactFailure(ctx: StatusContext, goalId: string, detail: string) {
+		const deferred = runtime.continuationDeferredForContext;
+		if (!deferred || deferred.goalId !== goalId) return;
+		deferred.compactRequested = false;
+		deferred.compactFailCount = (deferred.compactFailCount ?? 0) + 1;
+		if (
+			shouldGiveUpAutoCompactRetries(
+				deferred.compactFailCount,
+				DEFAULT_MAX_COMPACT_FAILS_WHILE_DEFERRED,
+			)
+		) {
+			deferred.giveUpCompact = true;
+			notifyGoal(
+				ctx,
+				`Goal compact failed ${deferred.compactFailCount}× while deferred (${detail}). Auto-continue stays held; run /compact manually or start a new session.`,
+				"error",
+			);
+			return;
+		}
+		notifyGoal(
+			ctx,
+			`Goal compact failed while deferred (${detail}). Will retry on next settle (${deferred.compactFailCount}/${DEFAULT_MAX_COMPACT_FAILS_WHILE_DEFERRED}).`,
+			"warning",
+		);
+	}
+
+	/**
+	 * If Pi reports critical context pressure, hold auto-continue and best-effort
+	 * request compact (Codex-like: do not keep burning when the window is full).
+	 */
+	function deferContinuationIfContextCritical(ctx: StatusContext, goalId: string): boolean {
+		const threshold = runtime.config.continueDeferContextPercent;
+		const percent = readContextPercent(ctx);
+		if (!shouldDeferContinuationForContext({ percent, thresholdPercent: threshold })) {
+			// Pressure cleared without a compact event (e.g. model switch / unknown).
+			if (
+				runtime.continuationDeferredForContext?.goalId === goalId &&
+				(percent === null || percent < threshold)
+			) {
+				clearContinuationContextDeferral(goalId);
+			}
+			return false;
+		}
+
+		const pct = percent as number;
+		const existing = runtime.continuationDeferredForContext;
+		if (existing?.goalId === goalId) {
+			existing.percent = pct;
+			existing.at = Date.now();
+		} else {
+			runtime.continuationDeferredForContext = {
+				goalId,
+				percent: pct,
+				at: Date.now(),
+				notified: false,
+				compactRequested: false,
+				compactFailCount: 0,
+				giveUpCompact: false,
+			};
+		}
+
+		const deferred = runtime.continuationDeferredForContext;
+		if (deferred && !deferred.notified) {
+			deferred.notified = true;
+			notifyGoal(
+				ctx,
+				`Goal auto-continue deferred: context ${pct.toFixed(1)}% ≥ ${threshold}%. Waiting for compact (or run /compact).`,
+				"warning",
+			);
+		}
+		if (deferred && !deferred.compactRequested && !deferred.giveUpCompact) {
+			deferred.compactRequested = true;
+			try {
+				ctx.compact?.({
+					customInstructions:
+						"Preserve the active /goal objective, verified progress, open requirements, and next steps.",
+					onError: (error) => {
+						noteCompactFailure(
+							ctx,
+							goalId,
+							error instanceof Error ? error.message : String(error),
+						);
+					},
+				});
+			} catch (error) {
+				noteCompactFailure(
+					ctx,
+					goalId,
+					error instanceof Error ? error.message : String(error),
+				);
+			}
+		}
+		return true;
+	}
+
 	function dispatchContinuationIfSettled(ctx: StatusContext) {
 		const intent = runtime.continuationIntent;
 		if (!intent) return false;
@@ -1084,6 +1237,11 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 			return false;
 		}
 		if (ctx.isIdle?.() !== true || hasPendingMessages(ctx)) return false;
+
+		// Codex-aligned: do not auto-push when the live window is critically full.
+		if (deferContinuationIfContextCritical(ctx, intent.goalId)) {
+			return false;
+		}
 
 		runtime.continuationIntent = undefined;
 		runtime.continuationDelivery = intent;
@@ -1102,9 +1260,10 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 	}
 
 	function hasContinuationWorkForGoal(goalId: string) {
-		return (
-			runtime.continuationIntent?.goalId === goalId ||
-			runtime.continuationDelivery?.goalId === goalId
+		return hasContinuationWork(
+			goalId,
+			runtime.continuationIntent?.goalId,
+			runtime.continuationDelivery?.goalId,
 		);
 	}
 
@@ -1220,6 +1379,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		runtime.continuationIntent = undefined;
 		runtime.continuationDelivery = undefined;
 		runtime.cancelledContinuationMarkers.clear();
+		runtime.continuationDeferredForContext = undefined;
 	}
 
 	function cancelContinuationWork() {
@@ -1307,12 +1467,17 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 }
 
 /** Stable enough for dedupe: ignore high-churn timeUsedSeconds alone when status/id/iteration/tokens match. */
+
 function serializeGoalPersistSnapshot(goal: ActiveGoal): string {
 	return JSON.stringify({
 		id: goal.id,
 		status: goal.status,
 		iteration: goal.iteration,
 		tokensUsed: Math.round(goal.tokensUsed),
+		lastAccountedBillable:
+			goal.lastAccountedBillable === undefined
+				? null
+				: Math.round(goal.lastAccountedBillable),
 		tokenBudget: goal.tokenBudget ?? null,
 		text: goal.text,
 	});
@@ -1324,6 +1489,7 @@ function createGoal(
 	baselineTokens: number,
 ): ActiveGoal {
 	const now = Date.now();
+	const baseline = nonNegativeFiniteNumber(baselineTokens);
 	return {
 		id: randomUUID(),
 		text,
@@ -1334,7 +1500,8 @@ function createGoal(
 		tokenBudget,
 		tokensUsed: 0,
 		timeUsedSeconds: 0,
-		baselineTokens,
+		baselineTokens: baseline,
+		lastAccountedBillable: baseline,
 		activeStartedAt: now,
 	};
 }
@@ -1395,105 +1562,6 @@ async function sendPrompt(pi: ExtensionAPI, ctx: StatusContext, prompt: string) 
 	}
 }
 
-/** ◉ marker color: contrast against the status text color. */
-function statusMarkerColor(baseColor: ThemeColor): ThemeColor {
-	// Prefer success for the glyph; when status is already success, flip to accent.
-	return baseColor === "success" ? "accent" : "success";
-}
-
-export function formatStatus(
-	goal: ActiveGoal | undefined,
-	runtime?: Pick<GoalRuntime, "judgeRejectCount" | "continuationCount" | "config" | "lastVerdict">,
-	theme?: StatusTheme,
-) {
-	if (!goal) return undefined;
-	const color = (c: ThemeColor, text: string) => (theme ? theme.fg(c, text) : text);
-	// ◉ in a contrasting color; "goal" + status share baseColor; no space after ◉.
-	const prefix = (baseColor: ThemeColor) =>
-		`${color(statusMarkerColor(baseColor), "◉")}${color(baseColor, "goal")}`;
-	if (goal.status === "complete") {
-		return `${prefix("success")} ${color("success", "complete")}`;
-	}
-	let base: string;
-	let baseColor: ThemeColor;
-	if (goal.status === "paused") {
-		base = "paused";
-		baseColor = "warning";
-	} else if (goal.status === "blocked") {
-		base = "blocked";
-		baseColor = "error";
-	} else if (goal.status === "usage_limited") {
-		base = "usage";
-		baseColor = "warning";
-	} else if (goal.status === "budget_limited") {
-		base = `budget ${formatBudget(goal)}`;
-		baseColor = "warning";
-	} else if (goal.tokenBudget !== undefined) {
-		base = `active ${formatBudget(goal)}`;
-		baseColor = "accent";
-	} else {
-		base = `active ${formatDuration(goal.timeUsedSeconds)}`;
-		baseColor = "accent";
-	}
-	const head = prefix(baseColor);
-	if (!runtime) return `${head} ${color(baseColor, base)}`;
-	const contCap =
-		runtime.config.neverBlock || runtime.config.maxContinuations <= 0
-			? "∞"
-			: String(runtime.config.maxContinuations);
-	const rejectCap = runtime.config.neverBlock ? "∞" : String(runtime.config.maxReact);
-	const bits = [`${head} ${color(baseColor, base)}`, color("muted", `c${runtime.continuationCount}/${contCap}`)];
-	if (runtime.judgeRejectCount > 0)
-		bits.push(color("warning", `x${runtime.judgeRejectCount}/${rejectCap}`));
-	if (runtime.config.neverBlock) bits.push(color("muted", "nb"));
-	if (!runtime.config.judgeEnabled) bits.push(color("dim", "j:off"));
-	else if (runtime.lastVerdict?.error) bits.push(color("error", "j:err"));
-	else if (runtime.lastVerdict?.impossible) bits.push(color("error", "j:imp"));
-	else if (runtime.lastVerdict?.ok) bits.push(color("success", "j:ok"));
-	else if (runtime.lastVerdict) bits.push(color("warning", "j:no"));
-	return bits.join(" ");
-}
-
-function formatBudget(goal: ActiveGoal) {
-	return `${formatTokenCount(goal.tokensUsed)}/${formatTokenCount(goal.tokenBudget ?? 0)}`;
-}
-
-function goalSummary(goal: ActiveGoal, runtime?: GoalRuntime) {
-	const lines = [
-		`Goal: ${goal.text}`,
-		`Status: ${goal.status}`,
-		`Iteration: ${goal.iteration}`,
-		`Active elapsed: ${formatDuration(goal.timeUsedSeconds)}`,
-		`Tokens: ${goal.tokenBudget === undefined ? formatTokenCount(goal.tokensUsed) : formatBudget(goal)}`,
-	];
-	if (runtime) {
-		const contCap =
-			runtime.config.neverBlock || runtime.config.maxContinuations <= 0
-				? "∞"
-				: String(runtime.config.maxContinuations);
-		const rejectCap = runtime.config.neverBlock ? "∞" : String(runtime.config.maxReact);
-		lines.push(`Continuations: ${runtime.continuationCount}/${contCap}`);
-		lines.push(`Judge rejects: ${runtime.judgeRejectCount}/${rejectCap}`);
-		if (runtime.config.neverBlock) lines.push("Never-block: on (retries instead of blocking)");
-		lines.push(`Judge: ${runtime.config.judgeEnabled ? "on" : "off"} (${runtime.config.judgeFailPolicy})`);
-		if (runtime.lastVerdict) {
-			lines.push(
-				`Last judge: ${runtime.lastVerdict.ok ? "ok" : runtime.lastVerdict.impossible ? "impossible" : "rejected"}${runtime.lastVerdict.error ? " (error)" : ""} — ${runtime.lastVerdict.reason.slice(0, 200)}`,
-			);
-		}
-	}
-	lines.push(`Commands: ${goalCommandHint(goal.status)}`);
-	return lines.join("\n");
-}
-
-function goalCommandHint(status: GoalStatus) {
-	if (status === "active") return "/goal edit <objective>, /goal pause, /goal clear";
-	if (isResumableGoalStatus(status)) {
-		return "/goal edit <objective>, /goal resume, /goal clear";
-	}
-	return "/goal edit <objective>, /goal clear";
-}
-
 function hasPendingMessages(ctx: StatusContext) {
 	return ctx.hasPendingMessages?.() ?? false;
 }
@@ -1506,159 +1574,16 @@ function abortCurrentTurn(ctx: StatusContext) {
 	}
 }
 
-function blocksStaleGoalToolCalls(status: GoalStatus) {
-	return status === "paused" || status === "blocked" || status === "usage_limited";
-}
-
-function isResumableGoalStatus(status: GoalStatus) {
-	return blocksStaleGoalToolCalls(status) || status === "budget_limited";
-}
-
-function stoppedStatusLabel(status: GoalStatus) {
-	if (status === "usage_limited") return "usage-limited";
-	if (status === "budget_limited") return "budget-limited";
-	return status;
-}
-
-export function isContradictoryCompletionSummary(summary: string) {
-	return CONTRADICTORY_COMPLETION_PATTERNS.some((pattern) => pattern.test(summary));
-}
-
-function goalIdRejectionReason(goal: ActiveGoal, requestedGoalId: string) {
-	if (!requestedGoalId) return "missing goal_id";
-	if (requestedGoalId !== goal.id) return "goal_id does not match the active goal";
-	return undefined;
-}
-
-export function isUsageLimitedGoalInterruption(assistant: AssistantMessageLike) {
-	const errorMessage = assistant.errorMessage;
-	return (
-		assistant.stopReason === "error" &&
-		typeof errorMessage === "string" &&
-		USAGE_LIMIT_GOAL_ERROR_PATTERNS.some((pattern) => pattern.test(errorMessage))
-	);
-}
-
-export function isRetryableGoalInterruption(assistant: AssistantMessageLike) {
-	if (assistant.stopReason !== "error") return false;
-	if (!assistant.errorMessage) return false;
-	if (
-		isUsageLimitedGoalInterruption(assistant) ||
-		NON_RETRYABLE_GOAL_ERROR_RE.test(assistant.errorMessage)
-	) {
-		return false;
-	}
-	return (
-		isGoalContextOverflow(assistant) ||
-		RETRYABLE_GOAL_ERROR_PATTERNS.some((pattern) => pattern.test(assistant.errorMessage ?? ""))
-	);
-}
-
-function isGoalContextOverflow(assistant: AssistantMessageLike) {
-	return isContextOverflow(toPiAssistantMessage(assistant));
-}
-
-function toPiAssistantMessage(assistant: AssistantMessageLike): PiAssistantMessage {
-	return {
-		role: "assistant",
-		content: assistant.content ?? [],
-		api: assistant.api ?? "openai-responses",
-		provider: assistant.provider ?? "unknown",
-		model: assistant.model ?? "unknown",
-		usage: assistant.usage ?? zeroUsage(),
-		stopReason: assistant.stopReason ?? "error",
-		errorMessage: assistant.errorMessage,
-		timestamp: assistant.timestamp ?? Date.now(),
-	};
-}
-
-function zeroUsage(): Usage {
-	return {
-		input: 0,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 0,
-		cost: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			total: 0,
-		},
-	};
-}
-
-function continuationMarker(goal: ActiveGoal) {
-	return `${goal.id}:${goal.iteration}:${randomUUID()}`;
-}
-
-function escapeRegExpText(value: string) {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-const CONTINUATION_MARKER_PATTERN = new RegExp(
-	`<!--\\s*${escapeRegExpText(CONTINUATION_MARKER_PREFIX)}([^\\s>]+)\\s*-->`,
-);
-
-function extractContinuationMarker(prompt: string) {
-	return CONTINUATION_MARKER_PATTERN.exec(prompt)?.[1];
-}
-
-export function findFinalAssistantMessage(messages: unknown[]): AssistantMessageLike | undefined {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (!message || typeof message !== "object") continue;
-		const candidate = message as Record<string, unknown>;
-		if (candidate.role !== "assistant") continue;
-		const assistant: AssistantMessageLike = {
-			role: "assistant",
-			stopReason: isAgentStopReason(candidate.stopReason) ? candidate.stopReason : undefined,
-			errorMessage: typeof candidate.errorMessage === "string" ? candidate.errorMessage : undefined,
-		};
-		if (Array.isArray(candidate.content))
-			assistant.content = candidate.content as PiAssistantMessage["content"];
-		if (typeof candidate.api === "string") assistant.api = candidate.api;
-		if (typeof candidate.provider === "string") assistant.provider = candidate.provider;
-		if (typeof candidate.model === "string") assistant.model = candidate.model;
-		if (typeof candidate.timestamp === "number") assistant.timestamp = candidate.timestamp;
-		const usage = normalizeUsage(candidate.usage);
-		if (usage) assistant.usage = usage;
-		return assistant;
-	}
-	return undefined;
-}
-
-function isAgentStopReason(value: unknown): value is AgentStopReason {
-	return ["stop", "length", "toolUse", "error", "aborted"].includes(String(value));
-}
-
-function normalizeUsage(value: unknown): Usage | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const usage = value as Partial<Usage>;
-	if (typeof usage.input !== "number" || typeof usage.output !== "number") return undefined;
-	return {
-		input: nonNegativeFiniteNumber(usage.input),
-		output: nonNegativeFiniteNumber(usage.output),
-		cacheRead: nonNegativeFiniteNumber(usage.cacheRead),
-		cacheWrite: nonNegativeFiniteNumber(usage.cacheWrite),
-		totalTokens: assistantUsageTokens(usage),
-		cost: {
-			input: usage.cost?.input ?? 0,
-			output: usage.cost?.output ?? 0,
-			cacheRead: usage.cost?.cacheRead ?? 0,
-			cacheWrite: usage.cost?.cacheWrite ?? 0,
-			total: usage.cost?.total ?? 0,
-		},
-	};
-}
-
 function formatError(error: unknown) {
 	return truncateNotification(error instanceof Error ? error.message : String(error));
 }
 
 function truncateNotification(value: string) {
 	return value.length > 160 ? `${value.slice(0, 157)}...` : value;
+}
+
+function formatBudget(goal: ActiveGoal) {
+	return `${formatTokenCount(goal.tokensUsed)}/${formatTokenCount(goal.tokenBudget ?? 0)}`;
 }
 
 export default function goal(pi: ExtensionAPI, options?: HybridGoalOptions) {

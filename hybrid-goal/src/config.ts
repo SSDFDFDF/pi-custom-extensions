@@ -6,26 +6,25 @@ import { fileURLToPath } from "node:url";
 export type JudgeFailPolicy = "fail-closed" | "fail-open";
 
 export interface HybridGoalConfig {
-	/** Independent judge on goal_complete / stop attempts. Default false (requires a usable judge model). */
+	/** Independent judge on goal_complete / stop attempts. */
 	judgeEnabled: boolean;
 	/** On judge transport/parse failure: fail-closed rejects completion; fail-open allows it. */
 	judgeFailPolicy: JudgeFailPolicy;
 	/** Optional judge model as provider/id. Empty = use current session model. */
 	judgeModel: string;
-	/** Hard cap on judge rejections before the goal is blocked (MiMo MAX_GOAL_REACT). Default 12. */
+	/** Hard cap on judge rejections before the goal is blocked. Default 12. */
 	maxReact: number;
 	/** Hard cap on automatic continuations (normal working turns). 0 = unlimited. Default 0. */
 	maxContinuations: number;
-	/** Never auto-transition to blocked; keep retrying instead (good for flaky networks). Default false. */
+	/** Never auto-transition to blocked; keep retrying instead. Default false. */
 	neverBlock: boolean;
 	/** Max chars of transcript text sent to the judge. Default 120_000. */
 	judgeTranscriptChars: number;
-	/** Upstream pi-goal git URL for /goal-evol. */
-	piGoalUpstream: string;
-	/** Upstream MiMo-Code git URL for /goal-evol. */
-	mimoUpstream: string;
-	/** Cache dir for evolution clones (relative to package or absolute). */
-	evolCacheDir: string;
+	/**
+	 * Defer automatic goal continuation when Pi context usage percent is ≥ this value.
+	 * 0 disables. Default 95.
+	 */
+	continueDeferContextPercent: number;
 }
 
 export const DEFAULT_CONFIG: HybridGoalConfig = {
@@ -36,19 +35,16 @@ export const DEFAULT_CONFIG: HybridGoalConfig = {
 	maxContinuations: 0,
 	neverBlock: false,
 	judgeTranscriptChars: 120_000,
-	piGoalUpstream: "https://github.com/narumiruna/pi-extensions.git",
-	mimoUpstream: "https://github.com/XiaomiMiMo/MiMo-Code.git",
-	evolCacheDir: "cache",
+	continueDeferContextPercent: 95,
 };
 
 const CONFIG_FILE_NAME = "hybrid-goal.config.json";
 
 export function packageRootFromUrl(importMetaUrl: string): string {
-	// src/*.ts → package root is parent of src/
 	return dirname(dirname(fileURLToPath(importMetaUrl)));
 }
 
-export function defaultConfigPath(packageRoot: string): string {
+export function defaultConfigPath(_packageRoot: string): string {
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? ".", ".pi", "agent");
 	return join(agentDir, CONFIG_FILE_NAME);
 }
@@ -57,7 +53,8 @@ export function loadConfig(packageRoot: string): HybridGoalConfig {
 	const path = defaultConfigPath(packageRoot);
 	if (!existsSync(path)) return { ...DEFAULT_CONFIG };
 	try {
-		const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<HybridGoalConfig>;
+		const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<HybridGoalConfig> &
+			Record<string, unknown>;
 		return normalizeConfig(raw);
 	} catch {
 		return { ...DEFAULT_CONFIG };
@@ -72,16 +69,12 @@ export function saveConfig(packageRoot: string, patch: Partial<HybridGoalConfig>
 	return next;
 }
 
-export function resolveEvolCacheDir(packageRoot: string, config: HybridGoalConfig): string {
-	if (config.evolCacheDir.startsWith("/")) return config.evolCacheDir;
-	return join(packageRoot, config.evolCacheDir);
-}
-
 export function normalizeConfig(raw: Partial<HybridGoalConfig> | undefined): HybridGoalConfig {
 	const base = { ...DEFAULT_CONFIG, ...(raw ?? {}) };
 	const maxReact = Number(base.maxReact);
 	const maxContinuations = Number(base.maxContinuations);
 	const judgeTranscriptChars = Number(base.judgeTranscriptChars);
+	const continueDeferContextPercent = Number(base.continueDeferContextPercent);
 	return {
 		judgeEnabled: base.judgeEnabled !== false,
 		judgeFailPolicy: base.judgeFailPolicy === "fail-open" ? "fail-open" : "fail-closed",
@@ -99,18 +92,12 @@ export function normalizeConfig(raw: Partial<HybridGoalConfig> | undefined): Hyb
 			Number.isFinite(judgeTranscriptChars) && judgeTranscriptChars >= 8_000
 				? Math.floor(judgeTranscriptChars)
 				: DEFAULT_CONFIG.judgeTranscriptChars,
-		piGoalUpstream:
-			typeof base.piGoalUpstream === "string" && base.piGoalUpstream.trim()
-				? base.piGoalUpstream.trim()
-				: DEFAULT_CONFIG.piGoalUpstream,
-		mimoUpstream:
-			typeof base.mimoUpstream === "string" && base.mimoUpstream.trim()
-				? base.mimoUpstream.trim()
-				: DEFAULT_CONFIG.mimoUpstream,
-		evolCacheDir:
-			typeof base.evolCacheDir === "string" && base.evolCacheDir.trim()
-				? base.evolCacheDir.trim()
-				: DEFAULT_CONFIG.evolCacheDir,
+		continueDeferContextPercent:
+			Number.isFinite(continueDeferContextPercent) && continueDeferContextPercent <= 0
+				? 0
+				: Number.isFinite(continueDeferContextPercent) && continueDeferContextPercent > 0
+					? Math.min(100, Math.floor(continueDeferContextPercent))
+					: DEFAULT_CONFIG.continueDeferContextPercent,
 	};
 }
 

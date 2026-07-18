@@ -22,9 +22,16 @@ export interface ActiveGoal {
 	updatedAt: number;
 	iteration: number;
 	tokenBudget?: number;
+	/** Monotonic lifetime billable spend (does not shrink on compact). */
 	tokensUsed: number;
 	timeUsedSeconds: number;
+	/** Branch billable total when the goal started. */
 	baselineTokens: number;
+	/**
+	 * Watermark of branch billable cumulative for monotonic accounting.
+	 * Optional for legacy snapshots loaded before this field existed.
+	 */
+	lastAccountedBillable?: number;
 	activeStartedAt?: number;
 }
 
@@ -51,15 +58,22 @@ export function loadGoalFromSession(ctx: SessionContext): ActiveGoal | undefined
 
 export function normalizeLoadedGoal(goal: ActiveGoal): ActiveGoal {
 	const now = Date.now();
+	const baselineTokens = nonNegativeFiniteNumber(goal.baselineTokens);
+	const tokensUsed = nonNegativeFiniteNumber(goal.tokensUsed);
+	const lastAccountedBillable = isNonNegativeFiniteNumber(goal.lastAccountedBillable)
+		? goal.lastAccountedBillable
+		: // Legacy snapshots: reconstruct watermark so the next delta is not double-counted.
+			Math.min(Number.MAX_SAFE_INTEGER, baselineTokens + tokensUsed);
 	return {
 		...goal,
 		startedAt: isNonNegativeFiniteNumber(goal.startedAt) ? goal.startedAt : now,
 		updatedAt: isNonNegativeFiniteNumber(goal.updatedAt) ? goal.updatedAt : now,
 		iteration: Math.max(0, Math.floor(nonNegativeFiniteNumber(goal.iteration))),
 		tokenBudget: normalizeTokenBudget(goal.tokenBudget),
-		tokensUsed: nonNegativeFiniteNumber(goal.tokensUsed),
+		tokensUsed,
 		timeUsedSeconds: nonNegativeFiniteNumber(goal.timeUsedSeconds),
-		baselineTokens: nonNegativeFiniteNumber(goal.baselineTokens),
+		baselineTokens,
+		lastAccountedBillable,
 		activeStartedAt: goal.status === "active" ? now : undefined,
 	};
 }
