@@ -93,6 +93,9 @@ export type { HybridGoalOptions, StatusContext } from "./goal-types.js";
 // Orchestration remains in this file: tools, commands, event hooks, continuation.
 // Pure helpers live in goal-status / goal-interruptions / compact-policy / accounting.
 
+/** Tools that exist only while a /goal is usable (active or budget wrap-up). */
+const GOAL_TOOL_NAMES = ["goal_complete", "goal_blocked"] as const;
+type GoalToolName = (typeof GOAL_TOOL_NAMES)[number];
 
 function continuationMarker(goal: { id: string; iteration: number }) {
 	return `${goal.id}:${goal.iteration}:${randomUUID()}`;
@@ -155,10 +158,11 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		name: "goal_complete",
 		label: "Goal Complete",
 		description:
-			"Mark the active /goal as complete after all required work is done and verified, using the current goal_id stale-turn guard. Do not use for partial progress, blockers, failing, or unverified work.",
+			"Only when an active /goal is in progress: mark it complete after all required work is done and verified, using the current goal_id stale-turn guard. Not a general task tool. Do not use without an active /goal, or for partial progress, blockers, failing, or unverified work.",
 		promptSnippet:
-			"Mark the active /goal as complete after fully finishing and verifying it, with the current goal_id",
+			"Only with an active /goal: mark it complete after full verification (current goal_id)",
 		promptGuidelines: [
+			"goal_complete is available only while a user-activated /goal is active (or in budget wrap-up). Never invent a goal or call it without that mode.",
 			"When a /goal is active, keep working until the goal is complete; do not stop with only a plan or partial progress.",
 			"Before calling goal_complete, audit the active goal requirement by requirement against the current files, command output, tests, or external state.",
 			"Pass the exact goal_id shown in the current /goal prompt; never reuse a goal_id from an older, stopped, replaced, or cleared turn.",
@@ -374,10 +378,11 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		name: "goal_blocked",
 		label: "Goal Blocked",
 		description:
-			"Stop the active /goal only at a true impasse after the same blocker recurs for at least three consecutive goal turns, with the current goal_id and concrete evidence that user or external action is required. Do not use for ordinary clarification, uncertainty, or recoverable failures.",
+			"Only when an active /goal is in progress: stop it at a true impasse after the same blocker recurs for at least three consecutive goal turns, with the current goal_id and concrete evidence that user or external action is required. Not a general task tool. Do not use without an active /goal, or for ordinary clarification, uncertainty, or recoverable failures.",
 		promptSnippet:
-			"Mark the active /goal blocked only after the same blocker recurs for three consecutive goal turns",
+			"Only with an active /goal: stop at a true multi-turn impasse (evidence + current goal_id)",
 		promptGuidelines: [
+			"goal_blocked is available only while a user-activated /goal is active (or in budget wrap-up). Never invent a goal or call it without that mode.",
 			"Use goal_blocked only for a true impasse after the same blocker recurs for at least three consecutive goal turns and concrete evidence shows user or external action is required.",
 			"After a blocked goal is resumed, start a fresh three-turn blocker audit before using goal_blocked again.",
 			"Do not use goal_blocked for ordinary clarification, incomplete work, uncertainty, difficult tasks, or recoverable tool/provider failures.",
@@ -462,6 +467,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		},
 	});
 
+	// Register definitions always; expose to the model only while a /goal is usable.
 	pi.registerTool(goalCompleteTool);
 	pi.registerTool(goalBlockedTool);
 
@@ -512,6 +518,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 			persistGoal(runtime.activeGoal);
 			updateStatus(ctx, runtime.activeGoal);
 		} else ctx.ui.setStatus(STATUS_KEY, undefined);
+		syncGoalTools();
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
@@ -714,6 +721,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 
 	pi.on("before_agent_start", (event) => {
 		markContinuationStarted(event.prompt);
+		syncGoalTools();
 		if (runtime.activeGoal?.status !== "active") return;
 
 		return {
@@ -965,6 +973,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 			clearStaleGoalToolCallBlock();
 			clearPersistedGoal(ctx.cwd);
 			ctx.ui.setStatus(STATUS_KEY, undefined);
+			syncGoalTools();
 			return;
 		}
 
@@ -1269,6 +1278,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 
 	function updateStatus(ctx: StatusContext, goal: ActiveGoal) {
 		ctx.ui.setStatus(STATUS_KEY, formatStatus(goal, runtime, ctx.ui.theme));
+		syncGoalTools();
 	}
 
 	function persistVerdict(verdict: JudgeVerdict, goal: ActiveGoal) {
@@ -1457,12 +1467,59 @@ function registerGoalRuntime(pi: ExtensionAPI, options?: HybridGoalOptions) {
 		runtime.lastVerdict = undefined;
 		clearPersistedGoal(ctx.cwd);
 		ctx.ui.setStatus(STATUS_KEY, undefined);
+		syncGoalTools();
 	}
 
 	function showCompletionStatus(ctx: StatusContext) {
 		// Persistent: keep the colored "goal complete" marker in the footer until the
 		// next goal starts or the user clears it (no auto-clear timer).
 		ctx.ui.setStatus(STATUS_KEY, formatStatus({ status: "complete" } as ActiveGoal, undefined, ctx.ui.theme));
+		syncGoalTools();
+	}
+
+	/** True when goal tools should be on the model-visible active set. */
+	function goalToolsShouldBeActive(goal?: ActiveGoal): boolean {
+		if (!goal) return false;
+		// budget_limited still needs goal_complete for wrap-up verification.
+		return goal.status === "active" || goal.status === "budget_limited";
+	}
+
+	/**
+	 * Keep goal_complete / goal_blocked registered but only active while a /goal
+	 * is usable. Goal mode is user-activated (/goal); tools must not look like
+	 * always-on agent capabilities.
+	 */
+	function syncGoalTools() {
+		const api = runtime.pi as ExtensionAPI & {
+			getActiveTools?: () => string[];
+			setActiveTools?: (names: string[]) => void;
+		};
+		if (typeof api.getActiveTools !== "function" || typeof api.setActiveTools !== "function") {
+			return;
+		}
+		let active: string[];
+		try {
+			active = api.getActiveTools();
+		} catch {
+			return;
+		}
+		if (!Array.isArray(active)) return;
+
+		const want = goalToolsShouldBeActive(runtime.activeGoal);
+		const present = new Set(active);
+		const hasAll = GOAL_TOOL_NAMES.every((name) => present.has(name));
+		const hasAny = GOAL_TOOL_NAMES.some((name) => present.has(name));
+		if (want && hasAll) return;
+		if (!want && !hasAny) return;
+
+		const next = want
+			? [...new Set([...active, ...GOAL_TOOL_NAMES])]
+			: active.filter((name) => !GOAL_TOOL_NAMES.includes(name as GoalToolName));
+		try {
+			api.setActiveTools(next);
+		} catch {
+			// Runner not bound yet, or concurrent session teardown.
+		}
 	}
 }
 

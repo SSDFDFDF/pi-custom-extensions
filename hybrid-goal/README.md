@@ -49,6 +49,8 @@ Writes `~/.pi/agent/hybrid-goal.config.json`. Reload to fully apply runtime opti
 - `goal_complete({ goal_id, summary })` — local checks, then optional independent judge. Judge **on by default** (session model when `judgeModel` empty). Off: `judgeEnabled=false`.
 - `goal_blocked({ goal_id, reason, evidence, repeated_turns })` — true impasse only (≥3 turns).
 
+These tools are **registered always** but **active only while a user `/goal` is usable** (`active` or `budget_limited` wrap-up). Without `/goal`, they are stripped from the model-visible tool set (and their prompt snippets/guidelines). Goal mode is not an always-on agent capability.
+
 ## Config
 
 | key | default | meaning |

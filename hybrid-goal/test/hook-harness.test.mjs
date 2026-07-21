@@ -26,6 +26,8 @@ function createHarness() {
 	const entries = [];
 	const compactCalls = [];
 	const tools = new Map();
+	let activeTools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+	const activeToolHistory = [];
 	let commandHandler;
 	const branch = [];
 	let contextPercent = null;
@@ -42,7 +44,18 @@ function createHarness() {
 		},
 		registerTool(tool) {
 			const name = tool?.name ?? tool?.toolName;
-			if (name) tools.set(name, tool);
+			if (name) {
+				tools.set(name, tool);
+				// Pi makes newly registered tools available; goal runtime must strip until /goal.
+				if (!activeTools.includes(name)) activeTools = [...activeTools, name];
+			}
+		},
+		getActiveTools() {
+			return [...activeTools];
+		},
+		setActiveTools(names) {
+			activeTools = [...names];
+			activeToolHistory.push([...names]);
 		},
 		appendEntry(type, data) {
 			entries.push({ type, data });
@@ -60,6 +73,12 @@ function createHarness() {
 		entries,
 		compactCalls,
 		tools,
+		activeToolHistory,
+		getActiveTools: () => [...activeTools],
+		setActiveTools: (names) => {
+			activeTools = [...names];
+			activeToolHistory.push([...names]);
+		},
 		branch,
 		get aborted() {
 			return aborted;
@@ -340,4 +359,54 @@ test("hook harness: goal_complete rejects empty summary; accepts with judge off"
 	});
 	assert.match(String(ok?.content?.[0]?.text ?? ""), /Goal complete/i);
 	assert.equal(ok?.terminate, true);
+});
+
+test("hook harness: goal tools inactive until /goal; active while running; off after complete/pause", async () => {
+	const h = createHarness();
+	const runtime = await h.boot(await loadGoal());
+
+	// session_start with no goal should strip auto-activated goal tools
+	assert.equal(h.getActiveTools().includes("goal_complete"), false);
+	assert.equal(h.getActiveTools().includes("goal_blocked"), false);
+
+	await runtime.startGoal("finish the work");
+	assert.equal(h.getActiveTools().includes("goal_complete"), true);
+	assert.equal(h.getActiveTools().includes("goal_blocked"), true);
+	// other tools preserved
+	assert.equal(h.getActiveTools().includes("bash"), true);
+
+	await runtime.runCommand("pause");
+	assert.equal(h.getActiveTools().includes("goal_complete"), false);
+	assert.equal(h.getActiveTools().includes("goal_blocked"), false);
+
+	await runtime.runCommand("resume");
+	assert.equal(h.getActiveTools().includes("goal_complete"), true);
+
+	const goalId = runtime.latestGoalId();
+	const ok = await runtime.callTool("goal_complete", {
+		goal_id: goalId,
+		summary: "Implemented and verified with tests in worktree.",
+	});
+	assert.match(String(ok?.content?.[0]?.text ?? ""), /Goal complete/i);
+	assert.equal(h.getActiveTools().includes("goal_complete"), false);
+	assert.equal(h.getActiveTools().includes("goal_blocked"), false);
+});
+
+test("hook harness: before_agent_start re-syncs goal tools with active goal", async () => {
+	const h = createHarness();
+	const runtime = await h.boot(await loadGoal());
+	await runtime.startGoal("finish the work");
+	assert.equal(h.getActiveTools().includes("goal_complete"), true);
+
+	// External tool-set change drops goal tools mid-run.
+	h.setActiveTools(h.getActiveTools().filter((n) => n !== "goal_complete" && n !== "goal_blocked"));
+	assert.equal(h.getActiveTools().includes("goal_complete"), false);
+
+	const result = await runtime.emit("before_agent_start", {
+		prompt: "continue",
+		systemPrompt: "base",
+	});
+	assert.match(String(result?.systemPrompt ?? ""), /Active \/goal/);
+	assert.equal(h.getActiveTools().includes("goal_complete"), true);
+	assert.equal(h.getActiveTools().includes("goal_blocked"), true);
 });
