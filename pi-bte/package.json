@@ -1,7 +1,7 @@
 {
   "name": "pi-bte",
   "version": "0.2.0",
-  "description": "Structured board/task tools for Pi: items[] create/update/replace, optional multi-board.",
+  "description": "Structured board/task tools for Pi: items[] create/update, optional multi-board.",
   "type": "module",
   "private": true,
   "keywords": [

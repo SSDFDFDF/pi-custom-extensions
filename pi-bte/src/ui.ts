@@ -267,9 +267,6 @@ export function formatStatusText(state: BteState): string {
 			(active ? ` active=${active.id} (${active.title})` : " active=(none)"),
 		`tasks in scope: ${scoped.length} (done=${counts.completed} active=${counts.in_progress} pending=${counts.pending} cancelled=${counts.cancelled}) total=${state.tasks.length}`,
 	];
-	const note = active ? active.note : state.note;
-	if (note) lines.push(`note: ${note}`);
-
 	if (state.boards.length) {
 		lines.push("");
 		lines.push("Boards:");

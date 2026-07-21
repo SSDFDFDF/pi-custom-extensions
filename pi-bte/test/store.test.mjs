@@ -48,57 +48,6 @@ describe("BteStore", () => {
 		assert.equal(t.tasks[0].boardId, b.board.id);
 	});
 
-	it("replaceTasks rewrites only the scoped board", () => {
-		const store = new BteStore();
-		const auth = store.createBoard({ title: "Auth", activate: true });
-		const ui = store.createBoard({ title: "UI", activate: false });
-		assert.equal(auth.ok && ui.ok, true);
-		store.replaceTasks(
-			[
-				{ subject: "Login", status: "completed" },
-				{ subject: "Tokens", status: "pending" },
-			],
-			"auth work",
-			auth.board.id,
-		);
-		store.replaceTasks(
-			[{ subject: "Layout", status: "in_progress" }],
-			undefined,
-			ui.board.id,
-		);
-		assert.equal(store.listTasks(auth.board.id).length, 2);
-		assert.equal(store.listTasks(ui.board.id).length, 1);
-	});
-
-	it("replaceTasks rejects empty list and multiple in_progress", () => {
-		const store = new BteStore();
-		assert.equal(store.replaceTasks([]).ok, false);
-		assert.equal(
-			store.replaceTasks([
-				{ subject: "A", status: "in_progress" },
-				{ subject: "B", status: "in_progress" },
-			]).ok,
-			false,
-		);
-	});
-
-	it("replaceTasks preserves ids and reports removedCount", () => {
-		const store = new BteStore();
-		const first = store.replaceTasks([
-			{ subject: "Map auth", status: "completed" },
-			{ subject: "Add tokens", status: "pending" },
-		]);
-		assert.equal(first.ok, true);
-		const id0 = first.tasks[0].id;
-		const renamed = store.replaceTasks([
-			{ id: id0, subject: "Mapped auth", status: "completed" },
-			{ subject: "Only this", status: "pending" },
-		]);
-		assert.equal(renamed.ok, true);
-		assert.equal(renamed.tasks[0].id, id0);
-		assert.equal(renamed.removedCount, 1);
-	});
-
 	it("each board allows its own in_progress", () => {
 		const store = new BteStore();
 		const a = store.createBoard({ title: "A" });
@@ -157,22 +106,6 @@ describe("BteStore", () => {
 		store.switchBoard(null);
 		assert.equal(store.listTasks().length, 0);
 		assert.equal(store.listTasks("*").length, 2);
-	});
-
-	it("can force standalone replace while a board is active", () => {
-		const store = new BteStore();
-		store.createBoard({ title: "A" });
-		store.createTasks({ items: [{ subject: "InBoard" }] });
-		const alone = store.replaceTasks(
-			[{ subject: "Solo", status: "pending" }],
-			"note",
-			null,
-		);
-		assert.equal(alone.ok, true);
-		assert.equal(alone.scopeBoardId, undefined);
-		assert.equal(store.listTasks(null)[0].subject, "Solo");
-		assert.equal(store.getState().note, "note");
-		assert.equal(store.listTasks().length, 1);
 	});
 
 	it("clearTasks rejects unknown board; keeps ids monotonic", () => {
@@ -273,17 +206,30 @@ describe("BteStore", () => {
 		assert.equal(store.listTasks()[0].subject, "Live");
 	});
 
-	it("standalone note does not bleed into active board explanation", () => {
+	it("updateTasks status=deleted removes the task", () => {
 		const store = new BteStore();
-		store.replaceTasks([{ subject: "Solo", status: "pending" }], "solo-note", null);
-		store.createBoard({ title: "Auth" });
-		// Board is active; board has no note — must not show solo-note.
-		const details = store.boardDetails();
-		assert.equal(details.explanation, undefined);
-		const ctx = renderAgentContext(store.getState());
-		assert.doesNotMatch(ctx, /solo-note/);
-		// Standalone scope still keeps the note in state.
-		assert.equal(store.getState().note, "solo-note");
+		const c = store.createTasks({
+			items: [{ subject: "A" }, { subject: "B" }],
+		});
+		const [a, b] = c.tasks;
+		const r = store.updateTasks({ items: [{ taskId: a.id, status: "deleted" }] });
+		assert.equal(r.ok, true);
+		assert.equal(store.getTask(a.id), undefined);
+		assert.equal(store.getTask(b.id).subject, "B");
+		assert.equal(store.listTasks().length, 1);
+	});
+
+	it("clearTasks wipes the active scope only", () => {
+		const store = new BteStore();
+		const a = store.createBoard({ title: "A" });
+		const b = store.createBoard({ title: "B", activate: false });
+		store.createTasks({ items: [{ subject: "InA" }], boardId: a.board.id });
+		store.createTasks({ items: [{ subject: "InB" }], boardId: b.board.id });
+		const r = store.clearTasks({ scope: a.board.id });
+		assert.equal(r.ok, true);
+		assert.equal(r.removed, 1);
+		assert.equal(store.listTasks(a.board.id).length, 0);
+		assert.equal(store.listTasks(b.board.id).length, 1);
 	});
 
 	it("createTasks rejects list-only board tokens", () => {
@@ -372,39 +318,14 @@ describe("BteStore", () => {
 		assert.equal(store.getTask(c.tasks[1].id).status, "pending");
 	});
 
-	it("replaceTasks rejects unknown id", () => {
-		const store = new BteStore();
-		store.createTasks({ items: [{ subject: "A" }] });
-		const bad = store.replaceTasks([
-			{ id: "t999", subject: "Ghost", status: "pending" },
-		]);
-		assert.equal(bad.ok, false);
-		assert.match(bad.error, /Unknown task id/i);
-		assert.equal(store.listTasks().length, 1);
-	});
-
-	it("replaceTasks matches subject to preserve id without explicit id", () => {
-		const store = new BteStore();
-		const first = store.replaceTasks([
-			{ subject: "Same", status: "pending" },
-		]);
-		const id = first.tasks[0].id;
-		const second = store.replaceTasks([
-			{ subject: "Same", status: "completed" },
-		]);
-		assert.equal(second.ok, true);
-		assert.equal(second.tasks[0].id, id);
-		assert.equal(second.tasks[0].status, "completed");
-	});
 });
 
 describe("renderAgentContext", () => {
-	it("task-first copy and standalone note", () => {
+	it("task-first copy in agent context", () => {
 		const store = new BteStore();
-		store.replaceTasks([{ subject: "Only", status: "pending" }], "hello");
+		store.createTasks({ items: [{ subject: "Only", status: "pending" }] });
 		const ctx = renderAgentContext(store.getState());
 		assert.match(ctx, /items\[\]/i);
-		assert.match(ctx, /Note: hello/);
 	});
 
 	it("flags in_progress outside active board", () => {

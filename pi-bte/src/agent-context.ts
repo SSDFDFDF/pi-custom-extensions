@@ -19,7 +19,7 @@ export function renderAgentContext(state: BteState): string {
 
 	lines.push("[TASK BOARD]");
 	lines.push(
-		"task actions: create/update/replace all use items[]. create=append, update=patch by id (omitted kept), replace=full scope snapshot (omitted deleted). Prefer update for progress. One in_progress per board (or standalone).",
+		"task actions: create/update use items[]. create=append, update=patch by id (omitted kept; status=deleted removes). clear wipes a scope. One in_progress per board (or standalone).",
 	);
 
 	if (state.boards.length > 0) {
@@ -83,10 +83,6 @@ export function renderAgentContext(state: BteState): string {
 		lines.push(`Doc${active.doc.title ? ` (${active.doc.title})` : ""}:`);
 		lines.push(snippet);
 	}
-
-	// Active board uses board.note only; standalone scope uses state.note.
-	const note = active ? active.note : state.note;
-	if (note) lines.push(`Note: ${note}`);
 
 	return lines.join("\n");
 }

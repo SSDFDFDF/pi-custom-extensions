@@ -5,7 +5,7 @@ Structured task/board tools for Pi agents. **No plan mode, no tool locks, no goa
 ## Default path
 
 ```text
-task create / update / replace / list   ← primary (writes use items[])
+task create / update / list   ← primary (writes use items[])
 ```
 
 ## Advanced: multi-board
@@ -30,15 +30,15 @@ Rules:
 - At most one `in_progress` **per scope** (per board, or among standalone tasks).
 - **All write shapes use `items[]` only** (length 1 = single item). No parallel single-field create/update.
 - `create` = **append** (never deletes).
-- `update` = **patch by taskId** (omitted tasks kept).
-- `replace` = **full scope snapshot** (omitted steps deleted; empty rejected — use `task clear`).
+- `update` = **patch by taskId** (omitted tasks kept; `status:"deleted"` removes a task).
+- `clear` = **wipe a scope** (the only bulk delete).
 - No hybrid-goal coupling.
 
 ## Tools
 
 | Tool | Role |
 |------|------|
-| **task** | Primary: create / update / replace / get / list / clear |
+| **task** | Primary: create / update / get / list / clear |
 | **board** | Optional multi-board CRUD |
 | **board_doc** | Optional markdown on a board |
 
@@ -75,19 +75,20 @@ Rules:
 }
 ```
 
-### `task replace` (full snapshot)
+### `task update` (delete)
+
+Removal is an explicit patch — set `status` to `deleted`:
 
 ```json
 {
-  "action": "replace",
-  "boardId": "b1",
-  "explanation": "Auth milestone",
+  "action": "update",
   "items": [
-    { "id": "t1", "subject": "Map auth", "status": "completed" },
-    { "subject": "Add tests", "status": "pending" }
+    { "taskId": "t3", "status": "deleted" }
   ]
 }
 ```
+
+To wipe a whole scope, use `task clear` (optionally `boardId`).
 
 ### Tool `details`
 
@@ -95,12 +96,8 @@ Rules:
 |-------|---------|
 | `tasks` | **Full** task list (all scopes) — required for session reconstruction |
 | `scopedTasks` | Active/default scope, **or** the scope of a `task list` call |
-| `focusTasks` / `focusBoardId` / `removedCount` | Last write focus (especially replace) |
-| `explanation` | **Scope display note**: active board’s `note`, or standalone `state.note` when no active board; tool may override |
-| `note` | **Standalone-only** persisted note (`state.note`); may be set even when a board is active — do **not** treat as the active board’s caption |
+| `focusTasks` / `focusBoardId` | Last write focus |
 | `boards` / `activeBoardId` / sequences / `doc` | Board metadata |
-
-Prefer **`explanation`** for “what note to show for this result.” Use **`note`** only if you need the standalone-scope persisted field.
 
 ## Command
 

@@ -28,12 +28,13 @@ describe("registerTools", () => {
 		assert.deepEqual([...tools.keys()].sort(), ["board", "board_doc", "task"]);
 	});
 
-	it("task-first naming; replace is full snapshot", () => {
+	it("task-first naming; items[] create/update", () => {
 		const { tools } = captureTools();
 		assert.match(tools.get("task").promptSnippet, /items\[\]/i);
 		assert.match(tools.get("board").promptSnippet, /advanced|Optional/i);
-		assert.match(tools.get("task").description, /replace/i);
+		assert.match(tools.get("task").description, /update/i);
 		assert.match(tools.get("task").description, /items\[\]/i);
+		assert.doesNotMatch(tools.get("task").description, /replace/i);
 	});
 
 	it("board switch requires boardId; empty clears", async () => {
@@ -48,76 +49,6 @@ describe("registerTools", () => {
 		});
 		assert.equal(cleared.isError, undefined);
 		assert.equal(store.getState().activeBoardId, undefined);
-	});
-
-	it("replace empty items rejected", async () => {
-		const { tools, store } = captureTools();
-		await tools.get("task").execute("1", {
-			action: "create",
-			items: [{ subject: "Keep" }],
-		});
-		const wiped = await tools.get("task").execute("2", {
-			action: "replace",
-			items: [],
-		});
-		assert.equal(wiped.isError, true);
-		assert.equal(store.listTasks("*").length, 1);
-	});
-
-	it("replace on non-active board sets focusTasks", async () => {
-		const { tools, store } = captureTools();
-		await tools.get("board").execute("1", { action: "create", title: "Auth" });
-		await tools.get("board").execute("2", {
-			action: "create",
-			title: "UI",
-			activate: false,
-		});
-		const authId = store.getState().activeBoardId;
-		const uiId = store.listBoards().find((b) => b.id !== authId)?.id;
-		await tools.get("task").execute("3", {
-			action: "replace",
-			boardId: authId,
-			items: [
-				{ subject: "Auth A", status: "pending" },
-				{ subject: "Auth B", status: "pending" },
-			],
-		});
-		const written = await tools.get("task").execute("4", {
-			action: "replace",
-			boardId: uiId,
-			items: [{ subject: "UI only", status: "in_progress" }],
-		});
-		assert.equal(written.details.focusBoardId, uiId);
-		assert.deepEqual(
-			written.details.focusTasks.map((t) => t.subject),
-			["UI only"],
-		);
-		const rendered = tools.get("task").renderResult(
-			written,
-			{ expanded: true },
-			theme(),
-		);
-		assert.match(String(rendered.text ?? rendered), /UI only/);
-		assert.doesNotMatch(String(rendered.text ?? rendered), /Auth A/);
-	});
-
-	it("replace standalone alias while board active", async () => {
-		const { tools, store } = captureTools();
-		await tools.get("board").execute("1", { action: "create", title: "P" });
-		await tools.get("task").execute("2", {
-			action: "create",
-			items: [{ subject: "InBoard" }],
-		});
-		const written = await tools.get("task").execute("3", {
-			action: "replace",
-			boardId: "standalone",
-			explanation: "solo",
-			items: [{ subject: "Loose only", status: "pending" }],
-		});
-		assert.equal(written.isError, undefined);
-		assert.equal(written.details.focusBoardId, null);
-		assert.equal(store.listTasks(null)[0].subject, "Loose only");
-		assert.equal(store.getState().note, "solo");
 	});
 
 	it("task-only happy path with batch create/update", async () => {
@@ -139,6 +70,34 @@ describe("registerTools", () => {
 		});
 		assert.equal(store.getTask(idA).status, "completed");
 		assert.equal(store.getTask(idB).status, "in_progress");
+	});
+
+	it("update status=deleted removes a task via the tool", async () => {
+		const { tools, store } = captureTools();
+		const created = await tools.get("task").execute("1", {
+			action: "create",
+			items: [{ subject: "Keep" }, { subject: "Drop" }],
+		});
+		const ids = [...created.content[0].text.matchAll(/(t\d+)/g)].map((m) => m[1]);
+		const res = await tools.get("task").execute("2", {
+			action: "update",
+			items: [{ taskId: ids[1], status: "deleted" }],
+		});
+		assert.equal(res.isError, undefined);
+		assert.equal(store.listTasks("*").length, 1);
+		assert.equal(store.listTasks("*")[0].subject, "Keep");
+	});
+
+	it("clear wipes scope via the tool", async () => {
+		const { tools, store } = captureTools();
+		await tools.get("task").execute("1", {
+			action: "create",
+			items: [{ subject: "A" }, { subject: "B" }],
+		});
+		const res = await tools.get("task").execute("2", { action: "clear" });
+		assert.equal(res.isError, undefined);
+		assert.match(res.content[0].text, /Cleared 2/);
+		assert.equal(store.listTasks("*").length, 0);
 	});
 
 	it("task clear unknown board errors", async () => {
@@ -188,19 +147,6 @@ describe("registerTools", () => {
 		assert.match(result.content[0].text, /not found/i);
 	});
 
-	it("replace boardId=* explains list/clear only", async () => {
-		const { tools, store } = captureTools();
-		store.createTasks({ items: [{ subject: "Keep" }] });
-		const result = await tools.get("task").execute("1", {
-			action: "replace",
-			boardId: "*",
-			items: [{ subject: "Nope", status: "pending" }],
-		});
-		assert.equal(result.isError, true);
-		assert.match(result.content[0].text, /list\/clear/i);
-		assert.equal(store.listTasks("*").length, 1);
-	});
-
 	it("get accepts taskIds array", async () => {
 		const { tools, store } = captureTools();
 		const c = store.createTasks({
@@ -233,16 +179,6 @@ describe("registerTools", () => {
 		});
 		assert.equal(result.isError, true);
 		assert.match(result.content[0].text, /action=create|taskId/i);
-	});
-
-	it("replace with taskId field errors helpfully", async () => {
-		const { tools } = captureTools();
-		const result = await tools.get("task").execute("1", {
-			action: "replace",
-			items: [{ taskId: "t1", subject: "X", status: "pending" }],
-		});
-		assert.equal(result.isError, true);
-		assert.match(result.content[0].text, /id \(not taskId\)|taskId/i);
 	});
 
 	it("get missing task id is error", async () => {

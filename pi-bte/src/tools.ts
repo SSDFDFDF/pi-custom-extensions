@@ -1,6 +1,6 @@
 /**
  * Tool registration — board | task | board_doc
- * task writes are items[]-only: create | update | replace
+ * task writes are items[]-only: create | update
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -19,7 +19,6 @@ import {
 } from "./types.ts";
 import {
 	normalizeCreateItems,
-	normalizeReplaceItems,
 	normalizeUpdateItems,
 } from "./task-params.ts";
 
@@ -42,7 +41,7 @@ const MutationStatusEnum = StringEnum([
 const CreateItemSchema = Type.Object({
 	subject: Type.String({
 		minLength: 1,
-		description: "create/replace: task title. Not used alone on update (need taskId).",
+		description: "Task title (create).",
 	}),
 	description: Type.Optional(Type.String()),
 	activeForm: Type.Optional(Type.String()),
@@ -72,31 +71,15 @@ const UpdateItemSchema = Type.Object({
 	removeBlockedBy: Type.Optional(Type.Array(Type.String())),
 });
 
-/** replace items: subject+status required; optional id keeps identity. */
-const ReplaceItemSchema = Type.Object({
-	subject: Type.String({ minLength: 1 }),
-	status: StatusEnum,
-	id: Type.Optional(
-		Type.String({
-			description: "replace only: existing task id to keep identity on rename.",
-		}),
-	),
-	description: Type.Optional(Type.String()),
-	activeForm: Type.Optional(Type.String()),
-	blocks: Type.Optional(Type.Array(Type.String())),
-	blockedBy: Type.Optional(Type.Array(Type.String())),
-});
-
 /**
  * Shared items array (union). Runtime normalizers enforce the shape for each action:
  * - create: subject (+ optional status/deps); no taskId
  * - update: taskId (+ patch fields); no bare create-only rows
- * - replace: subject + status (+ optional id)
  */
 const ItemsSchema = Type.Optional(
-	Type.Array(Type.Union([CreateItemSchema, UpdateItemSchema, ReplaceItemSchema]), {
+	Type.Array(Type.Union([CreateItemSchema, UpdateItemSchema]), {
 		description:
-			"Required for create/update/replace (min 1). create=[{subject,…}]; update=[{taskId,…}]; replace=[{subject,status,id?,…}]. Do not mix shapes in one call.",
+			"Required for create/update (min 1). create=[{subject,…}]; update=[{taskId,…}]. Do not mix shapes in one call.",
 		minItems: 1,
 	}),
 );
@@ -241,20 +224,16 @@ export function registerTools(
 		name: "task",
 		label: "Task",
 		description:
-			"Task tool: create | update | replace | get | list | clear. create/update/replace use items[] only (length 1 = single). create=append, update=patch by id (omitted kept), replace=full scope snapshot (omitted deleted).",
-		promptSnippet: "Primary: items[] create/update/replace + list",
+			"Task tool: create | update | get | list | clear. Writes use items[]. create appends; update patches by taskId (status=deleted removes one).",
+		promptSnippet: "Primary: items[] create/update + list",
 		promptGuidelines: [
-			"create/update/replace always use items[] — never parallel single-field forms.",
-			"create = append only (items need subject); update = patch by taskId (safe); replace = full rewrite (subject+status; omitted deleted).",
-			"Do not mix create rows (subject) with update rows (taskId) in one items[] call.",
-			"Bootstrap with create items[] (or one replace); progress with update items[].",
-			"Do not pass boardId='*' on create/update/replace; '*' is only for list/clear.",
+			"Do not mix create rows (subject) with update rows (taskId) in one call.",
+			"boardId '*' is list/clear only, never on create/update.",
 		],
 		parameters: Type.Object({
 			action: StringEnum([
 				"create",
 				"update",
-				"replace",
 				"get",
 				"list",
 				"clear",
@@ -269,12 +248,7 @@ export function registerTools(
 			boardId: Type.Optional(
 				Type.String({
 					description:
-						"create/replace: target scope (board id or empty/standalone). list/clear: scope, '*'=all. Not for update (use item.boardId to move).",
-				}),
-			),
-			explanation: Type.Optional(
-				Type.String({
-					description: "replace only: optional scope note.",
+						"create: target scope (board id or empty/standalone). list/clear: scope, '*'=all. Not for update (use item.boardId to move).",
 				}),
 			),
 		}),
@@ -394,63 +368,6 @@ export function registerTools(
 						}),
 					);
 				}
-				case "replace": {
-					if (isListOnlyBoardToken(params.boardId)) {
-						return err(
-							store,
-							"replace",
-							'boardId "*" / "all" is only valid for task list/clear',
-						);
-					}
-					const items = normalizeReplaceItems(params.items);
-					if (!items.ok) return err(store, "replace", items.error);
-					const scope =
-						params.boardId === undefined
-							? undefined
-							: parseBoardRef(params.boardId);
-					const result = store.replaceTasks(
-						items.value,
-						params.explanation,
-						scope,
-					);
-					if (!result.ok) {
-						return {
-							content: [{ type: "text" as const, text: `Error: ${result.error}` }],
-							details: store.boardDetails({
-								kind: "task",
-								action: "replace",
-								explanation: params.explanation,
-								error: result.error,
-							}),
-							isError: true,
-						};
-					}
-					onChange();
-					const scopeLabel = result.scopeBoardId
-						? `board ${result.scopeBoardId}`
-						: "standalone";
-					const removed =
-						result.removedCount > 0 ? `, removed ${result.removedCount}` : "";
-					const text = [
-						`Replaced scope (${scopeLabel}${removed})`,
-						params.explanation ? `Note: ${params.explanation}` : undefined,
-						formatTaskList(result.tasks),
-					]
-						.filter(Boolean)
-						.join("\n");
-					return {
-						content: [{ type: "text" as const, text }],
-						details: store.boardDetails({
-							kind: "task",
-							action: "replace",
-							explanation: params.explanation,
-							focusTasks: result.tasks,
-							focusBoardId: result.scopeBoardId ?? null,
-							removedCount: result.removedCount,
-							changedIds: result.tasks.map((t) => t.id),
-						}),
-					};
-				}
 				case "clear": {
 					const scope = parseListScope(params.boardId);
 					const result = store.clearTasks({ scope });
@@ -474,49 +391,10 @@ export function registerTools(
 			if (n > 0) text += ` ${theme.fg("dim", `${n} item(s)`)}`;
 			const ids = Array.isArray(args.taskIds) ? args.taskIds.length : 0;
 			if (ids > 0) text += ` ${theme.fg("accent", `${ids} id(s)`)}`;
-			if (args.explanation)
-				text += theme.fg("dim", ` — ${String(args.explanation).slice(0, 40)}`);
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, { expanded }, theme) {
-			const details = result.details as
-				| ReturnType<BteStore["boardDetails"]>
-				| undefined;
-			if (result.isError) {
-				const t = result.content[0];
-				const msg = t?.type === "text" ? t.text : "error";
-				return new Text(theme.fg("error", msg), 0, 0);
-			}
-			if (details?.action === "replace" && details.focusTasks?.length) {
-				const tasks = details.focusTasks;
-				const removed =
-					details.removedCount && details.removedCount > 0
-						? theme.fg("dim", ` (−${details.removedCount})`)
-						: "";
-				const head = theme.fg("success", "✓ Replaced") + removed;
-				const show = expanded ? tasks : tasks.slice(0, 8);
-				let body = head;
-				for (const t of show) {
-					const mark =
-						t.status === "completed"
-							? theme.fg("success", "✓")
-							: t.status === "in_progress"
-								? theme.fg("accent", "►")
-								: t.status === "cancelled"
-									? theme.fg("dim", "–")
-									: theme.fg("dim", "○");
-					const subj =
-						t.status === "completed" || t.status === "cancelled"
-							? theme.fg("dim", t.subject)
-							: theme.fg("muted", t.subject);
-					body += `\n${mark} ${theme.fg("accent", t.id)} ${subj}`;
-				}
-				if (!expanded && tasks.length > 8) {
-					body += `\n${theme.fg("dim", `… ${tasks.length - 8} more`)}`;
-				}
-				return new Text(body, 0, 0);
-			}
+		renderResult(result, _opts, theme) {
 			return renderSimple(result, theme);
 		},
 	});

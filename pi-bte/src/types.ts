@@ -29,8 +29,6 @@ export interface Board {
 	id: string;
 	title: string;
 	doc?: BoardDoc;
-	/** Last replace-note for this board (from task replace explanation). */
-	note?: string;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -40,8 +38,6 @@ export interface BteState {
 	/** Default scope for tools; undefined = standalone tasks. */
 	activeBoardId?: string;
 	tasks: Task[];
-	/** Last replace-note when scope was standalone (from task replace explanation). */
-	note?: string;
 	nextTaskSeq: number;
 	nextBoardSeq: number;
 	updatedAt: number;
@@ -64,7 +60,6 @@ export type ToolDetailsKind = "board" | "task" | "board_doc" | "state";
 export interface BoardDetails {
 	kind: ToolDetailsKind;
 	action?: string;
-	explanation?: string;
 	/** Full task list (all scopes) — session reconstruction. */
 	tasks: Task[];
 	/** Active/default scope tasks. */
@@ -73,10 +68,8 @@ export interface BoardDetails {
 	focusTasks?: Task[];
 	/** Board id of focusTasks, or null for standalone. */
 	focusBoardId?: string | null;
-	removedCount?: number;
 	boards: Board[];
 	activeBoardId?: string;
-	note?: string;
 	nextTaskSeq: number;
 	nextBoardSeq: number;
 	doc?: BoardDoc;
@@ -115,7 +108,6 @@ export function cloneState(state: BteState): BteState {
 		boards: state.boards.map(cloneBoard),
 		activeBoardId: state.activeBoardId,
 		tasks: state.tasks.map(cloneTask),
-		note: state.note,
 		nextTaskSeq: state.nextTaskSeq,
 		nextBoardSeq: state.nextBoardSeq,
 		updatedAt: state.updatedAt,
@@ -207,7 +199,7 @@ export function isTaskStatus(value: unknown): value is TaskStatus {
 }
 
 /**
- * Board association for create/update/replace scope.
+ * Board association for create/update scope.
  * undefined = inherit active; null = standalone; string = board id.
  */
 export function parseBoardRef(

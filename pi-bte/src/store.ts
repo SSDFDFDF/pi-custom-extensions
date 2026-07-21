@@ -1,6 +1,6 @@
 /**
  * pi-bte store — boards + flat tasks (optional boardId).
- * Task writes are items[]-only: createTasks | updateTasks | replaceTasks.
+ * Task writes are items[]-only: createTasks | updateTasks.
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -313,168 +313,6 @@ export class BteStore {
 		return { ok: true, tasks: touched };
 	}
 
-	/**
-	 * Full replace of tasks in one scope. Omitted tasks are deleted.
-	 * boardId: undefined=active/default, null=standalone, string=that board.
-	 * Empty items rejected — use clearTasks.
-	 */
-	replaceTasks(
-		items: Array<{
-			subject: string;
-			status: TaskStatus;
-			id?: string;
-			description?: string;
-			activeForm?: string;
-			blocks?: string[];
-			blockedBy?: string[];
-			metadata?: Record<string, unknown>;
-		}>,
-		note?: string,
-		boardId?: string | null,
-	): {
-		ok: true;
-		tasks: Task[];
-		scopeBoardId?: string;
-		removedCount: number;
-	} | { ok: false; error: string } {
-		if (!items.length) {
-			return {
-				ok: false,
-				error: "replace items must be non-empty. Use task clear to wipe a scope.",
-			};
-		}
-		if (items.some((item) => !isTaskStatus(item.status))) {
-			return { ok: false, error: "Each item needs a valid status." };
-		}
-		if (items.filter((p) => p.status === "in_progress").length > 1) {
-			return { ok: false, error: "At most one step can be in_progress." };
-		}
-		if (items.some((p) => !p.subject?.trim())) {
-			return { ok: false, error: "Each item needs non-empty subject." };
-		}
-
-		const scope = this.resolveScope(boardId);
-		if (scope.error) return { ok: false, error: scope.error };
-		const scopeBoardId = scope.boardId;
-
-		if (scopeBoardId) {
-			const board = getBoard(this.state, scopeBoardId);
-			if (!board) return { ok: false, error: `board ${scopeBoardId} not found` };
-			if (note !== undefined) board.note = note || undefined;
-			board.updatedAt = Date.now();
-		} else if (note !== undefined) {
-			this.state.note = note || undefined;
-		}
-
-		const scoped = this.state.tasks.filter((t) =>
-			scopeBoardId ? t.boardId === scopeBoardId : !t.boardId,
-		);
-		const outside = this.state.tasks.filter((t) =>
-			scopeBoardId ? t.boardId !== scopeBoardId : Boolean(t.boardId),
-		);
-
-		const now = Date.now();
-		const prevById = new Map(scoped.map((task) => [task.id, task]));
-		const claimedIds = new Set<string>();
-		const explicitIds = items
-			.map((item) => item.id?.trim())
-			.filter((id): id is string => Boolean(id));
-		if (new Set(explicitIds).size !== explicitIds.length) {
-			return { ok: false, error: "Item ids must be unique." };
-		}
-		for (const id of explicitIds) {
-			if (!prevById.has(id)) {
-				return { ok: false, error: `Unknown task id: ${id}` };
-			}
-		}
-
-		const prevBySubject = new Map<string, Task[]>();
-		for (const task of scoped) {
-			const queue = prevBySubject.get(task.subject) ?? [];
-			queue.push(task);
-			prevBySubject.set(task.subject, queue);
-		}
-
-		const next: Task[] = [];
-		for (const item of items) {
-			const subject = item.subject.trim();
-			const explicitId = item.id?.trim();
-			let prev: Task | undefined;
-			if (explicitId) {
-				prev = prevById.get(explicitId);
-				claimedIds.add(explicitId);
-				const queue = prevBySubject.get(prev?.subject ?? "");
-				if (queue && prev) {
-					const idx = queue.findIndex((c) => c.id === prev!.id);
-					if (idx >= 0) queue.splice(idx, 1);
-				}
-			} else {
-				const queue = prevBySubject.get(subject);
-				while (queue?.length) {
-					const candidate = queue.shift();
-					if (!candidate || claimedIds.has(candidate.id)) continue;
-					prev = candidate;
-					claimedIds.add(candidate.id);
-					break;
-				}
-			}
-			const blocks =
-				item.blocks !== undefined
-					? normalizeIdList(item.blocks)
-					: prev?.blocks
-						? [...prev.blocks]
-						: undefined;
-			const blockedBy =
-				item.blockedBy !== undefined
-					? normalizeIdList(item.blockedBy)
-					: prev?.blockedBy
-						? [...prev.blockedBy]
-						: undefined;
-			next.push({
-				id: prev?.id ?? this.allocTaskId(),
-				subject,
-				description:
-					item.description !== undefined
-						? item.description.trim() || undefined
-						: prev?.description,
-				status: item.status,
-				activeForm:
-					item.activeForm !== undefined
-						? item.activeForm.trim() || undefined
-						: prev?.activeForm,
-				boardId: scopeBoardId,
-				blocks,
-				blockedBy,
-				metadata:
-					item.metadata !== undefined
-						? { ...item.metadata }
-						: prev?.metadata
-							? { ...prev.metadata }
-							: undefined,
-				createdAt: prev?.createdAt ?? now,
-				updatedAt: now,
-			});
-		}
-
-		const retainedIds = new Set(next.map((t) => t.id));
-		for (const task of next) {
-			task.blocks = pruneIds(task.blocks, retainedIds, task.id);
-			task.blockedBy = pruneIds(task.blockedBy, retainedIds, task.id);
-		}
-
-		const removedCount = scoped.filter((t) => !next.some((n) => n.id === t.id)).length;
-		this.bumpTaskSeq(next);
-		this.state.tasks = [...outside, ...next];
-		this.touch();
-		this.persist();
-		return {
-			ok: true,
-			tasks: next.map(cloneTask),
-			scopeBoardId,
-			removedCount,
-		};
-	}
-
 	getTask(taskId: string): Task | undefined {
 		const t = this.state.tasks.find((x) => x.id === taskId);
 		return t ? cloneTask(t) : undefined;
@@ -493,11 +331,9 @@ export class BteStore {
 		if (scope === "*") {
 			removed = this.state.tasks.length;
 			this.state.tasks = [];
-			this.state.note = undefined;
 			if (options?.clearDoc) {
 				for (const b of this.state.boards) b.doc = undefined;
 			}
-			for (const b of this.state.boards) b.note = undefined;
 		} else {
 			const resolved =
 				scope === null
@@ -516,12 +352,10 @@ export class BteStore {
 			const before = this.state.tasks.length;
 			if (resolved === null || resolved === undefined) {
 				this.state.tasks = this.state.tasks.filter((t) => t.boardId);
-				this.state.note = undefined;
 			} else {
 				this.state.tasks = this.state.tasks.filter((t) => t.boardId !== resolved);
 				const board = getBoard(this.state, resolved);
 				if (board) {
-					board.note = undefined;
 					if (options?.clearDoc) board.doc = undefined;
 					board.updatedAt = Date.now();
 				}
@@ -536,20 +370,15 @@ export class BteStore {
 	boardDetails(partial?: Partial<BoardDetails>): BoardDetails {
 		const s = this.getState();
 		const active = getActiveBoard(s);
-		// Do not fall back to standalone note while a board is active (scope bleed).
-		const scopeNote = active ? active.note : s.note;
 		return {
 			kind: partial?.kind ?? "state",
 			action: partial?.action,
-			explanation: partial?.explanation ?? scopeNote,
 			tasks: s.tasks,
 			scopedTasks: partial?.scopedTasks?.map(cloneTask) ?? tasksInScope(s),
 			focusTasks: partial?.focusTasks?.map(cloneTask),
 			focusBoardId: partial?.focusBoardId,
-			removedCount: partial?.removedCount,
 			boards: s.boards,
 			activeBoardId: s.activeBoardId,
-			note: s.note,
 			nextTaskSeq: s.nextTaskSeq,
 			nextBoardSeq: s.nextBoardSeq,
 			doc: active?.doc,
@@ -595,19 +424,6 @@ export class BteStore {
 		this.lastPersistedSnapshot = undefined;
 	}
 
-	private resolveScope(
-		boardId?: string | null,
-	): { boardId?: string; error?: string } {
-		if (boardId === null) return { boardId: undefined };
-		if (boardId !== undefined) {
-			if (!getBoard(this.state, boardId)) {
-				return { error: `board ${boardId} not found` };
-			}
-			return { boardId };
-		}
-		return { boardId: this.state.activeBoardId };
-	}
-
 	private resolveAssociation(
 		boardId?: string | null,
 	): { boardId?: string; error?: string } {
@@ -638,13 +454,11 @@ export class BteStore {
 		const payload = this.boardDetails({ kind: "state" });
 		const fingerprint = JSON.stringify({
 			activeBoardId: payload.activeBoardId ?? null,
-			note: this.state.note ?? null,
 			nextTaskSeq: payload.nextTaskSeq,
 			nextBoardSeq: payload.nextBoardSeq,
 			boards: payload.boards.map((b) => ({
 				id: b.id,
 				title: b.title,
-				note: b.note ?? null,
 				doc: b.doc ? { title: b.doc.title, body: b.doc.body } : null,
 			})),
 			tasks: payload.tasks.map((task) => ({

@@ -48,7 +48,7 @@ export function normalizeCreateItems(
 		if (typeof it.id === "string" && it.id.trim()) {
 			return {
 				ok: false,
-				error: `items[${i}]: create does not take id (use action=replace to keep identity, or omit id)`,
+				error: `items[${i}]: create does not take id (ids are assigned automatically)`,
 			};
 		}
 		const subject = typeof it.subject === "string" ? it.subject : "";
@@ -127,60 +127,6 @@ export function normalizeUpdateItems(
 			addBlockedBy: asStringArray(it.addBlockedBy),
 			removeBlocks: asStringArray(it.removeBlocks),
 			removeBlockedBy: asStringArray(it.removeBlockedBy),
-		});
-	}
-	return { ok: true, value };
-}
-
-export function normalizeReplaceItems(
-	raw: unknown,
-):
-	| {
-			ok: true;
-			value: Array<{
-				subject: string;
-				status: TaskStatus;
-				id?: string;
-				description?: string;
-				activeForm?: string;
-				blocks?: string[];
-				blockedBy?: string[];
-			}>;
-	  }
-	| { ok: false; error: string } {
-	if (!Array.isArray(raw) || raw.length === 0) {
-		return { ok: false, error: "items must be a non-empty array" };
-	}
-	const value = [];
-	for (let i = 0; i < raw.length; i++) {
-		const it = raw[i];
-		if (!isPlainObject(it)) {
-			return { ok: false, error: `items[${i}] must be an object` };
-		}
-		if (typeof it.taskId === "string" && it.taskId.trim()) {
-			return {
-				ok: false,
-				error: `items[${i}]: replace uses id (not taskId) to keep identity; or omit id for new rows`,
-			};
-		}
-		const subject = typeof it.subject === "string" ? it.subject : "";
-		if (!subject.trim()) {
-			return { ok: false, error: `items[${i}]: subject is required for replace` };
-		}
-		if (!isTaskStatus(it.status)) {
-			return {
-				ok: false,
-				error: `items[${i}]: status is required for replace (pending|in_progress|completed|cancelled)`,
-			};
-		}
-		value.push({
-			subject,
-			status: it.status,
-			id: typeof it.id === "string" ? it.id : undefined,
-			description: typeof it.description === "string" ? it.description : undefined,
-			activeForm: typeof it.activeForm === "string" ? it.activeForm : undefined,
-			blocks: asStringArray(it.blocks),
-			blockedBy: asStringArray(it.blockedBy),
 		});
 	}
 	return { ok: true, value };

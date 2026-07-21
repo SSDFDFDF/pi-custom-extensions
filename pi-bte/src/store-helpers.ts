@@ -268,7 +268,6 @@ function normalizeBoard(raw: Partial<Board>, now: number): Board | undefined {
 							typeof raw.doc.updatedAt === "number" ? raw.doc.updatedAt : now,
 					}
 				: undefined,
-		note: typeof raw?.note === "string" ? raw.note : undefined,
 		createdAt:
 			typeof raw?.createdAt === "number" && Number.isFinite(raw.createdAt)
 				? raw.createdAt
@@ -311,7 +310,6 @@ export function coerceState(data: unknown): BteState | undefined {
 			typeof d.activeBoardId === "string" && boardIds.has(d.activeBoardId)
 				? d.activeBoardId
 				: undefined,
-		note: typeof d.note === "string" ? d.note : undefined,
 		nextTaskSeq: d.nextTaskSeq as number,
 		nextBoardSeq: d.nextBoardSeq as number,
 		updatedAt: typeof d.updatedAt === "number" ? d.updatedAt : now,
