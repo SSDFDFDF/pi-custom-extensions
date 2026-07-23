@@ -215,7 +215,7 @@ export function registerShellTool(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use shell for one coherent objective; chain related commands with && when failure should stop the chain.",
       "Prefer filtered output (rg, test name filters, tail of failures). Avoid cat of large logs or source files.",
-      "Use read for known file content and apply_patch for direct source edits.",
+      "Use read for known file content, write for new files or complete rewrites, and apply_patch for precise source edits.",
     ],
     parameters: shellSchema,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {

@@ -10,8 +10,14 @@ import { Type, type Static } from "typebox";
 export const applyPatchSchema = Type.Object({
   patch: Type.String({
     description:
-      "Codex-compatible patch text starting with *** Begin Patch and ending with *** End Patch.",
+      "Codex-compatible patch text. First line MUST be exactly *** Begin Patch and last line MUST be exactly *** End Patch. This is not markdown: never write *** Begin Patch *** or *** End Patch ***. File paths are relative to the project cwd (no absolute paths unless allowOutsideWorkspace=true). Update hunk lines must start with ' ', '+', or '-'. Use @@ or @@ symbolName — not unified-diff line numbers.",
   }),
+  allowOutsideWorkspace: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true, allow absolute paths and paths outside the current project directory. Defaults to false. Prefer cwd-relative paths whenever possible.",
+    }),
+  ),
 });
 
 export type ApplyPatchInput = Static<typeof applyPatchSchema>;
@@ -39,11 +45,13 @@ interface FileChange {
 interface PatchPlan {
   root: string;
   changes: FileChange[];
+  allowOutsideWorkspace: boolean;
 }
 
 export interface ApplyPatchDetails {
   root: string;
   changes: Array<{ action: string; path: string; sourcePath?: string }>;
+  allowOutsideWorkspace: boolean;
 }
 
 const BEGIN = "*** Begin Patch";
@@ -53,9 +61,68 @@ const DELETE = "*** Delete File: ";
 const UPDATE = "*** Update File: ";
 const MOVE = "*** Move to: ";
 const EOF = "*** End of File";
+/** Models sometimes close headers like markdown fences: `*** Begin Patch ***`. */
+const BEGIN_FENCE = "*** Begin Patch ***";
+const END_FENCE = "*** End Patch ***";
+/** Models often emit unified-diff headers like `@@ -12,3 +12,4 @@`; ignore the line numbers. */
+const UNIFIED_DIFF_HUNK_HEADER =
+  /^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s*@@(?:\s+(.*))?$/;
 
 function parseError(message: string): Error {
   return new Error(`Invalid apply_patch: ${message}`);
+}
+
+function formatGot(line: string | undefined): string {
+  if (line === undefined) return "<missing>";
+  const preview = line.length > 80 ? `${line.slice(0, 77)}...` : line;
+  return JSON.stringify(preview);
+}
+
+function normalizeBoundaryLine(line: string | undefined, kind: "begin" | "end"): string | undefined {
+  if (line === undefined) return undefined;
+  const trimmed = line.trim();
+  if (kind === "begin") {
+    if (trimmed === BEGIN || trimmed === BEGIN_FENCE) return BEGIN;
+    return trimmed;
+  }
+  if (trimmed === END || trimmed === END_FENCE) return END;
+  return trimmed;
+}
+
+function parseChangeContext(headerLine: string): string | undefined {
+  if (headerLine === "@@" || headerLine === "@@ ") return undefined;
+  const unified = headerLine.match(UNIFIED_DIFF_HUNK_HEADER);
+  if (unified) {
+    const rest = unified[1]?.trim();
+    return rest || undefined;
+  }
+  if (headerLine.startsWith("@@ ")) {
+    return headerLine.slice(3).trim() || undefined;
+  }
+  // Fallback for odd variants such as "@@foo"
+  if (headerLine.startsWith("@@")) {
+    return headerLine.slice(2).trim() || undefined;
+  }
+  return undefined;
+}
+
+function emptyUpdateChunkError(path: string): Error {
+  return parseError(
+    [
+      `empty update chunk for ${path}`,
+      "hint: each @@ hunk needs at least one line with a leading space (context), '+' (add), or '-' (remove)",
+    ].join("\n"),
+  );
+}
+
+function unexpectedUpdateLineError(path: string, line: string, lineNumber: number): Error {
+  return parseError(
+    [
+      `unexpected update line in ${path} at patch line ${lineNumber}: ${line}`,
+      `got: ${formatGot(line)}`,
+      "hint: every hunk line must start with ' ' (context), '+' (add), or '-' (remove); unprefixed text is invalid",
+    ].join("\n"),
+  );
 }
 
 function parseFileLines(lines: string[], start: number, path: string): { lines: string[]; next: number } {
@@ -63,21 +130,38 @@ function parseFileLines(lines: string[], start: number, path: string): { lines: 
   let index = start;
   while (index < lines.length && !lines[index].startsWith("*** ")) {
     const line = lines[index];
-    if (!line.startsWith("+")) throw parseError(`add hunk for ${path} contains a non-add line`);
+    if (!line.startsWith("+")) {
+      throw parseError(
+        [
+          `add hunk for ${path} contains a non-add line at patch line ${index + 1}`,
+          `got: ${formatGot(line)}`,
+          "hint: every line in an Add File hunk must start with '+'",
+        ].join("\n"),
+      );
+    }
     content.push(line.slice(1));
     index += 1;
   }
-  if (content.length === 0) throw parseError(`add hunk for ${path} is empty`);
+  if (content.length === 0) {
+    throw parseError(
+      [
+        `add hunk for ${path} is empty`,
+        "hint: include one or more lines starting with '+' for the new file contents",
+      ].join("\n"),
+    );
+  }
   return { lines: content, next: index };
 }
 
 function isPatchBoundary(line: string): boolean {
+  const trimmed = line.trim();
   return (
     line.startsWith(ADD) ||
     line.startsWith(DELETE) ||
     line.startsWith(UPDATE) ||
     line.startsWith("*** Environment ID: ") ||
-    line.trim() === END
+    trimmed === END ||
+    trimmed === END_FENCE
   );
 }
 
@@ -106,9 +190,14 @@ function parseUpdateChunks(lines: string[], start: number, path: string): {
     }
     if (line === "@@" || line.startsWith("@@ ")) {
       if (current && current.oldLines.length === 0 && current.newLines.length === 0) {
-        throw parseError(`empty update chunk for ${path}`);
+        throw emptyUpdateChunkError(path);
       }
-      current = { context: line.slice(2).trim() || undefined, oldLines: [], newLines: [], endOfFile: false };
+      current = {
+        context: parseChangeContext(line),
+        oldLines: [],
+        newLines: [],
+        endOfFile: false,
+      };
       chunks.push(current);
       index += 1;
       continue;
@@ -116,7 +205,7 @@ function parseUpdateChunks(lines: string[], start: number, path: string): {
     if (line === EOF) {
       ensureChunk();
       if (current!.oldLines.length === 0 && current!.newLines.length === 0) {
-        throw parseError(`empty update chunk for ${path}`);
+        throw emptyUpdateChunkError(path);
       }
       current!.endOfFile = true;
       index += 1;
@@ -141,22 +230,50 @@ function parseUpdateChunks(lines: string[], start: number, path: string): {
     } else if (line.startsWith("-")) {
       current!.oldLines.push(line.slice(1));
     } else {
-      throw parseError(`unexpected update line in ${path}: ${line}`);
+      throw unexpectedUpdateLineError(path, line, index + 1);
     }
     index += 1;
   }
 
   if (current && current.oldLines.length === 0 && current.newLines.length === 0) {
-    throw parseError(`empty update chunk for ${path}`);
+    throw emptyUpdateChunkError(path);
   }
-  if (chunks.length === 0) throw parseError(`update hunk for ${path} is empty`);
+  if (chunks.length === 0) {
+    throw parseError(
+      [
+        `update hunk for ${path} is empty`,
+        "hint: after *** Update File, include at least one @@ hunk with ' '/'+'/'-' lines (optional *** Move to: first)",
+      ].join("\n"),
+    );
+  }
   return { chunks, moveTo, next: index };
 }
 
 export function parsePatch(patch: string): PatchOperation[] {
   const lines = patch.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim().split("\n");
-  if (lines[0]?.trim() !== BEGIN) throw parseError(`first line must be '${BEGIN}'`);
-  if (lines.at(-1)?.trim() !== END) throw parseError(`last line must be '${END}'`);
+  const first = normalizeBoundaryLine(lines[0], "begin");
+  const last = normalizeBoundaryLine(lines.at(-1), "end");
+  if (first !== BEGIN) {
+    throw parseError(
+      [
+        `first line must be '${BEGIN}'`,
+        `got: ${formatGot(lines[0])}`,
+        "hint: do not close the header with trailing ' ***'; this is not markdown",
+      ].join("\n"),
+    );
+  }
+  if (last !== END) {
+    throw parseError(
+      [
+        `last line must be '${END}'`,
+        `got: ${formatGot(lines.at(-1))}`,
+        "hint: do not close the footer with trailing ' ***'; this is not markdown",
+      ].join("\n"),
+    );
+  }
+  // Canonicalize accepted fence-style begin/end so the rest of the parser sees exact markers.
+  lines[0] = BEGIN;
+  lines[lines.length - 1] = END;
 
   const operations: PatchOperation[] = [];
   let index = 1;
@@ -192,7 +309,13 @@ export function parsePatch(patch: string): PatchOperation[] {
       index = parsed.next;
       continue;
     }
-    throw parseError(`unsupported hunk header: ${line}`);
+    throw parseError(
+      [
+        `unsupported hunk header: ${line}`,
+        `got: ${formatGot(line)}`,
+        "hint: expected *** Add File: / *** Delete File: / *** Update File: (or a blank / Environment ID line). If this text was meant as file content, it belongs inside a hunk with a leading ' ', '+', or '-'",
+      ].join("\n"),
+    );
   }
   return operations;
 }
@@ -292,16 +415,52 @@ function applyChunks(content: string, chunks: PatchChunk[], path: string): strin
   return `${lines.join("\n")}\n`;
 }
 
-function safeRelativePath(root: string, rawPath: string): string {
+export interface ApplyPatchOptions {
+  allowOutsideWorkspace?: boolean;
+}
+
+function resolvePatchPath(root: string, rawPath: string, allowOutsideWorkspace: boolean): string {
   const value = rawPath.trim();
-  if (!value || value.includes("\0") || value.includes("\\") || isAbsolute(value)) {
-    throw new Error(`unsafe patch path: ${rawPath}`);
+  if (!value || value.includes("\0") || value.includes("\\")) {
+    throw new Error(
+      [
+        `unsafe patch path: ${rawPath}`,
+        `project root: ${root}`,
+        "hint: use a non-empty path relative to the project root; backslashes and NUL are not allowed",
+      ].join("\n"),
+    );
+  }
+  if (isAbsolute(value)) {
+    if (!allowOutsideWorkspace) {
+      const resolved = resolve(value);
+      const rel = relative(root, resolved);
+      const inside =
+        rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+      throw new Error(
+        [
+          `unsafe patch path: ${rawPath}`,
+          `project root: ${root}`,
+          inside
+            ? `hint: paths must be relative to the project root; use ${JSON.stringify(rel || ".")} instead of an absolute path`
+            : "hint: absolute paths are rejected by default; rewrite as a cwd-relative path, or set allowOutsideWorkspace=true only for intentional outside-project edits",
+        ].join("\n"),
+      );
+    }
+    return resolve(value);
   }
   const normalized = normalize(value);
   const target = resolve(root, normalized);
-  const escaped = relative(root, target);
-  if (escaped === ".." || escaped.startsWith(`..${sep}`) || isAbsolute(escaped)) {
-    throw new Error(`patch path escapes the workspace: ${rawPath}`);
+  if (!allowOutsideWorkspace) {
+    const escaped = relative(root, target);
+    if (escaped === ".." || escaped.startsWith(`..${sep}`) || isAbsolute(escaped)) {
+      throw new Error(
+        [
+          `patch path escapes the workspace: ${rawPath}`,
+          `project root: ${root}`,
+          "hint: use a path under the project root, or set allowOutsideWorkspace=true for intentional outside-project edits",
+        ].join("\n"),
+      );
+    }
   }
   return target;
 }
@@ -333,15 +492,20 @@ async function readRegularFile(path: string, required: boolean): Promise<{ conte
   }
 }
 
-export async function planPatch(rootInput: string, patch: string): Promise<PatchPlan> {
+export async function planPatch(
+  rootInput: string,
+  patch: string,
+  options: ApplyPatchOptions = {},
+): Promise<PatchPlan> {
   const root = await realpath(rootInput);
+  const allowOutsideWorkspace = options.allowOutsideWorkspace === true;
   const operations = parsePatch(patch);
   if (operations.length === 0) throw new Error("apply_patch contains no file changes");
 
   const affected = new Set<string>();
   const changes: FileChange[] = [];
   for (const operation of operations) {
-    const source = safeRelativePath(root, operation.path);
+    const source = resolvePatchPath(root, operation.path, allowOutsideWorkspace);
     await assertNoSymlinkPath(root, source);
     if (affected.has(source)) throw new Error(`patch references the same path more than once: ${operation.path}`);
     affected.add(source);
@@ -360,7 +524,7 @@ export async function planPatch(rootInput: string, patch: string): Promise<Patch
     if (!existing) throw new Error(`file to update does not exist: ${operation.path}`);
     const updatedContent = applyChunks(existing.content, operation.chunks, operation.path);
     if (operation.moveTo) {
-      const destination = safeRelativePath(root, operation.moveTo);
+      const destination = resolvePatchPath(root, operation.moveTo, allowOutsideWorkspace);
       await assertNoSymlinkPath(root, destination);
       if (affected.has(destination)) throw new Error(`patch references the same path more than once: ${operation.moveTo}`);
       affected.add(destination);
@@ -370,7 +534,7 @@ export async function planPatch(rootInput: string, patch: string): Promise<Patch
       changes.push({ path: source, action: "M", content: updatedContent, mode: existing.mode });
     }
   }
-  return { root, changes };
+  return { root, changes, allowOutsideWorkspace };
 }
 
 async function snapshot(path: string): Promise<{ content: string; mode: number } | undefined> {
@@ -415,17 +579,34 @@ async function commitPatch(plan: PatchPlan): Promise<void> {
   }
 }
 
-export async function applyPatch(rootInput: string, patch: string): Promise<ApplyPatchDetails> {
-  const plan = await planPatch(rootInput, patch);
+function summarizePath(root: string, path: string, allowOutsideWorkspace: boolean): string {
+  if (!allowOutsideWorkspace) return relative(root, path);
+  const escaped = relative(root, path);
+  if (escaped === "" || (!escaped.startsWith(`..${sep}`) && escaped !== ".." && !isAbsolute(escaped))) {
+    return escaped;
+  }
+  return path;
+}
+
+export async function applyPatch(
+  rootInput: string,
+  patch: string,
+  options: ApplyPatchOptions = {},
+): Promise<ApplyPatchDetails> {
+  const plan = await planPatch(rootInput, patch, options);
   await withFileMutationQueue(plan.root, async () => {
     // Re-plan inside the queue so concurrent writes cannot invalidate matching context.
-    const currentPlan = await planPatch(plan.root, patch);
+    const currentPlan = await planPatch(plan.root, patch, options);
     await commitPatch(currentPlan);
   });
   const summary = plan.changes
     .filter((change) => change.content !== null || change.action !== "R")
-    .map((change) => ({ action: change.action, path: relative(plan.root, change.path), sourcePath: change.sourcePath }));
-  return { root: plan.root, changes: summary };
+    .map((change) => ({
+      action: change.action,
+      path: summarizePath(plan.root, change.path, plan.allowOutsideWorkspace),
+      sourcePath: change.sourcePath,
+    }));
+  return { root: plan.root, changes: summary, allowOutsideWorkspace: plan.allowOutsideWorkspace };
 }
 
 export function registerApplyPatchTool(pi: ExtensionAPI) {
@@ -433,17 +614,26 @@ export function registerApplyPatchTool(pi: ExtensionAPI) {
     name: "apply_patch",
     label: "apply_patch",
     description:
-      "Apply one validated Codex-style multi-file patch inside the current project. Supports Add File, Update File, Delete File, Move to, multiple hunks, and context matching.",
-    promptSnippet: "Apply a validated multi-file source patch",
+      "Apply precise Codex-style multi-file edits inside the current project. Best for local updates, small adds/deletes, and renames with context matching. Prefer write for new files, complete rewrites, or docs that embed apply_patch markers. First line MUST be exactly *** Begin Patch and last line exactly *** End Patch (never fence-style *** Begin Patch ***). Paths are relative to the project cwd — no absolute paths unless allowOutsideWorkspace=true. Hunk lines must start with ' ', '+', or '-'. Use @@ / @@ symbolName, not unified-diff line numbers.",
+    promptSnippet: "Apply precise multi-file source patches",
     promptGuidelines: [
-      "Use apply_patch as the only direct source-editing tool; shell may run formatters and generators.",
+      "Use apply_patch for precise edits to existing files; use write for new files or complete rewrites.",
+      "Patch envelope is not markdown: first line exactly *** Begin Patch, last line exactly *** End Patch. Never write *** Begin Patch *** or *** End Patch ***.",
+      "Patch paths are relative to the current project cwd. Never use absolute paths unless allowOutsideWorkspace=true.",
+      "In update hunks, every content line must start with a leading space (context), '+' (add), or '-' (remove). Unprefixed text is invalid.",
+      "Use @@ or @@ symbolName for context anchors. Do not rely on unified-diff line numbers like @@ -12,3 +12,4 @@ (they are ignored if present).",
+      "If editing docs that embed apply_patch examples (*** markers / sample hunks), prefer write for that file.",
+      "Prefer small, focused apply_patch hunks with unique context over large whole-file patches.",
       "Include enough context in apply_patch update hunks to identify the target uniquely.",
       "On apply_patch failure, read the file again before regenerating the patch.",
+      "Set allowOutsideWorkspace=true only when intentionally editing files outside the current project directory.",
     ],
     parameters: applyPatchSchema,
     executionMode: "sequential",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const details = await applyPatch(ctx.cwd, params.patch);
+      const details = await applyPatch(ctx.cwd, params.patch, {
+        allowOutsideWorkspace: params.allowOutsideWorkspace === true,
+      });
       const lines = details.changes.map((change) => `${change.action} ${change.path}`);
       return {
         content: [{ type: "text", text: `Applied patch:\n${lines.join("\n")}` }],

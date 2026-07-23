@@ -3,11 +3,11 @@ import { registerApplyPatchTool } from "./apply-patch.js";
 import { registerShellTool } from "./shell.js";
 import { loadConfig, saveConfig, type CompressMode } from "./config.js";
 
-const DISABLED_TOOLS = new Set(["bash", "grep", "find", "ls", "edit", "write"]);
+const DISABLED_TOOLS = new Set(["bash", "grep", "find", "ls", "edit"]);
 
 function configureActiveTools(pi: ExtensionAPI) {
   const active = pi.getActiveTools().filter((name) => !DISABLED_TOOLS.has(name));
-  pi.setActiveTools([...new Set([...active, "read", "shell", "apply_patch"])]);
+  pi.setActiveTools([...new Set([...active, "read", "write", "shell", "apply_patch"])]);
 }
 
 const COMPRESS_MODES: CompressMode[] = ["off", "safe", "aggressive"];
@@ -22,7 +22,7 @@ function statusLines(pi: ExtensionAPI): string[] {
   const { compress } = loadConfig();
   return [
     "kun-tools",
-    `Active core tools: ${["read", "shell", "apply_patch"].filter((name) => active.includes(name)).join(", ") || "none"}`,
+    `Active core tools: ${["read", "write", "shell", "apply_patch"].filter((name) => active.includes(name)).join(", ") || "none"}`,
     `Disabled overlapping tools: ${hidden.filter((name) => DISABLED_TOOLS.has(name)).join(", ") || "none"}`,
     `Compress: mode=${compress.mode} minBytes=${compress.minBytes} commandFilters=${compress.commandFilters}`,
   ];

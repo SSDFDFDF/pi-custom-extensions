@@ -44,7 +44,7 @@ test("activates the compact local tool surface and preserves unrelated tools", (
   for (const handler of handlers.get("session_start") ?? []) handler();
 
   assert.deepEqual(registered, ["shell", "apply_patch"]);
-  assert.deepEqual(active, ["read", "subagent", "web_search", "hypa_shell", "shell", "apply_patch"]);
+  assert.deepEqual(active, ["read", "write", "subagent", "web_search", "hypa_shell", "shell", "apply_patch"]);
 });
 
 test("handleCompress sets valid modes", () => {

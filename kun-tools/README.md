@@ -4,13 +4,14 @@ A compact, shell-first tool surface for the Pi coding agent.
 
 ## Tool surface
 
-When the package loads, it keeps Pi's built-in `read`, adds `shell` and `apply_patch`, and deactivates overlapping built-in tools (`bash`, `edit`, `write`, `grep`, `find`, `ls`). Tools from unrelated extensions remain active. To drop another extension's tools, remove that extension.
+When the package loads, it keeps Pi's built-in `read` and `write`, adds `shell` and `apply_patch`, and deactivates overlapping built-in tools (`bash`, `edit`, `grep`, `find`, `ls`). Tools from unrelated extensions remain active. To drop another extension's tools, remove that extension.
 
 | Tool | Purpose |
 |---|---|
 | `shell` | Run one coherent command-line task with explicit `workdir` and millisecond timeout. |
 | `read` | Pi's built-in exact, paginated text/image reader. |
-| `apply_patch` | Apply validated Codex-style add/update/delete/move patches inside the current project. |
+| `write` | Pi's built-in full-file writer for new files or complete rewrites. |
+| `apply_patch` | Apply precise Codex-style add/update/delete/move patches to existing files. Prefer this for local edits; use `write` for large new files or full rewrites. |
 
 ## Local loading
 
@@ -18,7 +19,7 @@ The extension lives at `~/.pi/agent/extensions/kun-tools/` and is discovered aut
 
 ## Patch format
 
-`apply_patch` receives a JSON object with one `patch` string:
+`apply_patch` receives a JSON object with a `patch` string and optional `allowOutsideWorkspace`:
 
 ```text
 *** Begin Patch
@@ -32,6 +33,8 @@ The extension lives at `~/.pi/agent/extensions/kun-tools/` and is discovered aut
 *** End Patch
 ```
 
+The envelope is **not markdown**. First line must be exactly `*** Begin Patch` and last line exactly `*** End Patch`. Do **not** write fence-style `*** Begin Patch ***` / `*** End Patch ***` (the parser accepts that common model slip, but the canonical form omits the trailing ` ***`).
+
 Supported headers:
 
 - `*** Add File: path`
@@ -39,9 +42,16 @@ Supported headers:
 - `*** Delete File: path`
 - `*** Move to: path` immediately after an update header
 - `@@` or `@@ context line` for update chunks
+- `@@ -12,3 +12,4 @@` unified-diff line numbers are accepted but **ignored** (optional trailing symbol after the second `@@` is kept as context)
 - `*** End of File` for an end-anchored chunk
 
-All operations are parsed and validated before writes begin. Patch paths must remain under the active project directory and may not traverse symbolic links.
+Rules that prevent the most common failures:
+
+- Paths are **relative to the project cwd**. Absolute paths are rejected unless `allowOutsideWorkspace=true`. If the absolute path is still inside the project, the error suggests the relative form.
+- Every update/add content line must start with ` ` (context), `+` (add), or `-` (remove). Unprefixed text is invalid.
+- Prefer `write` when editing docs that embed `*** Begin Patch` examples, so sample markers are not parsed as live syntax.
+
+All operations are parsed and validated before writes begin. By default, patch paths must remain under the active project directory and may not traverse symbolic links. Set `allowOutsideWorkspace=true` only when intentionally editing outside the project root.
 
 ## Execution model
 
