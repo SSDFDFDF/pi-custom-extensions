@@ -215,6 +215,53 @@ test("accepts fence-style begin/end markers models often emit", () => {
   );
 });
 
+
+test("tolerates intermediate and duplicated end/begin markers", () => {
+  const end = "*** End Patch";
+  const endFence = "*** End Patch ***";
+  const begin = "*** Begin Patch";
+  const beginFence = "*** Begin Patch ***";
+
+  assert.deepEqual(
+    parsePatch([begin, "*** Add File: nested/new.txt", "+created", endFence, end].join("\n")),
+    [{ kind: "add", path: "nested/new.txt", lines: ["created"] }],
+  );
+
+  assert.deepEqual(
+    parsePatch(
+      [
+        beginFence,
+        begin,
+        "*** Add File: a.txt",
+        "+one",
+        endFence,
+        "*** Add File: b.txt",
+        "+two",
+        endFence,
+      ].join("\n"),
+    ),
+    [
+      { kind: "add", path: "a.txt", lines: ["one"] },
+      { kind: "add", path: "b.txt", lines: ["two"] },
+    ],
+  );
+
+  // Leading indentation on control lines is a common model slip.
+  assert.deepEqual(
+    parsePatch(
+      [begin, "  *** Add File: spaced.txt", "+ok", "  " + endFence, end].join("\n"),
+    ),
+    [{ kind: "add", path: "spaced.txt", lines: ["ok"] }],
+  );
+
+  // User-visible failure mode: only fence-style end as the final line is already accepted;
+  // intermediate fence end without a second terminator used to throw unsupported hunk header.
+  assert.deepEqual(
+    parsePatch([begin, "*** Add File: x.txt", "+y", endFence].join("\n")),
+    [{ kind: "add", path: "x.txt", lines: ["y"] }],
+  );
+});
+
 test("still rejects other malformed begin/end markers with got+hint", () => {
   assert.throws(
     () => parsePatch("*** Begin Patch***\n*** End Patch"),

@@ -89,6 +89,14 @@ function normalizeBoundaryLine(line: string | undefined, kind: "begin" | "end"):
   return trimmed;
 }
 
+function isEndMarker(line: string | undefined): boolean {
+  return normalizeBoundaryLine(line, "end") === END;
+}
+
+function isBeginMarker(line: string | undefined): boolean {
+  return normalizeBoundaryLine(line, "begin") === BEGIN;
+}
+
 function parseChangeContext(headerLine: string): string | undefined {
   if (headerLine === "@@" || headerLine === "@@ ") return undefined;
   const unified = headerLine.match(UNIFIED_DIFF_HUNK_HEADER);
@@ -128,7 +136,7 @@ function unexpectedUpdateLineError(path: string, line: string, lineNumber: numbe
 function parseFileLines(lines: string[], start: number, path: string): { lines: string[]; next: number } {
   const content: string[] = [];
   let index = start;
-  while (index < lines.length && !lines[index].startsWith("*** ")) {
+  while (index < lines.length && !isPatchBoundary(lines[index])) {
     const line = lines[index];
     if (!line.startsWith("+")) {
       throw parseError(
@@ -154,14 +162,16 @@ function parseFileLines(lines: string[], start: number, path: string): { lines: 
 }
 
 function isPatchBoundary(line: string): boolean {
+  // Control lines may be indented; content lines keep their original prefix
+  // (' ', '+', '-') so trimming is only safe for structural headers.
   const trimmed = line.trim();
   return (
-    line.startsWith(ADD) ||
-    line.startsWith(DELETE) ||
-    line.startsWith(UPDATE) ||
-    line.startsWith("*** Environment ID: ") ||
-    trimmed === END ||
-    trimmed === END_FENCE
+    trimmed.startsWith(ADD) ||
+    trimmed.startsWith(DELETE) ||
+    trimmed.startsWith(UPDATE) ||
+    trimmed.startsWith("*** Environment ID: ") ||
+    isEndMarker(trimmed) ||
+    isBeginMarker(trimmed)
   );
 }
 
@@ -182,13 +192,16 @@ function parseUpdateChunks(lines: string[], start: number, path: string): {
 
   while (index < lines.length && !isPatchBoundary(lines[index])) {
     const line = lines[index];
-    if (chunks.length === 0 && !current && line.startsWith(MOVE)) {
-      moveTo = line.slice(MOVE.length).trim();
+    const trimmedLine = line.trim();
+    if (chunks.length === 0 && !current && trimmedLine.startsWith(MOVE)) {
+      moveTo = trimmedLine.slice(MOVE.length).trim();
       if (!moveTo) throw parseError(`move destination for ${path} is empty`);
       index += 1;
       continue;
     }
-    if (line === "@@" || line.startsWith("@@ ")) {
+    // Do not trim @@ / EOF lines: a context line " @@..." is valid file content
+    // (leading space + "@@..."), while hunk headers must start at column 0.
+    if (line === "@@" || line.startsWith("@@ ") || line.startsWith("@@")) {
       if (current && current.oldLines.length === 0 && current.newLines.length === 0) {
         throw emptyUpdateChunkError(path);
       }
@@ -202,7 +215,7 @@ function parseUpdateChunks(lines: string[], start: number, path: string): {
       index += 1;
       continue;
     }
-    if (line === EOF) {
+    if (line === EOF || trimmedLine === EOF) {
       ensureChunk();
       if (current!.oldLines.length === 0 && current!.newLines.length === 0) {
         throw emptyUpdateChunkError(path);
@@ -278,8 +291,21 @@ export function parsePatch(patch: string): PatchOperation[] {
   const operations: PatchOperation[] = [];
   let index = 1;
   while (index < lines.length - 1) {
-    const line = lines[index].trimEnd();
-    if (!line.trim()) {
+    // Models sometimes indent headers or emit per-file / duplicated End markers.
+    // Normalize whitespace for control lines; keep original content lines elsewhere.
+    const line = lines[index].trim();
+    if (!line) {
+      index += 1;
+      continue;
+    }
+    // Intermediate *** End Patch / *** End Patch *** (and accidental duplicates) are
+    // no-ops: the real terminator is validated as the final line above.
+    if (isEndMarker(line)) {
+      index += 1;
+      continue;
+    }
+    // Ignore a duplicated begin marker inside the body (same class of model slip).
+    if (isBeginMarker(line)) {
       index += 1;
       continue;
     }

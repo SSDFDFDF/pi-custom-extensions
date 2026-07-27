@@ -4,13 +4,14 @@ A compact, shell-first tool surface for the Pi coding agent.
 
 ## Tool surface
 
-When the package loads, it keeps Pi's built-in `read` and `write`, adds `shell` and `apply_patch`, and deactivates overlapping built-in tools (`bash`, `edit`, `grep`, `find`, `ls`). Tools from unrelated extensions remain active. To drop another extension's tools, remove that extension.
+When the package loads, it keeps Pi's built-in `read`, `write`, and `edit`, adds `shell` and `apply_patch`, and deactivates overlapping built-in tools (`bash`, `grep`, `find`, `ls`). Tools from unrelated extensions remain active. To drop another extension's tools, remove that extension.
 
 | Tool | Purpose |
 |---|---|
 | `shell` | Run one coherent command-line task with explicit `workdir` and millisecond timeout. |
 | `read` | Pi's built-in exact, paginated text/image reader. |
 | `write` | Pi's built-in full-file writer for new files or complete rewrites. |
+| `edit` | Pi's built-in in-place string-replacement editor. |
 | `apply_patch` | Apply precise Codex-style add/update/delete/move patches to existing files. Prefer this for local edits; use `write` for large new files or full rewrites. |
 
 ## Local loading
@@ -33,7 +34,7 @@ The extension lives at `~/.pi/agent/extensions/kun-tools/` and is discovered aut
 *** End Patch
 ```
 
-The envelope is **not markdown**. First line must be exactly `*** Begin Patch` and last line exactly `*** End Patch`. Do **not** write fence-style `*** Begin Patch ***` / `*** End Patch ***` (the parser accepts that common model slip, but the canonical form omits the trailing ` ***`).
+The envelope is **not markdown**. First line must be exactly `*** Begin Patch` and last line exactly `*** End Patch`. Do **not** write fence-style `*** Begin Patch ***` / `*** End Patch ***` (the parser accepts that common model slip, including intermediate or duplicated end markers, but the canonical form omits the trailing ` ***`).
 
 Supported headers:
 

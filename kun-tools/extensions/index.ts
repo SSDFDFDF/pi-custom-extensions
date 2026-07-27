@@ -3,7 +3,7 @@ import { registerApplyPatchTool } from "./apply-patch.js";
 import { registerShellTool } from "./shell.js";
 import { loadConfig, saveConfig, type CompressMode } from "./config.js";
 
-const DISABLED_TOOLS = new Set(["bash", "grep", "find", "ls", "edit"]);
+const DISABLED_TOOLS = new Set(["bash", "grep", "find", "ls"]);
 
 function configureActiveTools(pi: ExtensionAPI) {
   const active = pi.getActiveTools().filter((name) => !DISABLED_TOOLS.has(name));
