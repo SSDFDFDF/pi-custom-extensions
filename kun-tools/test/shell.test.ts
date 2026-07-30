@@ -149,6 +149,15 @@ test("formatShellFooter is stable", () => {
   );
 });
 
+test("prompt guidance prefers shell while keeping overlapping built-ins as fallbacks", () => {
+  const tool = captureShellTool();
+  assert.ok(
+    tool.promptGuidelines.some((guideline: string) =>
+      guideline.includes("Prefer shell over bash, grep, find, and ls"),
+    ),
+  );
+});
+
 test("renderCall shows the command, not the full args JSON", () => {
   const tool = captureShellTool();
   const component = tool.renderCall({ command: "echo hi", timeoutMs: 5000 }, themeStub, renderContext());

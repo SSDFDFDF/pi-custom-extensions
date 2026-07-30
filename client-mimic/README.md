@@ -100,7 +100,7 @@ Modeled on codex-rs `AgentControl` + `AutoCompactWindowIds` + Responses client h
 | resume / reload | restore from store | restore | **reuse** last chain (no new window) |
 | `session_compact` | unchanged | unchanged | advance: prev←cur, new cur, number++ |
 
-**Wire surface (codex profile)**
+**Wire surface (codex and codex-lite profiles)**
 
 Headers (defaults):
 
@@ -118,6 +118,18 @@ Body when `ensureCodexIdentity: true`:
 - `metadata`: `session_id`, `thread_id`, `x-codex-installation-id`, `x-codex-window-id`,
   `first_window_id`, `previous_window_id` (if any), `window_number`, `turn_id`,
   optional `x-codex-parent-thread-id`
+
+The `codex-lite` profile follows the current Codex Responses Lite contract used
+by models such as `gpt-5.6-sol`. In addition to the Codex identity headers, it:
+
+- sends `x-openai-internal-codex-responses-lite: true`
+- moves top-level `tools` to a leading developer `additional_tools` input item
+- moves top-level `instructions` to a developer input message when present
+- removes `max_output_tokens`, forces `tool_choice: auto` and
+  `parallel_tool_calls: false`
+- sets `reasoning.context: all_turns`, defaults `text.verbosity` to `low`, and
+  includes `reasoning.encrypted_content`
+- writes current Codex identity fields to `client_metadata`
 
 Do **not** force `stream` / `store` via `bodyPatch` — mismatches break pi response parsing.
 
@@ -189,7 +201,7 @@ before profile headers apply; profile spelling wins on case collisions.
 ```
 /mimic                    show status + active profile
 /mimic on | off           master switch
-/mimic use <profile>      activate codex | claude-code | off
+/mimic use <profile>      activate codex | codex-lite | claude-code | off
 /mimic list               list profiles
 /mimic show [profile]     print resolved headers + ids + body flags + prompt mode
 /mimic prompt                                show system-prompt config (all levels)
@@ -227,7 +239,9 @@ Default `bodyPatch: {}`. Do not force `stream`/`store` unless you know pi's
 request mode and the provider accepts those fields.
 
 Claude body fingerprints → use `ensureMetadataUserId` / `prependBillingSystem`.  
-Codex body identity → use `ensureCodexIdentity` (default true on codex profile).
+Codex body identity → use `ensureCodexIdentity` (default true on codex profiles).
+Responses Lite body conversion → use `codexResponsesLite` (default true only on
+the built-in `codex-lite` profile).
 
 ## System prompt
 

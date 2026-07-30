@@ -6,6 +6,7 @@ build/
 
 # extension-local caches (e.g. hybrid-goal /goal-evol clones)
 cache/
+.pi-subagents/
 
 # logs / temp
 *.log

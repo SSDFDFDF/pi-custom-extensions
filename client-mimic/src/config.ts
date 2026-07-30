@@ -58,11 +58,16 @@ export interface MimicProfile {
 	prependBillingSystem: boolean;
 	/**
 	 * When true, inject Codex Responses identity into the request body:
-	 * `prompt_cache_key` (= session_id) and flat `metadata` keys matching
-	 * codex-rs (`session_id`, `thread_id`, `x-codex-installation-id`,
-	 * `x-codex-window-id`). Existing user-set keys are left alone.
+	 * `prompt_cache_key` (= session_id) and flat identity keys. The legacy Codex
+	 * profile uses `metadata`; Responses Lite uses current Codex
+	 * `client_metadata`. Existing user-set keys are left alone.
 	 */
 	ensureCodexIdentity: boolean;
+	/**
+	 * Convert ordinary OpenAI Responses payloads to Codex Responses Lite.
+	 * The transform is guarded by the presence of a top-level `input` array.
+	 */
+	codexResponsesLite: boolean;
 	/** Client version string used to fill {version} in headers. */
 	version: string;
 	/**
@@ -231,6 +236,32 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 		prependBillingSystem: false,
 		// Inject prompt_cache_key + Responses client_metadata shaped like codex-rs.
 		ensureCodexIdentity: true,
+		codexResponsesLite: false,
+		templateVars: {},
+		systemPrompt: { mode: "inherit" },
+	},
+	"codex-lite": {
+		label: "OpenAI Codex CLI (Responses Lite)",
+		version: "0.145.0",
+		npmPackage: "@openai/codex",
+		headers: {
+			originator: "codex_cli_rs",
+			"User-Agent": "codex_cli_rs/{version} ({os_type} {os_version}; {uname_arch}) {terminal}",
+			"OpenAI-Beta": "responses=experimental",
+			version: "{version}",
+			"session-id": "{session_id}",
+			"thread-id": "{thread_id}",
+			"x-codex-installation-id": "{installation_id}",
+			"x-codex-window-id": "{window_id}",
+			"x-codex-parent-thread-id": "{parent_thread_id}",
+			"x-openai-internal-codex-responses-lite": "true",
+		},
+		stripHeaders: ["x-stainless-lang", "x-stainless-package-version"],
+		bodyPatch: {},
+		ensureMetadataUserId: false,
+		prependBillingSystem: false,
+		ensureCodexIdentity: true,
+		codexResponsesLite: true,
 		templateVars: {},
 		systemPrompt: { mode: "inherit" },
 	},
@@ -272,6 +303,7 @@ export const DEFAULT_PROFILES: Record<string, MimicProfile> = {
 		ensureMetadataUserId: true,
 		prependBillingSystem: true,
 		ensureCodexIdentity: false,
+		codexResponsesLite: false,
 		// Version of the bundled @anthropic-ai/sdk that recent Claude Code
 		// builds ship (captured from 2.1.198 on the wire: 0.94.0). Not the
 		// same as the CLI version; refresh by hand if your gateway checks it.
@@ -389,6 +421,10 @@ function normalizeProfile(key: string, raw: Partial<MimicProfile> | undefined): 
 			typeof src.ensureCodexIdentity === "boolean"
 				? src.ensureCodexIdentity
 				: (base?.ensureCodexIdentity ?? false),
+		codexResponsesLite:
+			typeof src.codexResponsesLite === "boolean"
+				? src.codexResponsesLite
+				: (base?.codexResponsesLite ?? false),
 		templateVars,
 		systemPrompt: normalizeSystemPrompt(src.systemPrompt, base?.systemPrompt ?? { mode: "inherit" }, true),
 	};

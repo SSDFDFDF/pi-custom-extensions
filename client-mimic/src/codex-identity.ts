@@ -258,7 +258,11 @@ export function persistIdentityState(store: CodexIdentityStore, state: CodexIden
  * session/thread/installation: set if missing.
  * window/turn chain: always refresh (they move over time).
  */
-export function ensureCodexIdentity(payload: Record<string, unknown>, ids: CodexBodyIds): boolean {
+export function ensureCodexIdentity(
+	payload: Record<string, unknown>,
+	ids: CodexBodyIds,
+	target: "metadata" | "client_metadata" = "metadata",
+): boolean {
 	let changed = false;
 	if (
 		payload.prompt_cache_key === undefined ||
@@ -270,8 +274,8 @@ export function ensureCodexIdentity(payload: Record<string, unknown>, ids: Codex
 	}
 
 	const existingMeta =
-		payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
-			? ({ ...(payload.metadata as Record<string, unknown>) } as Record<string, unknown>)
+		payload[target] && typeof payload[target] === "object" && !Array.isArray(payload[target])
+			? ({ ...(payload[target] as Record<string, unknown>) } as Record<string, unknown>)
 			: {};
 
 	const setAlways = (key: string, value: string) => {
@@ -291,16 +295,20 @@ export function ensureCodexIdentity(payload: Record<string, unknown>, ids: Codex
 	setIfMissing("thread_id", ids.threadId);
 	setIfMissing("x-codex-installation-id", ids.installationId);
 	setAlways("x-codex-window-id", ids.windowId);
-	if (ids.firstWindowId) setAlways("first_window_id", ids.firstWindowId);
-	if (ids.previousWindowId) setAlways("previous_window_id", ids.previousWindowId);
-	else if ("previous_window_id" in existingMeta) {
-		delete existingMeta.previous_window_id;
-		changed = true;
+	// These window-chain diagnostics predate Codex's current client_metadata
+	// contract. Preserve them in the legacy metadata mode only.
+	if (target === "metadata") {
+		if (ids.firstWindowId) setAlways("first_window_id", ids.firstWindowId);
+		if (ids.previousWindowId) setAlways("previous_window_id", ids.previousWindowId);
+		else if ("previous_window_id" in existingMeta) {
+			delete existingMeta.previous_window_id;
+			changed = true;
+		}
+		if (ids.windowNumber != null) setAlways("window_number", String(ids.windowNumber));
 	}
-	if (ids.windowNumber != null) setAlways("window_number", String(ids.windowNumber));
 	if (ids.turnId) setAlways("turn_id", ids.turnId);
 	if (ids.parentThreadId) setIfMissing("x-codex-parent-thread-id", ids.parentThreadId);
-	if (changed) payload.metadata = existingMeta;
+	if (changed) payload[target] = existingMeta;
 	return changed;
 }
 

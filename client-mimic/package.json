@@ -8,7 +8,7 @@
   "license": "MIT",
   "scripts": {
     "test": "node --experimental-strip-types --test src/*.test.ts",
-    "check": "node --experimental-strip-types --check src/index.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/codex-identity.ts && node --experimental-strip-types --check src/claude-identity.ts && node --experimental-strip-types --check src/claude-body.ts && node --experimental-strip-types --check src/fs-util.ts && node --experimental-strip-types --check src/ids.ts"
+    "check": "node --experimental-strip-types --check src/index.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/codex-identity.ts && node --experimental-strip-types --check src/codex-lite.ts && node --experimental-strip-types --check src/claude-identity.ts && node --experimental-strip-types --check src/claude-body.ts && node --experimental-strip-types --check src/fs-util.ts && node --experimental-strip-types --check src/ids.ts && node --experimental-strip-types --check src/system-prompt.ts && node --experimental-strip-types --check src/update.ts"
   },
   "pi": {
     "extensions": ["./src/index.ts"]

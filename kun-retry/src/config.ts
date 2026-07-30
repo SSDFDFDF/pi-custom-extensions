@@ -14,6 +14,16 @@ export interface KunRetryConfig {
 	/** Overrides Pi built-in `retry.baseDelayMs` (written into settings.json). */
 	baseDelayMs: number;
 	/**
+	 * Constant retry interval in ms. `0` disables constant mode, which restores Pi's
+	 * built-in exponential backoff (`baseDelayMs * 2 ** (attempt - 1)`) untouched.
+	 *
+	 * When positive, every auto-retry waits exactly this long, no matter how many
+	 * attempts have already failed. Implemented by patching the delay Pi computes,
+	 * not by reimplementing retry: budget accounting, error-message removal, event
+	 * emission and Escape-cancellation all still run in Pi's `_prepareRetry`.
+	 */
+	constantDelayMs: number;
+	/**
 	 * Extra HTTP status codes treated as retryable when they appear in errorMessage
 	 * (e.g. 401, 403). Empty array disables status-code matching.
 	 */
@@ -49,6 +59,7 @@ export const DEFAULT_CONFIG: KunRetryConfig = {
 	enabled: true,
 	maxRetries: 10,
 	baseDelayMs: 2000,
+	constantDelayMs: 0,
 	// 520–524: Cloudflare edge/origin transient failures (524 also in Pi builtin).
 	statusCodes: [401, 403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529],
 	errorPatterns: [],
@@ -98,6 +109,7 @@ export function normalizeConfig(raw: Partial<KunRetryConfig> | undefined): KunRe
 	const base = { ...DEFAULT_CONFIG, ...(raw ?? {}) };
 	const maxRetries = Number(base.maxRetries);
 	const baseDelayMs = Number(base.baseDelayMs);
+	const constantDelayMs = Number(base.constantDelayMs);
 	const stallTimeoutMs = Number(base.stallTimeoutMs);
 
 	const statusCodes = Array.isArray(base.statusCodes)
@@ -123,6 +135,10 @@ export function normalizeConfig(raw: Partial<KunRetryConfig> | undefined): KunRe
 			Number.isFinite(baseDelayMs) && baseDelayMs >= 0
 				? Math.min(Math.floor(baseDelayMs), 600_000)
 				: DEFAULT_CONFIG.baseDelayMs,
+		constantDelayMs:
+			Number.isFinite(constantDelayMs) && constantDelayMs >= 0
+				? Math.min(Math.floor(constantDelayMs), 3_600_000)
+				: DEFAULT_CONFIG.constantDelayMs,
 		statusCodes: [...new Set(statusCodes)].sort((a, b) => a - b),
 		errorPatterns,
 		stallTimeoutMs:
@@ -154,7 +170,13 @@ export function formatConfigSummary(cfg: KunRetryConfig): string {
 		`enabled: ${cfg.enabled}`,
 		`nl: ${cfg.nl}`,
 		`maxRetries: ${maxLabel} (config ${cfg.maxRetries})`,
+		`delay: ${
+			cfg.constantDelayMs > 0
+				? `constant ${cfg.constantDelayMs}ms`
+				: `exponential (baseDelayMs ${cfg.baseDelayMs} × 2^(attempt-1), Pi built-in)`
+		}`,
 		`baseDelayMs: ${cfg.baseDelayMs}`,
+		`constantDelayMs: ${cfg.constantDelayMs === 0 ? "off (use built-in exponential)" : cfg.constantDelayMs}`,
 		`statusCodes: [${cfg.statusCodes.join(", ")}]`,
 		`errorPatterns: ${cfg.errorPatterns.length ? cfg.errorPatterns.map((p) => JSON.stringify(p)).join(", ") : "(none extra)"}`,
 		`stallTimeoutMs: ${cfg.stallTimeoutMs === 0 ? "off" : cfg.stallTimeoutMs}`,

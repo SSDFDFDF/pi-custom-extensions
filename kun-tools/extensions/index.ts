@@ -3,11 +3,13 @@ import { registerApplyPatchTool } from "./apply-patch.js";
 import { registerShellTool } from "./shell.js";
 import { loadConfig, saveConfig, type CompressMode } from "./config.js";
 
-const DISABLED_TOOLS = new Set(["bash", "grep", "find", "ls"]);
+const PREFERRED_TOOLS = ["shell", "apply_patch"] as const;
+const FALLBACK_TOOLS = ["bash", "grep", "find", "ls"] as const;
+const MANAGED_TOOLS = new Set<string>([...PREFERRED_TOOLS, ...FALLBACK_TOOLS]);
 
 function configureActiveTools(pi: ExtensionAPI) {
-  const active = pi.getActiveTools().filter((name) => !DISABLED_TOOLS.has(name));
-  pi.setActiveTools([...new Set([...active, "read", "write", "shell", "apply_patch"])]);
+  const active = pi.getActiveTools().filter((name) => !MANAGED_TOOLS.has(name));
+  pi.setActiveTools([...new Set([...active, ...PREFERRED_TOOLS, ...FALLBACK_TOOLS])]);
 }
 
 const COMPRESS_MODES: CompressMode[] = ["off", "safe", "aggressive"];
@@ -15,15 +17,11 @@ const COMPRESS_MODES: CompressMode[] = ["off", "safe", "aggressive"];
 function statusLines(pi: ExtensionAPI): string[] {
   configureActiveTools(pi);
   const active = pi.getActiveTools();
-  const hidden = pi
-    .getAllTools()
-    .map((tool) => tool.name)
-    .filter((name) => !active.includes(name));
   const { compress } = loadConfig();
   return [
     "kun-tools",
-    `Active core tools: ${["read", "write", "shell", "apply_patch"].filter((name) => active.includes(name)).join(", ") || "none"}`,
-    `Disabled overlapping tools: ${hidden.filter((name) => DISABLED_TOOLS.has(name)).join(", ") || "none"}`,
+    `Active core tools: ${["read", "write", "edit", ...PREFERRED_TOOLS].filter((name) => active.includes(name)).join(", ") || "none"}`,
+    `Lower-priority fallbacks: ${FALLBACK_TOOLS.filter((name) => active.includes(name)).join(", ") || "none"}`,
     `Compress: mode=${compress.mode} minBytes=${compress.minBytes} commandFilters=${compress.commandFilters}`,
   ];
 }
@@ -101,4 +99,4 @@ export default function kunTools(pi: ExtensionAPI) {
   });
 }
 
-export { configureActiveTools, DISABLED_TOOLS, handleCompress };
+export { configureActiveTools, FALLBACK_TOOLS, handleCompress, PREFERRED_TOOLS };

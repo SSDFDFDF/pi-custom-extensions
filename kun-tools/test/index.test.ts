@@ -19,7 +19,7 @@ function withTempConfig(fn: () => void) {
   }
 }
 
-test("activates the compact local tool surface and preserves unrelated tools", () => {
+test("keeps overlapping built-ins active as ordered fallbacks and preserves unrelated tools", () => {
   const registered: string[] = [];
   const handlers = new Map<string, Array<(...args: never[]) => unknown>>();
   let active = ["read", "bash", "edit", "write", "grep", "find", "ls", "subagent", "web_search", "hypa_shell"];
@@ -44,7 +44,23 @@ test("activates the compact local tool surface and preserves unrelated tools", (
   for (const handler of handlers.get("session_start") ?? []) handler();
 
   assert.deepEqual(registered, ["shell", "apply_patch"]);
-  assert.deepEqual(active, ["read", "edit", "write", "subagent", "web_search", "hypa_shell", "shell", "apply_patch"]);
+  assert.deepEqual(active, [
+    "read",
+    "edit",
+    "write",
+    "subagent",
+    "web_search",
+    "hypa_shell",
+    "shell",
+    "apply_patch",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+  ]);
+
+  for (const handler of handlers.get("before_agent_start") ?? []) handler();
+  assert.equal(new Set(active).size, active.length, "reconfiguration should remain duplicate-free");
 });
 
 test("handleCompress sets valid modes", () => {

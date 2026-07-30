@@ -3,13 +3,14 @@
  *
  * Replaces @narumitw/pi-retry with:
  * - Configurable maxRetries / baseDelayMs (synced into settings.json for Pi built-in auto-retry)
+ * - Optional constant retry interval instead of Pi's uncapped exponential backoff
  * - Extra retryable HTTP status codes and error-message patterns
  * - Stall stream watchdog (from pi-retry)
  * - /retry-nl unlimited "any error" mode
- * - /retry status|on|off|config|codes|patterns|max|delay|stall
+ * - /retry status|on|off|config|codes|patterns|max|delay|constant|stall
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { AgentSession, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	type KunRetryConfig,
 	DEFAULT_CONFIG,
@@ -19,6 +20,9 @@ import {
 	loadConfig,
 	saveConfig,
 } from "./config.ts";
+import { formatDelay, installConstantDelayPatch, parseConstantDelayMs } from "./retry-patch.ts";
+
+export { parseConstantDelayMs } from "./retry-patch.ts";
 import {
 	appendRetryHint,
 	EMPTY_RESPONSE_TAG,
@@ -103,6 +107,10 @@ export default function kunRetry(pi: ExtensionAPI) {
 	let cfg: KunRetryConfig = loadConfig();
 	let clearStatusTimer: NodeJS.Timeout | undefined;
 	let statusMode: StatusMode | undefined;
+	let statusText: string | undefined;
+	/** Last context seen by an event handler, so the retry hook can update the footer. */
+	let lastCtx: StatusContext | undefined;
+	let patchWarning: string | undefined;
 	let stallTimer: NodeJS.Timeout | undefined;
 	let providerWatchdogActive = false;
 	let waitingForStallAbortMessage = false;
@@ -116,6 +124,17 @@ export default function kunRetry(pi: ExtensionAPI) {
 		cfg = loadConfig();
 		return cfg;
 	};
+
+	// Constant-interval backoff. Only engages when enabled + constantDelayMs > 0;
+	// otherwise Pi's built-in exponential backoff runs completely unmodified.
+	const patch = installConstantDelayPatch(AgentSession, {
+		getConstantDelayMs: () => (cfg.enabled ? cfg.constantDelayMs : 0),
+		getMaxRetries: () => effectiveMaxRetries(cfg),
+		onRetry: ({ attempt, delayMs }) => {
+			if (lastCtx?.hasUI) showRetryStatus(lastCtx, { attempt, delayMs });
+		},
+	});
+	if (!patch.installed) patchWarning = patch.reason;
 
 	const applySettingsSync = (notify: StatusContext | undefined) => {
 		const result = syncBuiltinRetrySettings(cfg);
@@ -140,24 +159,34 @@ export default function kunRetry(pi: ExtensionAPI) {
 		if (clearStatusTimer) clearTimeout(clearStatusTimer);
 		clearStatusTimer = undefined;
 		statusMode = undefined;
+		statusText = undefined;
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	};
 
 	const setTransientStatus = (ctx: StatusContext, mode: StatusMode, text: string, visibleMs: number) => {
 		if (clearStatusTimer) clearTimeout(clearStatusTimer);
-		if (statusMode !== mode) ctx.ui.setStatus(STATUS_KEY, text);
+		if (statusMode !== mode || statusText !== text) ctx.ui.setStatus(STATUS_KEY, text);
 		statusMode = mode;
+		statusText = text;
 		clearStatusTimer = setTimeout(() => {
 			clearStatusTimer = undefined;
 			if (statusMode !== mode) return;
 			statusMode = undefined;
+			statusText = undefined;
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 		}, visibleMs);
 	};
 
-	const showRetryStatus = (ctx: StatusContext) => {
-		const label = cfg.nl ? "retrying∞" : "retrying";
-		setTransientStatus(ctx, "retry", label, STATUS_VISIBLE_MS);
+	const showRetryStatus = (ctx: StatusContext, constant?: { attempt: number; delayMs: number }) => {
+		const base = cfg.nl ? "retrying∞" : "retrying";
+		if (!constant) {
+			setTransientStatus(ctx, "retry", base, STATUS_VISIBLE_MS);
+			return;
+		}
+		const budget = cfg.nl ? "" : `/${effectiveMaxRetries(cfg)}`;
+		const label = `${base} ${constant.attempt}${budget} @${formatDelay(constant.delayMs)}`;
+		// Keep the label up for the whole wait so a long constant interval is visible.
+		setTransientStatus(ctx, "retry", label, Math.max(constant.delayMs + STATUS_VISIBLE_MS, STATUS_VISIBLE_MS));
 	};
 
 	const showIncomingStatus = (ctx: StatusContext) => {
@@ -226,7 +255,8 @@ export default function kunRetry(pi: ExtensionAPI) {
 			return;
 		}
 		if (cfg.nl) {
-			ctx.ui.setStatus(STATUS_KEY, "nl∞");
+			const suffix = cfg.constantDelayMs > 0 ? ` @${formatDelay(cfg.constantDelayMs)}` : "";
+			ctx.ui.setStatus(STATUS_KEY, `nl∞${suffix}`);
 		} else {
 			// Keep footer quiet in normal mode; transient "retrying"/"receiving" only.
 			if (statusMode !== "retry" && statusMode !== "incoming") {
@@ -239,7 +269,12 @@ export default function kunRetry(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		refreshConfig();
+		lastCtx = ctx;
 		applySettingsSync(ctx);
+		if (patchWarning && cfg.constantDelayMs > 0 && ctx.hasUI) {
+			ctx.ui.notify?.(`kun-retry: ${patchWarning}`, "warning");
+			patchWarning = undefined;
+		}
 		disarmStallWatchdog();
 		providerWatchdogActive = false;
 		waitingForStallAbortMessage = false;
@@ -257,6 +292,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_provider_request", (_event, ctx) => {
+		lastCtx = ctx;
 		if (!cfg.enabled) return;
 		if (ctx.hasUI) clearIncomingStatus(ctx);
 		lastIncomingUiAt = 0;
@@ -290,6 +326,15 @@ export default function kunRetry(pi: ExtensionAPI) {
 		disarmStallWatchdog();
 		providerWatchdogActive = false;
 		if (ctx.hasUI) clearIncomingStatus(ctx);
+
+		lastCtx = ctx;
+
+		// A successful turn ends the retry sequence; drop the stale "retrying" label
+		// instead of letting it linger for the rest of its visible window.
+		if (message.stopReason !== "error" && statusMode === "retry" && ctx.hasUI) {
+			clearStatus(ctx);
+			updateFooterStatus(ctx);
+		}
 
 		if (!cfg.enabled && !waitingForStallAbortMessage) return;
 
@@ -484,6 +529,37 @@ export default function kunRetry(pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === "constant" || sub === "const" || sub === "fixed") {
+				if (!restJoined) {
+					ctx.ui.notify(
+						cfg.constantDelayMs > 0
+							? `constantDelayMs=${cfg.constantDelayMs} (${formatDelay(cfg.constantDelayMs)} fixed interval)`
+							: "constantDelayMs=0 (off — Pi built-in exponential backoff)",
+						"info",
+					);
+					return;
+				}
+				const parsed = parseConstantDelayMs(restJoined);
+				if (parsed === undefined) {
+					ctx.ui.notify("Usage: /retry constant <ms|5s|2m|off>", "error");
+					return;
+				}
+				cfg = saveConfig({ constantDelayMs: parsed });
+				if (cfg.constantDelayMs === 0) {
+					ctx.ui.notify(
+						`kun-retry constant interval off — back to Pi built-in exponential backoff (${cfg.baseDelayMs}ms × 2^(attempt-1)).`,
+						"info",
+					);
+				} else {
+					ctx.ui.notify(
+						`kun-retry constant interval ON — every retry waits ${formatDelay(cfg.constantDelayMs)}, no exponential growth. Takes effect immediately (no /reload needed).`,
+						"info",
+					);
+				}
+				updateFooterStatus(ctx);
+				return;
+			}
+
 			if (sub === "codes" || sub === "statuscodes") {
 				if (!restJoined || restJoined === "clear" || restJoined === "none") {
 					cfg = saveConfig({ statusCodes: [] });
@@ -578,7 +654,8 @@ export default function kunRetry(pi: ExtensionAPI) {
 						"/retry status",
 						"/retry on|off",
 						"/retry max <n>          override retry.maxRetries",
-						"/retry delay <ms>       override retry.baseDelayMs",
+						"/retry delay <ms>       override retry.baseDelayMs (exponential base)",
+						"/retry constant <ms|off> fixed retry interval instead of exponential",
 						"/retry codes 401,403    extra HTTP codes in error text",
 						"/retry patterns a,b     extra regexes (i)",
 						"/retry stall <ms|off>   stream stall watchdog",

@@ -191,6 +191,36 @@ test("ensureCodexIdentity sets prompt_cache_key and refreshes window", () => {
 	assert.equal(meta2.turn_id, "turn-2");
 });
 
+test("ensureCodexIdentity uses current Codex client_metadata for Lite requests", () => {
+	const payload: Record<string, unknown> = {};
+	ensureCodexIdentity(
+		payload,
+		{
+			sessionId: "session",
+			threadId: "thread",
+			windowId: "window",
+			installationId: "install",
+			firstWindowId: "first-window",
+			previousWindowId: "previous-window",
+			windowNumber: 4,
+			turnId: "turn",
+			parentThreadId: "parent",
+		},
+		"client_metadata",
+	);
+
+	assert.equal(payload.prompt_cache_key, "session");
+	assert.equal(payload.metadata, undefined);
+	assert.deepEqual(payload.client_metadata, {
+		session_id: "session",
+		thread_id: "thread",
+		"x-codex-installation-id": "install",
+		"x-codex-window-id": "window",
+		turn_id: "turn",
+		"x-codex-parent-thread-id": "parent",
+	});
+});
+
 test("identity store atomic round-trip", () => {
 	const dir = mkdtempSync(join(tmpdir(), "mimic-id-"));
 	try {

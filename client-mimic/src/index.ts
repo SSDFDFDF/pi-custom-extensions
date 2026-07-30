@@ -14,7 +14,7 @@
  * Commands:
  *   /mimic                 show status
  *   /mimic on|off          master switch
- *   /mimic use <profile>   activate a profile (codex | claude-code | off)
+ *   /mimic use <profile>   activate a profile (codex | codex-lite | claude-code | off)
  *   /mimic list            list profiles
  *   /mimic show [profile]  print a profile's resolved headers/body/prompt mode
  *   /mimic prompt [...]    system-prompt control:
@@ -55,6 +55,7 @@ import {
 	type CodexIdentityState,
 	type CodexIdentityStore,
 } from "./codex-identity.ts";
+import { applyCodexResponsesLite } from "./codex-lite.ts";
 import {
 	defaultConfigPath,
 	formatStatus,
@@ -299,8 +300,11 @@ export default function clientMimic(pi: ExtensionAPI) {
 			if (prependClaudeBillingSystem(payload, profile.version)) changed = true;
 		}
 
-		// 4. Codex Responses identity (prompt_cache_key + client_metadata).
-		if (profile.ensureCodexIdentity) {
+		// 4. Codex Responses identity. Responses Lite uses Codex's current
+		// client_metadata field; the original codex profile keeps its legacy
+		// metadata shape for backwards compatibility with existing gateways.
+		const isCompatibleCodexPayload = !profile.codexResponsesLite || Array.isArray(payload.input);
+		if (profile.ensureCodexIdentity && isCompatibleCodexPayload) {
 			if (
 				ensureCodexIdentity(payload, {
 					sessionId: identity.sessionId,
@@ -312,10 +316,17 @@ export default function clientMimic(pi: ExtensionAPI) {
 					previousWindowId: identity.previousWindowId,
 					windowNumber: identity.windowNumber,
 					turnId: identity.turnId,
-				})
+				},
+				profile.codexResponsesLite ? "client_metadata" : "metadata",
+				)
 			) {
 				changed = true;
 			}
+		}
+
+		// 5. Codex Responses Lite transport contract.
+		if (profile.codexResponsesLite) {
+			if (applyCodexResponsesLite(payload)) changed = true;
 		}
 
 		return changed ? payload : undefined;
@@ -516,7 +527,7 @@ export default function clientMimic(pi: ExtensionAPI) {
 					[
 						"/mimic status            show config + active profile",
 						"/mimic on | off          master switch",
-						"/mimic use <profile>     activate codex | claude-code | off",
+						"/mimic use <profile>     activate codex | codex-lite | claude-code | off",
 						"/mimic list              list profiles",
 						"/mimic show [profile]    print resolved headers + body patch",
 						"/mimic prompt                show system-prompt config (all levels)",
@@ -554,6 +565,7 @@ export default function clientMimic(pi: ExtensionAPI) {
 		lines.push(`ensureMetadataUserId: ${profile.ensureMetadataUserId}`);
 		lines.push(`prependBillingSystem: ${profile.prependBillingSystem}`);
 		lines.push(`ensureCodexIdentity: ${profile.ensureCodexIdentity}`);
+		lines.push(`codexResponsesLite: ${profile.codexResponsesLite}`);
 		lines.push(
 			`ids: session=${identity.sessionId} thread=${identity.threadId}` +
 				(identity.parentThreadId ? ` parent_thread=${identity.parentThreadId}` : ""),

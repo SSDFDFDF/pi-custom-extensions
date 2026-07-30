@@ -4,7 +4,9 @@ A compact, shell-first tool surface for the Pi coding agent.
 
 ## Tool surface
 
-When the package loads, it keeps Pi's built-in `read`, `write`, and `edit`, adds `shell` and `apply_patch`, and deactivates overlapping built-in tools (`bash`, `grep`, `find`, `ls`). Tools from unrelated extensions remain active. To drop another extension's tools, remove that extension.
+When the package loads, it keeps Pi's built-in `read`, `write`, and `edit`, adds `shell` and `apply_patch`, and keeps the overlapping built-ins (`bash`, `grep`, `find`, `ls`) active as lower-priority fallbacks instead of deactivating them. Tools from unrelated extensions remain active. To drop another extension's tools, remove that extension.
+
+Pi does not expose a numeric tool-priority field. `kun-tools` therefore implements a soft preference: it orders `shell` and `apply_patch` before the fallback built-ins and adds prompt guidance to prefer `shell` for command-line work. The fallback tools remain directly callable when explicitly requested or when they are a better fit.
 
 | Tool | Purpose |
 |---|---|
@@ -13,6 +15,7 @@ When the package loads, it keeps Pi's built-in `read`, `write`, and `edit`, adds
 | `write` | Pi's built-in full-file writer for new files or complete rewrites. |
 | `edit` | Pi's built-in in-place string-replacement editor. |
 | `apply_patch` | Apply precise Codex-style add/update/delete/move patches to existing files. Prefer this for local edits; use `write` for large new files or full rewrites. |
+| `bash`, `grep`, `find`, `ls` | Pi's overlapping built-ins, retained as lower-priority fallbacks. |
 
 ## Local loading
 

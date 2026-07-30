@@ -15,6 +15,14 @@
         "apply": "replace"
       }
     },
+    "codex-lite": {
+      "_comment": "Use for Codex models whose metadata enables Responses Lite, such as gpt-5.6-sol. The built-in profile performs the body conversion; only prompt behavior is overridden here.",
+      "systemPrompt": {
+        "mode": "file",
+        "file": "extensions/client-mimic/prompts/codex.md",
+        "apply": "replace"
+      }
+    },
     "claude-code": {
       "version": "2.1.198",
       "ensureMetadataUserId": true,

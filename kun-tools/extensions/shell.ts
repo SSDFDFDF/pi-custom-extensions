@@ -213,6 +213,7 @@ export function registerShellTool(pi: ExtensionAPI) {
       "Run one coherent shell task in workdir. Use for rg/find/ls, git, tests, builds, and command-line workflows. Output is capped at 50KB/2000 lines; full truncated output is saved.",
     promptSnippet: "Run shell commands for exploration and execution",
     promptGuidelines: [
+      "Prefer shell over bash, grep, find, and ls for command-line work; keep those built-ins as fallbacks for explicit requests or cases shell cannot handle.",
       "Use shell for one coherent objective; chain related commands with && when failure should stop the chain.",
       "Prefer filtered output (rg, test name filters, tail of failures). Avoid cat of large logs or source files.",
       "Use read for known file content, write for new files or complete rewrites, and apply_patch for precise source edits.",
