@@ -69,6 +69,10 @@ import {
 } from "./config.ts";
 import { applySystemPrompt, effectiveSpec } from "./system-prompt.ts";
 import { formatUpdateResults, updateVersions } from "./update.ts";
+import {
+	registerClaudeCodeWrappers,
+	type WrapperOptions,
+} from "./provider-wrap.ts";
 
 const FLAG = "mimic";
 const STATUS_KEY = "client-mimic";
@@ -154,6 +158,48 @@ export default function clientMimic(pi: ExtensionAPI) {
 		ctx.ui.setStatus(STATUS_KEY, `mimic:${key}`);
 	};
 
+	/**
+	 * Register provider-level `streamSimple` wrappers (body and header patching
+	 * at the lowest layer) so the patches survive code paths that bypass extension
+	 * hooks — chiefly context compaction. Active for any profile when the user has
+	 * listed provider ids in `wrapProviders`.
+	 *
+	 * Safe to call on every session_start: `registerProvider` is idempotent and
+	 * re-wrapping an already-wrapped provider simply replaces the wrapper
+	 * (delegation always goes to the built-in anthropic streamSimple, not the
+	 * previous wrapper, so no nested-wrap buildup).
+	 */
+	const maybeRegisterWrappers = (ctx: Pick<ExtensionContext, "hasUI" | "ui">) => {
+		const profile = effectiveProfile();
+		if (!profile) return;
+		const ids = cfg.wrapProviders;
+		if (!ids || ids.length === 0) return;
+
+		const wrapOpts = {
+			deviceId,
+			sessionId: headerSessionId(effectiveActive()),
+			ensureMetadataUserId: profile.ensureMetadataUserId,
+			prependBillingSystem: profile.prependBillingSystem,
+			version: profile.version,
+			enforceThinkingIdentity: true,
+			// Pass profile and template context for header rewriting (works for all profiles)
+			profile,
+			templateContext: templateCtx(profile, ctx),
+		};
+		const { wrapped, skipped } = registerClaudeCodeWrappers(pi, ids, wrapOpts);
+		if (ctx.hasUI) {
+			if (wrapped.length) {
+				ctx.ui.notify(
+					`client-mimic: wrapped provider streamSimple for ${wrapped.join(", ")}`,
+					"info",
+				);
+			}
+			for (const id of skipped) {
+				ctx.ui.notify(`client-mimic: failed to wrap provider "${id}"`, "warning");
+			}
+		}
+	};
+
 	// ── Lifecycle ────────────────────────────────────────────────────────────
 
 	pi.on("session_start", (event, ctx) => {
@@ -182,6 +228,13 @@ export default function clientMimic(pi: ExtensionAPI) {
 		}
 
 		updateFooter(ctx);
+
+		// Provider-level wrapping: when a Claude-Code-shaped profile is active and
+		// the user listed provider ids in `wrapProviders`, wrap their
+		// `streamSimple` so the body patches (incl. the thinking+output_config
+		// identity pair) also take effect during compaction, which calls the
+		// provider's `streamSimple` directly and skips `before_provider_request`.
+		maybeRegisterWrappers(ctx);
 
 		if (ctx.hasUI) {
 			const p = effectiveProfile();
