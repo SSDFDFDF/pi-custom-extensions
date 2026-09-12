@@ -25,7 +25,6 @@ import {
 	applyTaskPatch,
 	coerceState,
 	deleteTaskFromWorking,
-	enforceOneInProgressPerScope,
 	normalizeIdList,
 	normalizeSequence,
 	normalizeState,
@@ -202,7 +201,6 @@ export class BteStore {
 			bid ? t.boardId === bid : !t.boardId,
 		);
 		const knownIds = new Set(scopeTasks.map((t) => t.id));
-		let inProgressCount = scopeTasks.filter((t) => t.status === "in_progress").length;
 
 		const now = Date.now();
 		const created: Task[] = [];
@@ -216,16 +214,6 @@ export class BteStore {
 			const status = raw.status ?? "pending";
 			if (!isTaskStatus(status)) {
 				return { ok: false, error: `items[${i}]: invalid status: ${status}` };
-			}
-			if (status === "in_progress") {
-				inProgressCount += 1;
-				if (inProgressCount > 1) {
-					const where = bid ? `board ${bid}` : "standalone tasks";
-					return {
-						ok: false,
-						error: `Only one task may be in_progress in ${where}.`,
-					};
-				}
 			}
 			const blocks = normalizeIdList(raw.blocks);
 			const blockedBy = normalizeIdList(raw.blockedBy);
@@ -303,9 +291,6 @@ export class BteStore {
 			}
 			touched.push(cloneTask(task));
 		}
-
-		const inProgErr = enforceOneInProgressPerScope(working);
-		if (inProgErr) return { ok: false, error: inProgErr };
 
 		this.state.tasks = working;
 		this.touch();

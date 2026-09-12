@@ -150,37 +150,14 @@ export function applyTaskPatch(
 	return { ok: true };
 }
 
-export function enforceOneInProgressPerScope(tasks: Task[]): string | undefined {
-	const scopes = new Map<string, Task[]>();
-	for (const t of tasks) {
-		const key = t.boardId ?? "";
-		const list = scopes.get(key) ?? [];
-		list.push(t);
-		scopes.set(key, list);
-	}
-	for (const [key, list] of scopes) {
-		const active = list.filter((t) => t.status === "in_progress");
-		if (active.length > 1) {
-			const where = key ? `board ${key}` : "standalone tasks";
-			return `Only one task may be in_progress in ${where}. Currently: ${active.map((t) => t.id).join(", ")}.`;
-		}
-	}
-	return undefined;
-}
+// Removed: Multiple in_progress tasks are now allowed per scope
 
 export function repairInProgressForScope(
 	allTasks: Task[],
 	scopeBoardId: string | undefined,
 ): void {
-	const list = allTasks.filter((t) =>
-		scopeBoardId ? t.boardId === scopeBoardId : !t.boardId,
-	);
-	let hasActive = false;
-	for (const task of list) {
-		if (task.status !== "in_progress") continue;
-		if (!hasActive) hasActive = true;
-		else task.status = "pending";
-	}
+	// Removed: Multiple in_progress tasks are now allowed per scope
+	// This function is kept for compatibility but does nothing
 }
 
 export function normalizeIdList(ids?: string[]): string[] | undefined {
@@ -344,13 +321,9 @@ export function normalizeState(state: BteState): BteState {
 	}
 	for (const list of scopes.values()) {
 		const retained = new Set(list.map((t) => t.id));
-		let hasActive = false;
 		for (const task of list) {
 			task.blocks = pruneIds(task.blocks, retained, task.id);
 			task.blockedBy = pruneIds(task.blockedBy, retained, task.id);
-			if (task.status !== "in_progress") continue;
-			if (!hasActive) hasActive = true;
-			else task.status = "pending";
 		}
 	}
 
