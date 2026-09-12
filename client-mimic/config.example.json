@@ -6,6 +6,8 @@
     "_comment": "Global default when a profile's systemPrompt.mode is 'inherit'. mode: off | neutral. 'neutral' applies the kun/π identity rewrite while keeping pi's generated tools/guidelines/skills/context.",
     "mode": "neutral"
   },
+  "wrapProviders": [],
+  "_wrapProviders_comment": "Provider ids (from models.json) whose streamSimple should be wrapped at the provider level so Claude-Code body patches (metadata.user_id, billing/identity system preamble, and the thinking+output_config identity pair) also apply on code paths that bypass before_provider_request — chiefly context compaction, which calls the provider streamSimple directly without an onPayload. Only active when a Claude-Code-shaped profile (ensureMetadataUserId/prependBillingSystem) is effective. Empty array = disabled. Example: [\"custom-jcp-966112-xyz-cc\"]",
   "profiles": {
     "codex": {
       "systemPrompt": {

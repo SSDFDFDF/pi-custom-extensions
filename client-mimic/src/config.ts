@@ -124,6 +124,20 @@ export interface MimicConfig {
 	systemPrompt: SystemPromptSpec;
 	/** Named profiles. */
 	profiles: Record<string, MimicProfile>;
+	/**
+	 * Provider ids whose `streamSimple` should be wrapped at the provider level
+	 * so Claude-Code body patching (metadata.user_id, billing/identity system
+	 * preamble, and the `thinking` + `output_config` identity pair) also takes
+	 * effect on code paths that bypass `before_provider_request` — most
+	 * importantly context compaction, which calls the provider's `streamSimple`
+	 * directly without an `onPayload` callback.
+	 *
+	 * Wrapping only activates when the effective profile sets
+	 * `ensureMetadataUserId` or `prependBillingSystem` (i.e. Claude-Code-shaped
+	 * profiles). Each entry is a provider id as configured in models.json.
+	 * Empty array disables provider wrapping (default).
+	 */
+	wrapProviders: string[];
 }
 
 /**
@@ -319,6 +333,7 @@ export const DEFAULT_CONFIG: MimicConfig = {
 	// by default. Set to { mode: "off" } to keep pi's built-in prompt verbatim.
 	systemPrompt: { mode: "neutral" },
 	profiles: DEFAULT_PROFILES,
+	wrapProviders: [],
 };
 
 const CONFIG_FILE_NAME = "client-mimic.config.json";
@@ -448,7 +463,25 @@ export function normalizeConfig(raw: Partial<MimicConfig> | undefined): MimicCon
 		active: active === "off" || profiles[active] ? active : "off",
 		systemPrompt: normalizeSystemPrompt(src.systemPrompt, { mode: "neutral" }, false),
 		profiles,
+		wrapProviders: normalizeWrapProviders(src.wrapProviders),
 	};
+}
+
+/** Normalize the wrapProviders list to a deduplicated array of non-empty strings. */
+function normalizeWrapProviders(raw: unknown): string[] {
+	if (!Array.isArray(raw)) return [];
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const entry of raw) {
+		if (typeof entry !== "string") continue;
+		const trimmed = entry.trim();
+		if (!trimmed) continue;
+		const lower = trimmed.toLowerCase();
+		if (seen.has(lower)) continue;
+		seen.add(lower);
+		out.push(trimmed);
+	}
+	return out;
 }
 
 /** Resolve template placeholders in a header value against runtime context. */
@@ -564,6 +597,7 @@ export function formatStatus(cfg: MimicConfig): string {
 		`active: ${cfg.active}`,
 		`config: ${defaultConfigPath()}`,
 		`system prompt: global=${describeSystemPrompt(cfg.systemPrompt)} | effective=${describeSystemPrompt(effectiveSystemPrompt(cfg))}`,
+		`wrapProviders: ${cfg.wrapProviders.length ? cfg.wrapProviders.join(", ") : "(none)"}`,
 		"profiles:",
 	];
 	for (const [key, p] of Object.entries(cfg.profiles)) {
