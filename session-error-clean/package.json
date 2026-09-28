@@ -1,0 +1,16 @@
+{
+	"name": "session-error-clean",
+	"version": "0.1.0",
+	"description": "Pi extension: remove persisted error entries (e.g. 503 retries) from session files, with parentId relinking, dry runs, backups, and live-context reload for the current session.",
+	"type": "module",
+	"private": true,
+	"keywords": ["pi-package", "pi-extension", "session", "cleanup", "errors"],
+	"license": "MIT",
+	"scripts": {
+		"test": "node --experimental-strip-types --test test/*.test.mjs",
+		"check": "node --experimental-strip-types --check src/clean.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/index.ts"
+	},
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	}
+}

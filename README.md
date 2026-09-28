@@ -10,6 +10,7 @@ npm/git package extensions declared in `settings.json` are not tracked here.
 |-----------|------|---------|
 | `client-mimic/` | dir | Rewrites outgoing provider headers/body to mimic Codex CLI / Claude Code, and owns system-prompt transformation (neutral rewrite or per-profile prompt files). Supersedes the former `neutral-system-prompt.ts`. |
 | `kun-retry/` | dir | Configurable retry: override built-in retry count/backoff, extra HTTP status codes and error patterns, stall watchdog, and `/retry-nl` unlimited mode. |
+| `session-error-clean/` | dir | Removes persisted error entries (e.g. 503 bursts) from session files: JSONL rewrite with parentId relinking, `/clean-errors` with dry run/pattern/id lookup, optional auto-clean on session_start, and live-context reload via `ctx.switchSession()`. |
 | `hybrid-goal/` | dir | Goal-mode state machine (pi-goal lineage) + independent judge + `/goal-evol` self-evolution. |
 | `pi-channels/` | dir | Multi-channel companion (Telegram first): queue, progress drafts, media, attach, connect lock. Replaces `@llblab/pi-telegram`. |
 
@@ -22,6 +23,10 @@ npm/git package extensions declared in `settings.json` are not tracked here.
 │   ├── prompts/
 │   └── src/
 ├── kun-retry/
+│   ├── index.ts
+│   ├── src/
+│   └── test/
+├── session-error-clean/
 │   ├── index.ts
 │   ├── src/
 │   └── test/

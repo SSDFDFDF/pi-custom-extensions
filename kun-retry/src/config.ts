@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 
 export interface KunRetryConfig {
 	/** Master switch for this extension's matching + settings sync. */
@@ -53,7 +52,54 @@ export interface KunRetryConfig {
 	retryEmptyResponse: boolean;
 	/** When true, write maxRetries/baseDelayMs/enabled into ~/.pi/agent/settings.json. */
 	syncSettings: boolean;
+	/**
+	 * Consecutive retryable errors before switching to the next candidate model.
+	 * `0` disables switching. Persisted because it is a behavioral parameter,
+	 * unlike the candidate list which is session-scoped.
+	 */
+	switchAfterErrors: number;
+	/**
+	 * Fold the session's active model into the rotation pool (at the front) so
+	 * the cycle alternates between already-used and candidate models.
+	 * Persisted because it is a behavioral parameter.
+	 */
+	includeActiveInRotation: boolean;
+	/**
+	 * Thinking level applied after a rotation model switch. Pi's own switch logic
+	 * prefers settings.defaultThinkingLevel over the current session level, which
+	 * can silently downgrade a manually raised level. kun-retry sets this
+	 * explicitly after `setModel` to override that.
+	 *
+	 * - a concrete level: apply it (clamped to what the target model supports)
+	 * - "inherit": restore the level the session had before the switch
+	 *
+	 * Defaults to "max" (the strongest level); Pi clamps it down for models that
+	 * support less.
+	 */
+	rotationThinkingLevel: RotationThinkingLevel;
 }
+
+/** Concrete thinking levels plus "inherit" (keep the pre-switch session level). */
+export type RotationThinkingLevel =
+	| "inherit"
+	| "off"
+	| "minimal"
+	| "low"
+	| "medium"
+	| "high"
+	| "xhigh"
+	| "max";
+
+export const ROTATION_THINKING_LEVELS: readonly RotationThinkingLevel[] = [
+	"inherit",
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
 
 export const DEFAULT_CONFIG: KunRetryConfig = {
 	enabled: true,
@@ -67,16 +113,15 @@ export const DEFAULT_CONFIG: KunRetryConfig = {
 	nl: false,
 	retryEmptyResponse: true,
 	syncSettings: true,
+	switchAfterErrors: 3,
+	includeActiveInRotation: true,
+	rotationThinkingLevel: "max",
 };
 
 /** Effective max retries written into settings when nl is on. */
 export const NL_MAX_RETRIES = 1_000_000;
 
 const CONFIG_FILE_NAME = "kun-retry.config.json";
-
-export function packageRootFromUrl(importMetaUrl: string): string {
-	return dirname(dirname(fileURLToPath(importMetaUrl)));
-}
 
 export function agentDir(): string {
 	return process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? ".", ".pi", "agent");
@@ -125,6 +170,8 @@ export function normalizeConfig(raw: Partial<KunRetryConfig> | undefined): KunRe
 				.filter(Boolean)
 		: [];
 
+	const switchAfterErrors = Number(base.switchAfterErrors);
+
 	return {
 		enabled: base.enabled !== false,
 		maxRetries:
@@ -148,6 +195,16 @@ export function normalizeConfig(raw: Partial<KunRetryConfig> | undefined): KunRe
 		nl: base.nl === true,
 		retryEmptyResponse: base.retryEmptyResponse !== false,
 		syncSettings: base.syncSettings !== false,
+		switchAfterErrors:
+			Number.isFinite(switchAfterErrors) && switchAfterErrors >= 0
+				? Math.min(Math.floor(switchAfterErrors), 1000)
+				: DEFAULT_CONFIG.switchAfterErrors,
+		includeActiveInRotation: base.includeActiveInRotation !== false,
+		rotationThinkingLevel: ROTATION_THINKING_LEVELS.includes(
+			base.rotationThinkingLevel as RotationThinkingLevel,
+		)
+			? (base.rotationThinkingLevel as RotationThinkingLevel)
+			: DEFAULT_CONFIG.rotationThinkingLevel,
 	};
 }
 
@@ -182,6 +239,9 @@ export function formatConfigSummary(cfg: KunRetryConfig): string {
 		`stallTimeoutMs: ${cfg.stallTimeoutMs === 0 ? "off" : cfg.stallTimeoutMs}`,
 		`retryEmptyResponse: ${cfg.retryEmptyResponse}`,
 		`syncSettings: ${cfg.syncSettings}`,
+		`switchAfterErrors: ${cfg.switchAfterErrors}${cfg.switchAfterErrors === 0 ? " (0 = switching disabled)" : ""}`,
+		`includeActiveInRotation: ${cfg.includeActiveInRotation}`,
+		`rotationThinkingLevel: ${cfg.rotationThinkingLevel}`,
 		`config: ${defaultConfigPath()}`,
 	].join("\n");
 }

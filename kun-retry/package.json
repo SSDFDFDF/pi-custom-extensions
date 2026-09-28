@@ -1,14 +1,14 @@
 {
   "name": "kun-retry",
-  "version": "0.1.0",
-  "description": "Kun retry extension: configurable max retries, status codes, error patterns, stall watchdog, and /retry-nl unlimited mode. Replaces @narumitw/pi-retry.",
+  "version": "0.2.0",
+  "description": "Kun retry extension: configurable max retries, constant/exponential backoff, status codes, error patterns, stall watchdog (soft-abort so Pi still retries), and /retry-nl unlimited mode. Replaces @narumitw/pi-retry.",
   "type": "module",
   "private": true,
   "keywords": ["pi-package", "pi-extension", "retry"],
   "license": "MIT",
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.mjs",
-    "check": "node --experimental-strip-types --check src/index.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/match.ts && node --experimental-strip-types --check src/retry-patch.ts && node --experimental-strip-types --check src/settings-bridge.ts"
+    "check": "node --experimental-strip-types --check src/index.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/match.ts && node --experimental-strip-types --check src/retry-patch.ts && node --experimental-strip-types --check src/settings-bridge.ts && node --experimental-strip-types --check src/soft-abort.ts && node --experimental-strip-types --check src/model-rotation.ts"
   },
   "pi": {
     "extensions": ["./src/index.ts"]
