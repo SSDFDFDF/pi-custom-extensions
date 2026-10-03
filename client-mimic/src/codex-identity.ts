@@ -1,19 +1,13 @@
 /**
- * Codex-shaped identity for client-mimic.
- *
- * Mirrors codex-rs AgentControl + AutoCompactWindowIds:
- * - root: session_id == thread_id
- * - child (fork/parentSession): share session_id, new thread_id + parent_thread_id
- * - window chain advances on compact; resume restores the chain
- * - installation_id is machine-stable
- * - turn_id is per outbound request
+ * Session-local client identities. All persisted records have the current shape;
+ * old files are not read, repaired or migrated.
  */
-
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteFile, withFileLockBestEffort } from "./fs-util.ts";
-import { isUuid, isUuidV7 } from "./ids.ts";
+import { createDeviceId, uuidV4 } from "./claude-identity.ts";
+import { atomicWriteFile, withFileLock } from "./fs-util.ts";
+import { isUuidV4, isUuidV7 } from "./ids.ts";
 
 export interface CodexWindowChain {
 	firstWindowId: string;
@@ -22,21 +16,20 @@ export interface CodexWindowChain {
 	windowNumber: number;
 }
 
-export interface CodexIdentityState extends CodexWindowChain {
-	/** Key in the on-disk store (usually pi session id). */
-	piSessionKey: string;
-	sessionId: string;
-	threadId: string;
-	parentThreadId?: string;
-	turnId: string;
-	installationId: string;
-}
-
 export interface CodexIdentityRecord extends CodexWindowChain {
 	sessionId: string;
 	threadId: string;
 	parentThreadId?: string;
+	installationId: string;
+	deviceId: string;
+	claudeSessionId: string;
 	updatedAt: string;
+}
+
+export interface CodexIdentityState extends Omit<CodexIdentityRecord, "updatedAt"> {
+	/** Storage key only; never used as an outgoing client identity. */
+	piSessionKey: string;
+	turnId: string;
 }
 
 export interface CodexIdentityStore {
@@ -48,13 +41,9 @@ export interface SessionStartLike {
 	previousSessionFile?: string;
 }
 
-export interface SessionHeaderLike {
-	parentSession?: string;
-}
-
 export interface SessionManagerLike {
-	getSessionId?: () => string;
-	getHeader?: () => SessionHeaderLike | null | undefined;
+	getSessionId: () => string;
+	getHeader: () => { parentSession?: string } | null | undefined;
 }
 
 export interface CodexBodyIds {
@@ -71,7 +60,7 @@ export interface CodexBodyIds {
 
 const MAX_STORE_ENTRIES = 200;
 
-/** RFC 9562 UUIDv7 (time-ordered). Codex SessionId/ThreadId/window_id use this. */
+/** RFC 9562 UUIDv7 (time-ordered). */
 export function uuidV7(): string {
 	const bytes = randomBytes(16);
 	const now = BigInt(Date.now());
@@ -87,19 +76,13 @@ export function uuidV7(): string {
 	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export { isUuid, isUuidV7 } from "./ids.ts";
+export { isUuid, isUuidV4, isUuidV7 } from "./ids.ts";
 
 export function newWindowChain(): CodexWindowChain {
-	const firstWindowId = uuidV7();
-	return {
-		firstWindowId,
-		previousWindowId: undefined,
-		windowId: firstWindowId,
-		windowNumber: 0,
-	};
+	const windowId = uuidV7();
+	return { firstWindowId: windowId, windowId, windowNumber: 0 };
 }
 
-/** Advance context window after compact (session/thread unchanged). */
 export function advanceWindowChain(chain: CodexWindowChain): CodexWindowChain {
 	return {
 		firstWindowId: chain.firstWindowId,
@@ -109,320 +92,151 @@ export function advanceWindowChain(chain: CodexWindowChain): CodexWindowChain {
 	};
 }
 
-export function normalizeWindowFields(known: Partial<CodexWindowChain>): CodexWindowChain {
-	const windowId = known.windowId && isUuidV7(known.windowId) ? known.windowId : uuidV7();
-	const firstWindowId =
-		known.firstWindowId && isUuidV7(known.firstWindowId) ? known.firstWindowId : windowId;
-	const previousWindowId =
-		known.previousWindowId && isUuidV7(known.previousWindowId)
-			? known.previousWindowId
-			: undefined;
-	const windowNumber =
-		typeof known.windowNumber === "number" && Number.isFinite(known.windowNumber)
-			? Math.max(0, Math.floor(known.windowNumber))
-			: 0;
-	return { firstWindowId, previousWindowId, windowId, windowNumber };
-}
-
 export function extractSessionIdFromPath(path: string | undefined): string | undefined {
-	if (!path) return undefined;
-	const base = path.split(/[/\\]/).pop() ?? "";
-	const m = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-	return m?.[1];
+	const base = path?.split(/[/\\]/).pop() ?? "";
+	return base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)?.[1];
 }
 
-export function readParentSessionPath(sessionManager: SessionManagerLike): string | undefined {
-	try {
-		const header = sessionManager.getHeader?.();
-		if (header?.parentSession) return header.parentSession;
-	} catch {
-		// ignore
-	}
-	return undefined;
-}
-
-export function createInitialIdentityState(installationId: string): CodexIdentityState {
+export function createInitialIdentityState(piSessionKey = ""): CodexIdentityState {
 	const sessionId = uuidV7();
-	const win = newWindowChain();
 	return {
-		piSessionKey: sessionId,
+		piSessionKey,
 		sessionId,
 		threadId: sessionId,
-		parentThreadId: undefined,
-		...win,
+		...newWindowChain(),
 		turnId: uuidV7(),
-		installationId,
+		installationId: randomUUID(),
+		deviceId: createDeviceId(),
+		claudeSessionId: uuidV4(),
 	};
 }
 
-/**
- * Resolve Codex session/thread/window for a pi session_start.
- * Pure w.r.t. store mutation: updates `store.byPiSession` and returns resolved state fields
- * (caller supplies installationId + mints turnId).
- */
+/** New root and complete identity set, retaining only Pi's storage key. */
+export function rotateIdentityState(state: CodexIdentityState): CodexIdentityState {
+	return createInitialIdentityState(state.piSessionKey);
+}
+
 export function resolveCodexIdentityOnSessionStart(
 	event: SessionStartLike,
 	sessionManager: SessionManagerLike,
 	store: CodexIdentityStore,
-): Omit<CodexIdentityState, "turnId" | "installationId"> {
-	const piIdRaw = sessionManager.getSessionId?.() ?? "";
-	const piId = piIdRaw && isUuidV7(piIdRaw) ? piIdRaw : piIdRaw || uuidV7();
-	const piThread = isUuidV7(piId) ? piId : uuidV7();
-
-	const known = store.byPiSession[piId];
-	if ((event.reason === "resume" || event.reason === "reload") && known) {
-		const win = normalizeWindowFields(known);
-		const resolved = {
-			piSessionKey: piId,
-			sessionId: known.sessionId,
-			threadId: known.threadId,
-			parentThreadId: known.parentThreadId,
-			...win,
-		};
-		store.byPiSession[piId] = { ...resolved, updatedAt: new Date().toISOString() };
-		return resolved;
+): CodexIdentityState {
+	const piSessionKey = sessionManager.getSessionId();
+	if (!piSessionKey) throw new Error("client-mimic: missing Pi session ID");
+	const known = store.byPiSession[piSessionKey];
+	if (known) {
+		const { updatedAt: _, ...ids } = known;
+		return { ...ids, piSessionKey, turnId: uuidV7() };
 	}
 
-	const parentPath =
-		readParentSessionPath(sessionManager) ??
-		(event.reason === "fork" || event.reason === "new" ? event.previousSessionFile : undefined);
-	const parentPiId = extractSessionIdFromPath(parentPath);
-	const parentRecord = parentPiId ? store.byPiSession[parentPiId] : undefined;
-
-	const isChild =
-		event.reason === "fork" ||
-		(parentRecord != null && parentPiId !== piId) ||
-		(parentPath != null && parentPiId != null && parentPiId !== piId);
-
-	let sessionId: string;
-	let threadId: string;
-	let parentThreadId: string | undefined;
-
-	if (isChild && parentRecord) {
-		sessionId = parentRecord.sessionId;
-		threadId = piThread;
-		parentThreadId = parentRecord.threadId;
-	} else if (isChild && parentPiId) {
-		sessionId = isUuidV7(parentPiId) ? parentPiId : uuidV7();
-		threadId = piThread;
-		parentThreadId = isUuidV7(parentPiId) ? parentPiId : sessionId;
-	} else if (known) {
-		const win = normalizeWindowFields(known);
-		const resolved = {
-			piSessionKey: piId,
-			sessionId: known.sessionId,
-			threadId: known.threadId,
-			parentThreadId: known.parentThreadId,
-			...win,
-		};
-		store.byPiSession[piId] = { ...resolved, updatedAt: new Date().toISOString() };
-		return resolved;
-	} else {
-		sessionId = piThread;
-		threadId = piThread;
-		parentThreadId = undefined;
+	const identity = createInitialIdentityState(piSessionKey);
+	const parentPath = sessionManager.getHeader()?.parentSession
+		?? (event.reason === "fork" ? event.previousSessionFile : undefined);
+	const parentKey = extractSessionIdFromPath(parentPath);
+	const parent = parentKey && parentKey !== piSessionKey ? store.byPiSession[parentKey] : undefined;
+	if (parent) {
+		identity.sessionId = parent.sessionId;
+		identity.parentThreadId = parent.threadId;
 	}
-
-	const win = newWindowChain();
-	const resolved = {
-		piSessionKey: piId,
-		sessionId,
-		threadId,
-		parentThreadId,
-		...win,
-	};
-	store.byPiSession[piId] = { ...resolved, updatedAt: new Date().toISOString() };
-	return resolved;
+	// An absent parent record is not reconstructed from old Pi IDs.
+	persistIdentityState(store, identity);
+	return identity;
 }
 
 export function recordFromState(state: CodexIdentityState): CodexIdentityRecord {
-	return {
-		sessionId: state.sessionId,
-		threadId: state.threadId,
-		parentThreadId: state.parentThreadId,
-		firstWindowId: state.firstWindowId,
-		previousWindowId: state.previousWindowId,
-		windowId: state.windowId,
-		windowNumber: state.windowNumber,
-		updatedAt: new Date().toISOString(),
-	};
+	const { piSessionKey: _, turnId: __, ...ids } = state;
+	return { ...ids, updatedAt: new Date().toISOString() };
 }
 
 export function persistIdentityState(store: CodexIdentityStore, state: CodexIdentityState): void {
-	if (!state.piSessionKey) return;
-	store.byPiSession[state.piSessionKey] = recordFromState(state);
+	if (state.piSessionKey) store.byPiSession[state.piSessionKey] = recordFromState(state);
 }
 
-/**
- * Inject Codex Responses identity into request body.
- * session/thread/installation: set if missing.
- * window/turn chain: always refresh (they move over time).
- */
+/** Managed identity values always take precedence over provider/config values. */
 export function ensureCodexIdentity(
 	payload: Record<string, unknown>,
 	ids: CodexBodyIds,
 	target: "metadata" | "client_metadata" = "metadata",
 ): boolean {
-	let changed = false;
-	if (
-		payload.prompt_cache_key === undefined ||
-		payload.prompt_cache_key === null ||
-		payload.prompt_cache_key === ""
-	) {
-		payload.prompt_cache_key = ids.sessionId;
-		changed = true;
-	}
-
-	const existingMeta =
-		payload[target] && typeof payload[target] === "object" && !Array.isArray(payload[target])
-			? ({ ...(payload[target] as Record<string, unknown>) } as Record<string, unknown>)
-			: {};
-
-	const setAlways = (key: string, value: string) => {
-		if (existingMeta[key] !== value) {
+	let changed = payload.prompt_cache_key !== ids.sessionId;
+	payload.prompt_cache_key = ids.sessionId;
+	const existingMeta = payload[target] && typeof payload[target] === "object" && !Array.isArray(payload[target])
+		? { ...(payload[target] as Record<string, unknown>) } : {};
+	const set = (key: string, value: string | undefined) => {
+		if (value === undefined) {
+			if (key in existingMeta) {
+				delete existingMeta[key];
+				changed = true;
+			}
+		} else if (existingMeta[key] !== value) {
 			existingMeta[key] = value;
 			changed = true;
 		}
 	};
-	const setIfMissing = (key: string, value: string) => {
-		if (existingMeta[key] === undefined || existingMeta[key] === null || existingMeta[key] === "") {
-			existingMeta[key] = value;
-			changed = true;
-		}
-	};
-
-	setIfMissing("session_id", ids.sessionId);
-	setIfMissing("thread_id", ids.threadId);
-	setIfMissing("x-codex-installation-id", ids.installationId);
-	setAlways("x-codex-window-id", ids.windowId);
-	// These window-chain diagnostics predate Codex's current client_metadata
-	// contract. Preserve them in the legacy metadata mode only.
-	if (target === "metadata") {
-		if (ids.firstWindowId) setAlways("first_window_id", ids.firstWindowId);
-		if (ids.previousWindowId) setAlways("previous_window_id", ids.previousWindowId);
-		else if ("previous_window_id" in existingMeta) {
-			delete existingMeta.previous_window_id;
-			changed = true;
-		}
-		if (ids.windowNumber != null) setAlways("window_number", String(ids.windowNumber));
-	}
-	if (ids.turnId) setAlways("turn_id", ids.turnId);
-	if (ids.parentThreadId) setIfMissing("x-codex-parent-thread-id", ids.parentThreadId);
+	set("session_id", ids.sessionId);
+	set("thread_id", ids.threadId);
+	set("x-codex-installation-id", ids.installationId);
+	set("x-codex-window-id", ids.windowId);
+	set("x-codex-parent-thread-id", ids.parentThreadId);
+	set("turn_id", ids.turnId);
+	// Standard Responses gateways use window diagnostics; Lite has a smaller contract.
+	set("first_window_id", target === "metadata" ? ids.firstWindowId : undefined);
+	set("previous_window_id", target === "metadata" ? ids.previousWindowId : undefined);
+	set("window_number", target === "metadata" && ids.windowNumber != null ? String(ids.windowNumber) : undefined);
 	if (changed) payload[target] = existingMeta;
 	return changed;
 }
 
-// ── Persistence ──────────────────────────────────────────────────────────────
-
+/** New filename prevents a still-running old plugin from overwriting this store. */
 export function identityStorePath(agentDir?: string): string {
-	const dir =
-		agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? ".", ".pi", "agent");
-	return join(dir, "client-mimic.identity.json");
+	const dir = agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? ".", ".pi", "agent");
+	return join(dir, "client-mimic.sessions.json");
 }
 
-export function installationIdPath(agentDir?: string): string {
-	const dir =
-		agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? ".", ".pi", "agent");
-	return join(dir, "client-mimic.installation_id");
-}
-
-export function codexInstallationIdPath(home = process.env.HOME ?? "."): string {
-	return join(home, ".codex", "installation_id");
+function isIdentityRecord(value: unknown): value is CodexIdentityRecord {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const r = value as Record<string, unknown>;
+	const v7 = (id: unknown) => typeof id === "string" && isUuidV7(id);
+	const v4 = (id: unknown) => typeof id === "string" && isUuidV4(id);
+	return v7(r.sessionId) && v7(r.threadId) && v7(r.windowId) && v7(r.firstWindowId)
+		&& (r.parentThreadId === undefined || v7(r.parentThreadId))
+		&& (r.previousWindowId === undefined || v7(r.previousWindowId))
+		&& v4(r.installationId) && v4(r.claudeSessionId)
+		&& typeof r.deviceId === "string" && /^[a-f0-9]{64}$/.test(r.deviceId)
+		&& typeof r.windowNumber === "number" && Number.isSafeInteger(r.windowNumber) && r.windowNumber >= 0
+		&& typeof r.updatedAt === "string" && Number.isFinite(Date.parse(r.updatedAt));
 }
 
 export function loadIdentityStore(path = identityStorePath()): CodexIdentityStore {
-	try {
-		if (existsSync(path)) {
-			const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<CodexIdentityStore>;
-			if (raw && typeof raw === "object" && raw.byPiSession && typeof raw.byPiSession === "object") {
-				return { byPiSession: { ...raw.byPiSession } };
-			}
-		}
-	} catch (err) {
-		console.warn(
-			`[client-mimic] identity store unreadable (${path}):`,
-			err instanceof Error ? err.message : err,
-		);
+	if (!existsSync(path)) return { byPiSession: {} };
+	const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<CodexIdentityStore> | null;
+	if (!raw || typeof raw !== "object" || !raw.byPiSession || typeof raw.byPiSession !== "object"
+		|| Array.isArray(raw.byPiSession) || !Object.values(raw.byPiSession).every(isIdentityRecord)) {
+		throw new Error(`Invalid client-mimic session store: ${path}. Clear it; no migration is supported.`);
 	}
-	return { byPiSession: {} };
+	return { byPiSession: { ...raw.byPiSession } };
 }
 
 export function saveIdentityStore(
 	store: CodexIdentityStore,
 	path = identityStorePath(),
+	options: { onlyKey?: string; strict?: boolean } = {},
 ): void {
-	// session_start / compact only — short lock timeout so UI cannot hang.
-	withFileLockBestEffort(
-		path,
-		() => {
-			try {
-				// Merge with on-disk state so parallel writers don't clobber each other.
-				const disk = loadIdentityStore(path);
-				const merged: Record<string, CodexIdentityRecord> = {
-					...disk.byPiSession,
-					...store.byPiSession,
-				};
-				const entries = Object.entries(merged).sort((a, b) =>
-					(b[1].updatedAt || "").localeCompare(a[1].updatedAt || ""),
-				);
-				const trimmed: Record<string, CodexIdentityRecord> = {};
-				for (const [k, v] of entries.slice(0, MAX_STORE_ENTRIES)) trimmed[k] = v;
-				store.byPiSession = trimmed;
-				atomicWriteFile(path, `${JSON.stringify(store, null, 2)}\n`);
-			} catch (err) {
-				console.warn(
-					`[client-mimic] identity store write failed (${path}):`,
-					err instanceof Error ? err.message : err,
-				);
-			}
-		},
-		/*timeoutMs*/ 200,
-	);
-}
-
-/**
- * Prefer real Codex `~/.codex/installation_id`; else persist under pi agent dir.
- */
-export function loadOrCreateInstallationId(options?: {
-	codexPath?: string;
-	localPath?: string;
-}): string {
-	const codexPath = options?.codexPath ?? codexInstallationIdPath();
 	try {
-		if (existsSync(codexPath)) {
-			const raw = readFileSync(codexPath, "utf8").trim();
-			if (isUuid(raw)) return raw;
-		}
-	} catch {
-		// fall through
-	}
-	const localPath = options?.localPath ?? installationIdPath();
-	try {
-		if (existsSync(localPath)) {
-			const raw = readFileSync(localPath, "utf8").trim();
-			if (raw) return raw;
-		}
-	} catch {
-		// fall through
-	}
-	return withFileLockBestEffort(localPath, () => {
-		try {
-			if (existsSync(localPath)) {
-				const raw = readFileSync(localPath, "utf8").trim();
-				if (raw) return raw;
+		withFileLock(path, () => {
+			const merged = { ...loadIdentityStore(path).byPiSession };
+			for (const [key, record] of Object.entries(store.byPiSession)) {
+				if (options.onlyKey !== undefined && key !== options.onlyKey) continue;
+				if (!isIdentityRecord(record)) throw new Error(`Invalid client-mimic identity for ${key}`);
+				if (options.onlyKey === key || !merged[key] || record.updatedAt > merged[key].updatedAt) merged[key] = record;
 			}
-		} catch {
-			// fall through
-		}
-		const id = randomUUID();
-		try {
-			atomicWriteFile(localPath, `${id}\n`);
-		} catch (err) {
-			console.warn(
-				`[client-mimic] installation_id persist failed:`,
-				err instanceof Error ? err.message : err,
-			);
-		}
-		return id;
-	});
+			const entries = Object.entries(merged).sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt));
+			const trimmed = Object.fromEntries(entries.slice(0, MAX_STORE_ENTRIES));
+			atomicWriteFile(path, `${JSON.stringify({ byPiSession: trimmed }, null, 2)}\n`);
+			store.byPiSession = trimmed;
+		}, { timeoutMs: 200, strict: true });
+	} catch (err) {
+		if (options.strict) throw err;
+		console.warn(`[client-mimic] identity store write failed (${path}):`, err instanceof Error ? err.message : err);
+	}
 }

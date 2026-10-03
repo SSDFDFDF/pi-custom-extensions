@@ -21,16 +21,17 @@ original session id, a valid leaf pointer, and an error-free context.
 ## Commands
 
 ```
-/clean-errors              default: clean current session file + reload live context
-/clean-errors help         usage
-/clean-errors dry          preview what would be removed (no write)
-/clean-errors <id-prefix>  clean another session file by session-id prefix
-                           (looked up under ~/.pi/agent/sessions/**)
-/clean-errors pattern <re> default regex filter on errorMessage, e.g. 503
-                           ('' = all error entries)
-/clean-errors auto on|off  auto-clean the file on session_start (file-level;
-                           live context needs /clean-errors or a resume)
-/clean-errors status       show config
+/clean-errors                        default: clean error entries + encrypted reasoning signatures & reload live context
+/clean-errors reasoning [dry|<id>]   strip only encrypted reasoning signatures (thinkingSignature, |fc_*, msg_*, responseId) + reload
+/clean-errors errors [dry|<id>]      clean only error entries (stopReason=error) + reload
+/clean-errors all [dry|<id>]         clean BOTH error entries and reasoning signatures + reload
+/clean-errors compat [on|off|status] toggle outbound before_provider_request Responses reasoning sanitizer (default: ON)
+/clean-errors dry [reasoning|errors] preview what would be removed (no write)
+/clean-errors <id-prefix>            clean another session file by session-id prefix
+/clean-errors pattern <re>           default regex filter on errorMessage, e.g. 503 ('' = all error entries)
+/clean-errors auto on|off            auto-clean error entries on session_start
+/clean-errors status                 show config + compat status
+/clean-errors help                   usage
 ```
 
 `dry`, `pattern`, and `auto` all compose with the id-prefix form except `dry`,

@@ -13,17 +13,17 @@
  *      c. ensures the `thinking` + `output_config` pair is present
  *
  * The wrapper delegates the actual HTTP call to the built-in anthropic
- * `streamSimple` (from `anthropicMessagesApi()`), which reads `model.baseUrl`,
- * `options.apiKey`, and `options.headers` — so our header rewrites take effect.
+ * `streamSimple` from `anthropicMessagesApi()` (the explicit Pi AI compat entrypoint),
+ * which reads `model.baseUrl`, `options.apiKey`, and `options.headers`.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { anthropicMessagesApi } from "@earendil-works/pi-ai";
+import { anthropicMessagesApi } from "@earendil-works/pi-ai/compat";
 import {
 	applyClaudeCodeBodyPatch,
 	type ClaudeCodeWrapOptions,
 } from "./claude-cc-body-fix.ts";
-import { resolveTemplate, type TemplateContext, type MimicProfile } from "./config.ts";
-import { mergeBetaFlags } from "./claude-body.ts";
+import type { TemplateContext, MimicProfile } from "./config.ts";
+import { rewriteHeaders } from "./headers.ts";
 
 export { applyClaudeCodeBodyPatch, type ClaudeCodeWrapOptions } from "./claude-cc-body-fix.ts";
 
@@ -39,12 +39,17 @@ export interface WrapperOptions extends ClaudeCodeWrapOptions {
  * Build a `streamSimple` function that wraps the built-in anthropic
  * streamSimple, injecting both header rewrites and body patches.
  */
-export function createClaudeCodeStreamSimpleWrapper(opts: WrapperOptions) {
-	// Delegate to the built-in anthropic-messages streamSimple — the same
-	// function the unwrapped provider would reach via getApiProvider().
-	const delegate = anthropicMessagesApi().streamSimple;
+export type WrapperOptionsSource = WrapperOptions | (() => WrapperOptions | null);
 
+export function createClaudeCodeStreamSimpleWrapper(
+	source: WrapperOptionsSource,
+	delegate = anthropicMessagesApi().streamSimple,
+) {
 	return function wrappedStreamSimple(model: any, context: any, options: any) {
+		// Snapshot once per call: future calls see resets/profile switches, while
+		// an in-flight request keeps matching headers and body.
+		const opts = typeof source === "function" ? source() : source;
+		if (!opts) return delegate(model, context, options);
 		const prevOnPayload = options?.onPayload;
 
 		const chainedOnPayload = async (payload: any, m: any) => {
@@ -73,70 +78,12 @@ export function createClaudeCodeStreamSimpleWrapper(opts: WrapperOptions) {
 		// Apply header rewrites: this fixes the core issue where compaction
 		// bypasses before_provider_headers and sends pi's default headers.
 		const existingHeaders = (options?.headers ?? {}) as Record<string, string | null | undefined>;
-		const rewrittenHeaders = applyHeaderRewrites(
-			existingHeaders,
-			opts.profile,
-			opts.templateContext,
-		);
+		const rewrittenHeaders = { ...existingHeaders };
+		rewriteHeaders(rewrittenHeaders, opts.profile, opts.templateContext, opts.forceIdentity);
 		wrappedOptions.headers = rewrittenHeaders;
 
 		return delegate(model, context, wrappedOptions);
 	};
-}
-
-/**
- * Apply the mimic profile's header rewrites to the existing headers object.
- * Mirrors the logic from index.ts `before_provider_headers` hook.
- */
-function applyHeaderRewrites(
-	existingHeaders: Record<string, string | null | undefined>,
-	profile: MimicProfile,
-	tctx: TemplateContext,
-): Record<string, string | null | undefined> {
-	const headers = { ...existingHeaders };
-
-	// 1. Strip pi's own identifying headers (case-insensitive match).
-	if (profile.stripHeaders.length) {
-		const lowerStrip = new Set(profile.stripHeaders.map((s) => s.toLowerCase()));
-		for (const existing of Object.keys(headers)) {
-			if (lowerStrip.has(existing.toLowerCase())) {
-				headers[existing] = null;
-			}
-		}
-	}
-
-	// 2. Apply profile headers (string = set/override, null = delete).
-	// Handle case-insensitive deduplication and anthropic-beta merging.
-	for (const [name, rawValue] of Object.entries(profile.headers)) {
-		const lower = name.toLowerCase();
-		const existingKeys = Object.keys(headers).filter((k) => k.toLowerCase() === lower);
-		const existingValue = existingKeys
-			.map((k) => headers[k])
-			.find((v): v is string => typeof v === "string" && v.trim().length > 0);
-
-		for (const existing of existingKeys) {
-			if (existing !== name) headers[existing] = null;
-		}
-
-		if (rawValue === null) {
-			headers[name] = null;
-			continue;
-		}
-
-		const resolved = resolveTemplate(rawValue, tctx);
-		// Empty resolved values delete the header (e.g. parent_thread_id on root).
-		if (!resolved) {
-			headers[name] = null;
-			continue;
-		}
-		if (lower === "anthropic-beta" && existingValue) {
-			headers[name] = mergeBetaFlags(existingValue, resolved);
-		} else {
-			headers[name] = resolved;
-		}
-	}
-
-	return headers;
 }
 
 /**
@@ -149,7 +96,7 @@ function applyHeaderRewrites(
 export function registerClaudeCodeWrappers(
 	pi: ExtensionAPI,
 	providerIds: string[],
-	opts: WrapperOptions,
+	opts: WrapperOptionsSource,
 ): { wrapped: string[]; skipped: string[] } {
 	const wrapped: string[] = [];
 	const skipped: string[] = [];

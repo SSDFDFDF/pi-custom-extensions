@@ -17,6 +17,8 @@
  *   /mimic use <profile>   activate a profile (codex | codex-lite | claude-code | off)
  *   /mimic list            list profiles
  *   /mimic show [profile]  print a profile's resolved headers/body/prompt mode
+ *   /mimic reset-ids       replace all managed identities for this conversation
+ *   /mimic ids             show current identities
  *   /mimic prompt [...]    system-prompt control:
  *                            /mimic prompt                       show config (all levels)
  *                            /mimic prompt <off|neutral>         set the global default
@@ -35,21 +37,17 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	ensureClaudeMetadata,
-	mergeBetaFlags,
 	prependClaudeBillingSystem,
 } from "./claude-body.ts";
-import {
-	loadOrCreateDeviceId,
-	resolveClaudeSessionId,
-} from "./claude-identity.ts";
 import {
 	advanceWindowChain,
 	createInitialIdentityState,
 	ensureCodexIdentity,
 	loadIdentityStore,
-	loadOrCreateInstallationId,
 	persistIdentityState,
+	recordFromState,
 	resolveCodexIdentityOnSessionStart,
+	rotateIdentityState,
 	saveIdentityStore,
 	uuidV7,
 	type CodexIdentityState,
@@ -57,16 +55,15 @@ import {
 } from "./codex-identity.ts";
 import { applyCodexResponsesLite } from "./codex-lite.ts";
 import {
-	defaultConfigPath,
 	formatStatus,
 	loadConfig,
-	resolveTemplate,
 	saveConfig,
 	type MimicConfig,
 	type MimicProfile,
 	type SystemPromptSpec,
 	type TemplateContext,
 } from "./config.ts";
+import { rewriteHeaders } from "./headers.ts";
 import { applySystemPrompt, effectiveSpec } from "./system-prompt.ts";
 import { formatUpdateResults, updateVersions } from "./update.ts";
 import {
@@ -76,6 +73,10 @@ import {
 
 const FLAG = "mimic";
 const STATUS_KEY = "client-mimic";
+const RESET_TEMPLATE_KEYS = new Set([
+	"session_id", "thread_id", "parent_thread_id", "window_id", "first_window_id",
+	"previous_window_id", "window_number", "turn_id", "installation_id", "uuid", "uuid_v7",
+]);
 
 export default function clientMimic(pi: ExtensionAPI) {
 	pi.registerFlag(FLAG, {
@@ -90,12 +91,9 @@ export default function clientMimic(pi: ExtensionAPI) {
 	// user runs /mimic use, which clears the override), later sessions must not
 	// resurrect the flag and silently override an explicit config choice.
 	let flagConsumed = false;
-	// Codex identity (session tree + window chain + turn). See codex-identity.ts.
-	const identityStore: CodexIdentityStore = loadIdentityStore();
-	let identity: CodexIdentityState = createInitialIdentityState(loadOrCreateInstallationId());
-	// Claude Code: stable device_id (persisted) + session_id as UUIDv4.
-	const deviceId = loadOrCreateDeviceId();
-	let claudeSessionId = resolveClaudeSessionId(undefined);
+	// Codex and Claude identities stored together per Pi conversation.
+	const identityStore: CodexIdentityStore = { byPiSession: {} };
+	let identity: CodexIdentityState = createInitialIdentityState("");
 
 	const refresh = () => {
 		cfg = loadConfig();
@@ -118,22 +116,23 @@ export default function clientMimic(pi: ExtensionAPI) {
 
 	const persistCurrentIdentity = () => {
 		persistIdentityState(identityStore, identity);
-		saveIdentityStore(identityStore);
+		saveIdentityStore(identityStore, undefined, { onlyKey: identity.piSessionKey });
 	};
 
 	/** Session id exposed in headers/body: Claude profile wants v4; Codex keeps tree ids. */
-	const headerSessionId = (profileKey: string): string => {
-		if (profileKey === "claude-code") return claudeSessionId;
+	const headerSessionId = (profile: MimicProfile): string => {
+		if (!profile.ensureCodexIdentity && (profile.ensureMetadataUserId || profile.prependBillingSystem ||
+			Object.keys(profile.headers).some((name) => name.toLowerCase() === "x-claude-code-session-id"))) {
+			return identity.claudeSessionId;
+		}
 		return identity.sessionId;
 	};
 
-	const templateCtx = (profile: MimicProfile, _ctx: ExtensionContext): TemplateContext => {
-		const key = effectiveActive();
-		const sessionId = headerSessionId(key);
+	const templateCtx = (profile: MimicProfile): TemplateContext => {
+		const sessionId = headerSessionId(profile);
 		return {
 			version: profile.version,
 			sessionId,
-			// Codex thread/window fields still come from identity; Claude ignores them.
 			threadId: identity.threadId,
 			parentThreadId: identity.parentThreadId,
 			windowId: identity.windowId,
@@ -144,7 +143,8 @@ export default function clientMimic(pi: ExtensionAPI) {
 			installationId: identity.installationId,
 			uuid: () => crypto.randomUUID(),
 			uuidV7: () => uuidV7(),
-			vars: profile.templateVars,
+			vars: Object.fromEntries(Object.entries(profile.templateVars).filter(([key]) =>
+				!RESET_TEMPLATE_KEYS.has(key))),
 		};
 	};
 
@@ -161,32 +161,40 @@ export default function clientMimic(pi: ExtensionAPI) {
 	/**
 	 * Register provider-level `streamSimple` wrappers (body and header patching
 	 * at the lowest layer) so the patches survive code paths that bypass extension
-	 * hooks — chiefly context compaction. Active for any profile when the user has
-	 * listed provider ids in `wrapProviders`.
-	 *
-	 * Safe to call on every session_start: `registerProvider` is idempotent and
-	 * re-wrapping an already-wrapped provider simply replaces the wrapper
-	 * (delegation always goes to the built-in anthropic streamSimple, not the
-	 * previous wrapper, so no nested-wrap buildup).
+	 * hooks — chiefly context compaction. Only Claude-shaped profiles can wrap
+	 * Anthropic providers; applying this wrapper to Codex would change its API.
+	 * Options are resolved afresh per request so resets and on/off apply without
+	 * nested registrations or stale session snapshots.
 	 */
-	const maybeRegisterWrappers = (ctx: Pick<ExtensionContext, "hasUI" | "ui">) => {
+	const registeredWrappers = new Set<string>();
+	const currentWrapOptions = (): WrapperOptions | null => {
 		const profile = effectiveProfile();
-		if (!profile) return;
-		const ids = cfg.wrapProviders;
-		if (!ids || ids.length === 0) return;
-
-		const wrapOpts = {
-			deviceId,
-			sessionId: headerSessionId(effectiveActive()),
+		if (!profile || (!profile.ensureMetadataUserId && !profile.prependBillingSystem)) return null;
+		return {
+			deviceId: identity.deviceId,
+			sessionId: headerSessionId(profile),
 			ensureMetadataUserId: profile.ensureMetadataUserId,
 			prependBillingSystem: profile.prependBillingSystem,
 			version: profile.version,
 			enforceThinkingIdentity: true,
-			// Pass profile and template context for header rewriting (works for all profiles)
+			forceIdentity: true,
 			profile,
-			templateContext: templateCtx(profile, ctx),
+			templateContext: templateCtx(profile),
 		};
-		const { wrapped, skipped } = registerClaudeCodeWrappers(pi, ids, wrapOpts);
+	};
+	const maybeRegisterWrappers = (ctx: Pick<ExtensionContext, "hasUI" | "ui">) => {
+		if (!currentWrapOptions()) return;
+		const ids = cfg.wrapProviders.filter((id) => !registeredWrappers.has(id));
+		if (!ids.length) return;
+		const wrapped: string[] = [];
+		const skipped: string[] = [];
+		for (const id of ids) {
+			const result = registerClaudeCodeWrappers(pi, [id], () =>
+				cfg.wrapProviders.includes(id) ? currentWrapOptions() : null);
+			wrapped.push(...result.wrapped);
+			skipped.push(...result.skipped);
+		}
+		for (const id of wrapped) registeredWrappers.add(id);
 		if (ctx.hasUI) {
 			if (wrapped.length) {
 				ctx.ui.notify(
@@ -204,14 +212,15 @@ export default function clientMimic(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		refresh();
-		const resolved = resolveCodexIdentityOnSessionStart(event, ctx.sessionManager, identityStore);
-		identity = {
-			...resolved,
-			turnId: uuidV7(),
-			installationId: identity.installationId,
-		};
-		// Claude session: UUIDv4 (real CLI). Mapped stably per pi session when pi uses v7.
-		claudeSessionId = resolveClaudeSessionId(ctx.sessionManager.getSessionId?.());
+		try {
+			identityStore.byPiSession = loadIdentityStore().byPiSession;
+		} catch (err) {
+			identityStore.byPiSession = {};
+			if (ctx.hasUI) {
+				ctx.ui.notify(`client-mimic: ${err instanceof Error ? err.message : String(err)}`, "warning");
+			}
+		}
+		identity = resolveCodexIdentityOnSessionStart(event, ctx.sessionManager, identityStore);
 		persistCurrentIdentity();
 
 		if (!flagConsumed) {
@@ -274,57 +283,9 @@ export default function clientMimic(pi: ExtensionAPI) {
 		if (profile.ensureCodexIdentity) {
 			identity = { ...identity, turnId: uuidV7() };
 		}
-		const tctx = templateCtx(profile, ctx);
+		const tctx = templateCtx(profile);
 
-		// 1. Strip pi's own identifying headers (case-insensitive match).
-		if (profile.stripHeaders.length) {
-			const lowerStrip = new Set(profile.stripHeaders.map((s) => s.toLowerCase()));
-			for (const existing of Object.keys(event.headers)) {
-				if (lowerStrip.has(existing.toLowerCase())) {
-					event.headers[existing] = null;
-				}
-			}
-		}
-
-		// 2. Apply profile headers (string = set/override, null = delete).
-		// HTTP header names are case-insensitive, but event.headers is a plain
-		// object with case-sensitive keys. To avoid emitting both e.g. "user-agent"
-		// (from the provider) and "User-Agent" (from the profile), drop every
-		// existing key that matches case-insensitively before writing the profile's
-		// canonical spelling. Deletion uses null so it also cancels a same-name key
-		// added by an earlier-loaded extension.
-		//
-		// anthropic-beta is special-cased: merge with any existing value (union of
-		// comma-separated flags) so we don't clobber betas pi already set for
-		// thinking/tool-streaming while still forcing Claude Code identity flags.
-		for (const [name, rawValue] of Object.entries(profile.headers)) {
-			const lower = name.toLowerCase();
-			const existingKeys = Object.keys(event.headers).filter((k) => k.toLowerCase() === lower);
-			const existingValue = existingKeys
-				.map((k) => event.headers[k])
-				.find((v): v is string => typeof v === "string" && v.trim().length > 0);
-
-			for (const existing of existingKeys) {
-				if (existing !== name) event.headers[existing] = null;
-			}
-
-			if (rawValue === null) {
-				event.headers[name] = null;
-				continue;
-			}
-
-			const resolved = resolveTemplate(rawValue, tctx);
-			// Empty resolved values delete the header (e.g. parent_thread_id on root).
-			if (!resolved) {
-				event.headers[name] = null;
-				continue;
-			}
-			if (lower === "anthropic-beta" && existingValue) {
-				event.headers[name] = mergeBetaFlags(existingValue, resolved);
-			} else {
-				event.headers[name] = resolved;
-			}
-		}
+		rewriteHeaders(event.headers, profile, tctx, true);
 	});
 
 	// ── Body patch ───────────────────────────────────────────────────────────
@@ -345,7 +306,7 @@ export default function clientMimic(pi: ExtensionAPI) {
 
 		// 2. Claude Code metadata.user_id (JSON string with device/session).
 		if (profile.ensureMetadataUserId) {
-			if (ensureClaudeMetadata(payload, deviceId, claudeSessionId)) changed = true;
+			if (ensureClaudeMetadata(payload, identity.deviceId, identity.claudeSessionId, true)) changed = true;
 		}
 
 		// 3. Claude Code billing/identity system preamble.
@@ -405,9 +366,9 @@ export default function clientMimic(pi: ExtensionAPI) {
 
 	pi.registerCommand("mimic", {
 		description:
-			"client-mimic: status | on | off | use <profile> | list | show [profile] | update [name|all]",
+			"client-mimic: status | on | off | use <profile> | ids | reset-ids | show [profile] | update [name|all]",
 		getArgumentCompletions: (prefix: string) => {
-			const subs = ["status", "on", "off", "use", "list", "show", "update", "prompt"];
+			const subs = ["status", "on", "off", "use", "list", "show", "ids", "reset-ids", "update", "prompt", "help"];
 			const profiles = Object.keys(loadConfig().profiles);
 			const parts = prefix.split(/\s+/);
 			let items: { value: string; label: string }[];
@@ -454,8 +415,48 @@ export default function clientMimic(pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === "ids") {
+				ctx.ui.notify(identitySummary(), "info");
+				return;
+			}
+
+			if (sub === "reset-ids") {
+				if (restJoined) {
+					ctx.ui.notify("Usage: /mimic reset-ids (current conversation only)", "error");
+					return;
+				}
+				// Never change identity between the headers and body of an active turn.
+				if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+					ctx.ui.notify("client-mimic: wait for the current turn and queued messages to finish before resetting IDs.", "warning");
+					return;
+				}
+				if (ctx.sessionManager.getSessionId() !== identity.piSessionKey) {
+					ctx.ui.notify("client-mimic: session changed; run /reload before resetting IDs.", "error");
+					return;
+				}
+				const next = rotateIdentityState(identity);
+				const staged: CodexIdentityStore = { byPiSession: {} };
+				persistIdentityState(staged, next);
+				try {
+					saveIdentityStore(staged, undefined, { onlyKey: next.piSessionKey, strict: true });
+				} catch (err) {
+					ctx.ui.notify(`client-mimic: IDs unchanged; could not save: ${err instanceof Error ? err.message : String(err)}`, "error");
+					return;
+				}
+				identity = next;
+				identityStore.byPiSession[next.piSessionKey] = recordFromState(next);
+				ctx.ui.notify([
+					"client-mimic: current conversation identities reset and saved. Effective on the next request.",
+					"Pi session ID/history, other conversations and machine identity files are unchanged.",
+					"Old parent/window links cleared; gateway prompt cache may be cold.",
+					identitySummary(),
+				].join("\n"), "info");
+				return;
+			}
+
 			if (sub === "on" || sub === "enable") {
 				cfg = saveConfig({ enabled: true });
+				maybeRegisterWrappers(ctx);
 				updateFooter(ctx);
 				ctx.ui.notify(`client-mimic enabled (active: ${cfg.active})`, "info");
 				return;
@@ -481,6 +482,7 @@ export default function clientMimic(pi: ExtensionAPI) {
 				cfg = saveConfig({ active: target, enabled: target === "off" ? cfg.enabled : true });
 				// Clear any flag override so the config choice takes effect this session.
 				flagOverride = undefined;
+				maybeRegisterWrappers(ctx);
 				updateFooter(ctx);
 				const p = cfg.profiles[target];
 				ctx.ui.notify(
@@ -501,6 +503,7 @@ export default function clientMimic(pi: ExtensionAPI) {
 				ctx.ui.notify("client-mimic: querying npm registry…", "info");
 				const results = await updateVersions(restJoined || undefined, ctx.signal);
 				refresh();
+				maybeRegisterWrappers(ctx);
 				updateFooter(ctx);
 				ctx.ui.notify(`client-mimic update results:\n${formatUpdateResults(results)}`, "info");
 				return;
@@ -545,7 +548,7 @@ export default function clientMimic(pi: ExtensionAPI) {
 					let nextSpec: SystemPromptSpec;
 					if (mode === "file") {
 						// Default to the tracked seed file for this profile when no path is given.
-						const path = rest.slice(1).join(" ").trim() || `extensions/client-mimic/prompts/${key}.md`;
+						const path = rest.slice(2).join(" ").trim() || `extensions/client-mimic/prompts/${key}.md`;
 						const prev = cfg.profiles[key].systemPrompt;
 						const apply = prev.mode === "file" && prev.apply ? prev.apply : "replace";
 						nextSpec = { mode: "file", file: path, apply };
@@ -581,6 +584,8 @@ export default function clientMimic(pi: ExtensionAPI) {
 						"/mimic status            show config + active profile",
 						"/mimic on | off          master switch",
 						"/mimic use <profile>     activate codex | codex-lite | claude-code | off",
+						"/mimic ids               show current session/thread/window/device IDs",
+						"/mimic reset-ids         replace all managed IDs for this conversation (keeps history)",
 						"/mimic list              list profiles",
 						"/mimic show [profile]    print resolved headers + body patch",
 						"/mimic prompt                show system-prompt config (all levels)",
@@ -598,19 +603,37 @@ export default function clientMimic(pi: ExtensionAPI) {
 		},
 	});
 
+	function identitySummary(): string {
+		return [
+			`pi_session_id (storage key): ${identity.piSessionKey}`,
+			`codex session_id: ${identity.sessionId}`,
+			`thread_id: ${identity.threadId}`,
+			`parent_thread_id: ${identity.parentThreadId ?? "(none)"}`,
+			`window_id: ${identity.windowId}`,
+			`first_window_id: ${identity.firstWindowId}`,
+			`previous_window_id: ${identity.previousWindowId ?? "(none)"}`,
+			`window_number: ${identity.windowNumber}`,
+			`turn_id: ${identity.turnId}`,
+			`installation_id: ${identity.installationId}`,
+			`claude session_id: ${identity.claudeSessionId}`,
+			`device_id: ${identity.deviceId}`,
+		].join("\n");
+	}
+
 	function showProfile(ctx: ExtensionContext, key: string) {
 		const profile = cfg.profiles[key.toLowerCase()];
 		if (!profile) {
 			ctx.ui.notify(`Unknown profile "${key}". Available: ${Object.keys(cfg.profiles).join(", ")}`, "error");
 			return;
 		}
-		const tctx = templateCtx(profile, ctx);
+		const tctx = templateCtx(profile);
 		const lines: string[] = [`${key} — ${profile.label} v${profile.version}`];
 		if (profile.npmPackage) lines.push(`npm: ${profile.npmPackage}`);
 		lines.push("headers:");
-		for (const [name, rawValue] of Object.entries(profile.headers)) {
-			if (rawValue === null) lines.push(`  - ${name}: (deleted)`);
-			else lines.push(`  ${name}: ${resolveTemplate(rawValue, tctx)}`);
+		const headers: Record<string, string | null | undefined> = {};
+		rewriteHeaders(headers, profile, tctx, true);
+		for (const [name, value] of Object.entries(headers)) {
+			lines.push(`  ${name}: ${value ?? "(deleted)"}`);
 		}
 		if (profile.stripHeaders.length) lines.push(`strip: ${profile.stripHeaders.join(", ")}`);
 		const bodyKeys = Object.keys(profile.bodyPatch);
@@ -619,18 +642,7 @@ export default function clientMimic(pi: ExtensionAPI) {
 		lines.push(`prependBillingSystem: ${profile.prependBillingSystem}`);
 		lines.push(`ensureCodexIdentity: ${profile.ensureCodexIdentity}`);
 		lines.push(`codexResponsesLite: ${profile.codexResponsesLite}`);
-		lines.push(
-			`ids: session=${identity.sessionId} thread=${identity.threadId}` +
-				(identity.parentThreadId ? ` parent_thread=${identity.parentThreadId}` : ""),
-		);
-		lines.push(
-			`window: #${identity.windowNumber} current=${identity.windowId}` +
-				` first=${identity.firstWindowId}` +
-				(identity.previousWindowId ? ` previous=${identity.previousWindowId}` : ""),
-		);
-		lines.push(`turn_id: ${identity.turnId}`);
-		lines.push(`installation_id: ${identity.installationId}`);
-		lines.push(`tree: ${identity.parentThreadId ? "child" : "root"}`);
+		lines.push(`resolved session_id: ${headerSessionId(profile)}`, identitySummary());
 		const varKeys = Object.keys(profile.templateVars);
 		if (varKeys.length) lines.push(`templateVars: ${JSON.stringify(profile.templateVars)}`);
 		lines.push(`systemPrompt: ${describeSpec(profile.systemPrompt)}`);

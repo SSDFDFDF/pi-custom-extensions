@@ -14,19 +14,30 @@ export function ensureClaudeMetadata(
 	payload: Record<string, unknown>,
 	deviceId: string,
 	sessionId: string,
+	force = false,
 ): boolean {
 	const existingMeta =
 		payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
 			? ({ ...(payload.metadata as Record<string, unknown>) } as Record<string, unknown>)
 			: {};
+	let user: Record<string, unknown> = {};
 	if (typeof existingMeta.user_id === "string" && existingMeta.user_id.trim()) {
-		return false;
+		if (!force) return false;
+		try {
+			const parsed: unknown = JSON.parse(existingMeta.user_id);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				user = parsed as Record<string, unknown>;
+			}
+		} catch { /* Replace non-JSON ids only after an explicit identity reset. */ }
 	}
-	existingMeta.user_id = JSON.stringify({
+	const userId = JSON.stringify({
+		...user,
 		device_id: deviceId,
-		account_uuid: "",
+		account_uuid: user.account_uuid ?? "",
 		session_id: sessionId,
 	});
+	if (existingMeta.user_id === userId) return false;
+	existingMeta.user_id = userId;
 	payload.metadata = existingMeta;
 	return true;
 }

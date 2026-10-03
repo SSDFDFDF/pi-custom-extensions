@@ -1,5 +1,5 @@
 /**
- * Run: node --experimental-strip-types --test src/codex-identity.test.ts
+ * Run: node --loader /tmp/client-mimic-test-loader.mjs --test src/codex-identity.test.ts
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -10,9 +10,9 @@ import {
 	advanceWindowChain,
 	ensureCodexIdentity,
 	extractSessionIdFromPath,
+	isUuidV4,
 	isUuidV7,
 	loadIdentityStore,
-	loadOrCreateInstallationId,
 	newWindowChain,
 	resolveCodexIdentityOnSessionStart,
 	saveIdentityStore,
@@ -57,7 +57,10 @@ test("root session_id equals thread_id", () => {
 	const piId = uuidV7();
 	const r = resolveCodexIdentityOnSessionStart({ reason: "startup" }, sm(piId), store);
 	assert.equal(r.sessionId, r.threadId);
-	assert.equal(r.sessionId, piId);
+	assert.ok(isUuidV7(r.sessionId));
+	assert.ok(isUuidV4(r.installationId));
+	assert.ok(isUuidV4(r.claudeSessionId));
+	assert.match(r.deviceId, /^[a-f0-9]{64}$/);
 	assert.equal(r.parentThreadId, undefined);
 	assert.equal(r.windowNumber, 0);
 	assert.ok(store.byPiSession[piId]);
@@ -77,7 +80,6 @@ test("fork child shares session, new thread, has parent", () => {
 	);
 
 	assert.equal(child.sessionId, root.sessionId);
-	assert.equal(child.threadId, childPi);
 	assert.notEqual(child.threadId, child.sessionId);
 	assert.equal(child.parentThreadId, root.threadId);
 	assert.equal(child.windowNumber, 0);
@@ -106,22 +108,17 @@ test("grandchild inherits root session_id", () => {
 
 	assert.equal(grand.sessionId, root.sessionId);
 	assert.equal(grand.parentThreadId, child.threadId);
-	assert.equal(grand.threadId, grandPi);
+	assert.notEqual(grand.threadId, child.threadId);
 });
 
 test("resume restores session/thread/window without minting new window", () => {
 	const store: CodexIdentityStore = { byPiSession: {} };
 	const piId = uuidV7();
 	const first = resolveCodexIdentityOnSessionStart({ reason: "startup" }, sm(piId), store);
-	// simulate compact persisted
 	const advanced = advanceWindowChain(first);
 	store.byPiSession[piId] = {
-		sessionId: first.sessionId,
-		threadId: first.threadId,
-		firstWindowId: advanced.firstWindowId,
-		previousWindowId: advanced.previousWindowId,
-		windowId: advanced.windowId,
-		windowNumber: advanced.windowNumber,
+		...first,
+		...advanced,
 		updatedAt: new Date().toISOString(),
 	};
 
@@ -224,37 +221,39 @@ test("ensureCodexIdentity uses current Codex client_metadata for Lite requests",
 test("identity store atomic round-trip", () => {
 	const dir = mkdtempSync(join(tmpdir(), "mimic-id-"));
 	try {
-		const path = join(dir, "client-mimic.identity.json");
+		const path = join(dir, "client-mimic.sessions.json");
+		const sid = uuidV7();
+		const wid = uuidV7();
 		const store: CodexIdentityStore = {
 			byPiSession: {
 				a: {
-					sessionId: "s",
-					threadId: "t",
-					firstWindowId: "w",
-					windowId: "w",
+					sessionId: sid,
+					threadId: sid,
+					firstWindowId: wid,
+					windowId: wid,
 					windowNumber: 0,
+					installationId: "00000000-0000-4000-8000-000000000001",
+					claudeSessionId: "00000000-0000-4000-8000-000000000002",
+					deviceId: "a".repeat(64),
 					updatedAt: "2026-01-01T00:00:00.000Z",
 				},
 			},
 		};
 		saveIdentityStore(store, path);
 		const loaded = loadIdentityStore(path);
-		assert.equal(loaded.byPiSession.a.sessionId, "s");
-		assert.equal(JSON.parse(readFileSync(path, "utf8")).byPiSession.a.threadId, "t");
+		assert.equal(loaded.byPiSession.a.sessionId, sid);
+		assert.equal(JSON.parse(readFileSync(path, "utf8")).byPiSession.a.threadId, sid);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
-test("installation id prefers codex file", () => {
-	const dir = mkdtempSync(join(tmpdir(), "mimic-inst-"));
+test("loadIdentityStore throws on legacy or corrupt data without migration", () => {
+	const dir = mkdtempSync(join(tmpdir(), "mimic-store-"));
 	try {
-		const codexPath = join(dir, "codex-installation_id");
-		const localPath = join(dir, "local-installation_id");
-		const expected = "61c063ab-0ac1-450a-9c59-13c0f3cc185b";
-		writeFileSync(codexPath, `${expected}\n`);
-		const id = loadOrCreateInstallationId({ codexPath, localPath });
-		assert.equal(id, expected);
+		const path = join(dir, "client-mimic.sessions.json");
+		writeFileSync(path, JSON.stringify({ byPiSession: { old: { sessionId: "s" } } }));
+		assert.throws(() => loadIdentityStore(path), /Invalid client-mimic session store/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

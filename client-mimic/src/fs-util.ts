@@ -83,12 +83,12 @@ export function tryAcquireFileLock(lockPath: string): (() => void) | null {
 /**
  * Acquire exclusive lock via O_EXCL lockfile. Returns a release function.
  * Stale locks older than staleMs are broken (best-effort).
- * On timeout returns a no-op release (unlocked best-effort) after a short wait —
- * callers should keep critical sections tiny.
+ * On timeout throws when strict=true; otherwise returns a no-op release
+ * (unlocked best-effort). Callers should keep critical sections tiny.
  */
 export function acquireFileLock(
 	lockPath: string,
-	options?: { timeoutMs?: number; staleMs?: number },
+	options?: { timeoutMs?: number; staleMs?: number; strict?: boolean },
 ): () => void {
 	const timeoutMs = options?.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
 	const staleMs = options?.staleMs ?? DEFAULT_LOCK_STALE_MS;
@@ -116,6 +116,7 @@ export function acquireFileLock(
 		}
 
 		if (Date.now() - start >= timeoutMs) {
+			if (options?.strict) throw new Error(`Identity store is busy: ${lockPath}. Try again.`);
 			console.warn(`[client-mimic] lock timeout on ${lockPath}; continuing unlocked`);
 			return () => {};
 		}
@@ -124,7 +125,7 @@ export function acquireFileLock(
 }
 
 /** Run fn under exclusive lock for path (uses path + ".lock"). */
-export function withFileLock<T>(path: string, fn: () => T, options?: { timeoutMs?: number }): T {
+export function withFileLock<T>(path: string, fn: () => T, options?: { timeoutMs?: number; strict?: boolean }): T {
 	const release = acquireFileLock(`${path}.lock`, options);
 	try {
 		return fn();

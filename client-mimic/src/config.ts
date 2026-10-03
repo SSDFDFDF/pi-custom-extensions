@@ -44,8 +44,9 @@ export interface MimicProfile {
 	 * When true, ensure the Anthropic Messages payload has `metadata.user_id`
 	 * in the Claude Code JSON-string form:
 	 *   {"device_id":"...","account_uuid":"","session_id":"..."}
-	 * Existing metadata.user_id is left alone. device_id is a stable per-machine
-	 * hash; session_id reuses pi's session id.
+	 * Existing metadata.user_id is left alone unless `/mimic reset-ids` has
+	 * created a session-local override. device_id defaults to a per-machine hash;
+	 * session_id is a stable UUIDv4.
 	 */
 	ensureMetadataUserId: boolean;
 	/**
@@ -60,7 +61,8 @@ export interface MimicProfile {
 	 * When true, inject Codex Responses identity into the request body:
 	 * `prompt_cache_key` (= session_id) and flat identity keys. The legacy Codex
 	 * profile uses `metadata`; Responses Lite uses current Codex
-	 * `client_metadata`. Existing user-set keys are left alone.
+	 * `client_metadata`. Existing user-set keys are left alone unless an explicit
+	 * session identity reset takes precedence.
 	 */
 	ensureCodexIdentity: boolean;
 	/**

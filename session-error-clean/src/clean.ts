@@ -43,6 +43,10 @@ export interface CleanFilter {
 	 * Undefined/empty matches every error entry.
 	 */
 	pattern?: RegExp;
+	/** Remove assistant error entries (default true). */
+	cleanErrors?: boolean;
+	/** Strip persisted Responses reasoning signatures and backend item IDs (default false). */
+	cleanReasoning?: boolean;
 }
 
 export interface RemovedError {
@@ -56,11 +60,17 @@ export interface CleanPlan {
 	/** Total parsed entries before cleaning. */
 	total: number;
 	/** Surviving entries with relinked parentIds, in original order. */
-	kept: SessionEntryLike[];
+	kept: Array<SessionEntryLike | RawLineEntry>;
 	/** Error entries selected for removal, in original order. */
 	removed: RemovedError[];
 	/** Survivors whose parentId had to be patched. */
 	relinked: number;
+	/** Surviving message entries whose reasoning/item signatures were cleaned. */
+	reasoningCleaned: number;
+	/** Number of thinkingSignature/textSignature/responseId fields stripped. */
+	signaturesRemoved: number;
+	/** Number of backend |fc_* / |ctc_* tool item ID suffixes stripped. */
+	itemIdsRemoved: number;
 }
 
 export interface CleanFileOptions {
@@ -105,6 +115,7 @@ export function isSessionFileHeader(entry: SessionEntryLike | RawLineEntry): boo
 }
 
 export function isErrorEntry(entry: SessionEntryLike | RawLineEntry, filter: CleanFilter): boolean {
+	if (filter.cleanErrors === false) return false;
 	if ("__raw" in entry) return false;
 	if (entry.type !== "message") return false;
 	const message = entry.message;
@@ -114,6 +125,87 @@ export function isErrorEntry(entry: SessionEntryLike | RawLineEntry, filter: Cle
 		if (!filter.pattern.test(text)) return false;
 	}
 	return true;
+}
+
+export function sanitizeEntryReasoning(entry: SessionEntryLike | RawLineEntry): {
+	entry: SessionEntryLike | RawLineEntry;
+	modified: boolean;
+	signaturesRemoved: number;
+	itemIdsRemoved: number;
+} {
+	if ("__raw" in entry || entry.type !== "message" || !entry.message || typeof entry.message !== "object") {
+		return { entry, modified: false, signaturesRemoved: 0, itemIdsRemoved: 0 };
+	}
+	const msg = entry.message as Record<string, unknown>;
+	let modified = false;
+	let signaturesRemoved = 0;
+	let itemIdsRemoved = 0;
+
+	if (msg.role === "assistant") {
+		const nextMsg: Record<string, unknown> = { ...msg };
+		if ("responseId" in nextMsg) {
+			delete nextMsg.responseId;
+			modified = true;
+			signaturesRemoved++;
+		}
+		if (Array.isArray(msg.content)) {
+			const nextContent = msg.content.flatMap((rawBlock: unknown): unknown[] => {
+				if (!rawBlock || typeof rawBlock !== "object" || Array.isArray(rawBlock)) return [rawBlock];
+				const block = rawBlock as Record<string, unknown>;
+				let blockChanged = false;
+				const nextBlock: Record<string, unknown> = { ...block };
+
+				if (block.type === "thinking" && "thinkingSignature" in nextBlock) {
+					delete nextBlock.thinkingSignature;
+					blockChanged = true;
+					signaturesRemoved++;
+				}
+				if ("thoughtSignature" in nextBlock) {
+					delete nextBlock.thoughtSignature;
+					blockChanged = true;
+					signaturesRemoved++;
+				}
+				if (block.type === "thinking" && (!nextBlock.thinking || String(nextBlock.thinking).trim() === "")) {
+					if (blockChanged) modified = true;
+					return [];
+				}
+				if (block.type === "text" && "textSignature" in nextBlock) {
+					delete nextBlock.textSignature;
+					blockChanged = true;
+					signaturesRemoved++;
+				}
+				if (block.type === "toolCall" && typeof nextBlock.id === "string" && nextBlock.id.includes("|")) {
+					nextBlock.id = nextBlock.id.split("|")[0];
+					blockChanged = true;
+					itemIdsRemoved++;
+				}
+				if (blockChanged) modified = true;
+				return [blockChanged ? nextBlock : rawBlock];
+			});
+			if (modified) nextMsg.content = nextContent;
+		}
+		return {
+			entry: modified ? { ...entry, message: nextMsg } : entry,
+			modified,
+			signaturesRemoved,
+			itemIdsRemoved,
+		};
+	}
+
+	if (msg.role === "toolResult" && typeof msg.toolCallId === "string" && msg.toolCallId.includes("|")) {
+		const nextMsg: Record<string, unknown> = {
+			...msg,
+			toolCallId: msg.toolCallId.split("|")[0],
+		};
+		return {
+			entry: { ...entry, message: nextMsg },
+			modified: true,
+			signaturesRemoved: 0,
+			itemIdsRemoved: 1,
+		};
+	}
+
+	return { entry, modified: false, signaturesRemoved: 0, itemIdsRemoved: 0 };
 }
 
 export function planClean(
@@ -142,6 +234,9 @@ export function planClean(
 	const kept: Array<SessionEntryLike | RawLineEntry> = [];
 	const removed: RemovedError[] = [];
 	let relinked = 0;
+	let reasoningCleaned = 0;
+	let signaturesRemoved = 0;
+	let itemIdsRemoved = 0;
 	for (const entry of entries) {
 		if (!("__raw" in entry) && typeof entry.id === "string" && removedParent.has(entry.id)) {
 			removed.push({
@@ -151,17 +246,28 @@ export function planClean(
 			});
 			continue;
 		}
-		const parent = entry.parentId ?? null;
-		const resolved = resolveParent(parent);
-		if (parent !== null && resolved !== parent) {
-			kept.push({ ...entry, parentId: resolved });
-			relinked++;
-		} else {
-			kept.push(entry);
+		let currentEntry: SessionEntryLike | RawLineEntry = entry;
+		if (!("__raw" in currentEntry)) {
+			const parent = currentEntry.parentId ?? null;
+			const resolved = resolveParent(parent);
+			if (parent !== null && resolved !== parent) {
+				currentEntry = { ...currentEntry, parentId: resolved };
+				relinked++;
+			}
 		}
+		if (filter.cleanReasoning) {
+			const res = sanitizeEntryReasoning(currentEntry);
+			if (res.modified) {
+				currentEntry = res.entry;
+				reasoningCleaned++;
+				signaturesRemoved += res.signaturesRemoved;
+				itemIdsRemoved += res.itemIdsRemoved;
+			}
+		}
+		kept.push(currentEntry);
 	}
 
-	return { total: entries.length, kept, removed, relinked };
+	return { total: entries.length, kept, removed, relinked, reasoningCleaned, signaturesRemoved, itemIdsRemoved };
 }
 
 function previewErrorMessage(value: unknown, max = 120): string {
@@ -185,7 +291,8 @@ export function cleanSessionFile(file: string, filter: CleanFilter = {}, options
 	}
 
 	const plan = planClean(entries, filter);
-	if (options.dryRun || plan.removed.length === 0) {
+	const hasChanges = plan.removed.length > 0 || plan.reasoningCleaned > 0;
+	if (options.dryRun || !hasChanges) {
 		return { file, plan, rewritten: false, bytesBefore, bytesAfter: bytesBefore };
 	}
 

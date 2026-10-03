@@ -6,7 +6,7 @@
  * import so it can be unit-tested in isolation. See `provider-wrap.ts` for
  * the `streamSimple` wrapper that uses it.
  */
-import { prependClaudeBillingSystem } from "./claude-body.ts";
+import { ensureClaudeMetadata, prependClaudeBillingSystem } from "./claude-body.ts";
 
 /** Options used by the wrapper to decide which body helpers to apply. */
 export interface ClaudeCodeWrapOptions {
@@ -26,6 +26,8 @@ export interface ClaudeCodeWrapOptions {
 	 * disabled pi omits `output_config`, so we inject a minimal one. Default true.
 	 */
 	enforceThinkingIdentity: boolean;
+	/** An explicit session reset takes precedence over existing provider metadata. */
+	forceIdentity?: boolean;
 }
 
 /** Minimal effort value to inject when we must fabricate `output_config`. */
@@ -55,27 +57,9 @@ export function applyClaudeCodeBodyPatch(
 
 	// 1. metadata.user_id (Claude Code JSON form).
 	if (opts.ensureMetadataUserId) {
-		const existingMeta =
-			p.metadata && typeof p.metadata === "object" && !Array.isArray(p.metadata)
-				? (p.metadata as Record<string, unknown>)
-				: null;
-		const existingUserId =
-			existingMeta && typeof existingMeta.user_id === "string" && existingMeta.user_id.trim()
-				? existingMeta.user_id
-				: null;
-		if (existingUserId === null) {
-			mutate((obj) => {
-				const meta =
-					obj.metadata && typeof obj.metadata === "object" && !Array.isArray(obj.metadata)
-						? { ...(obj.metadata as Record<string, unknown>) }
-						: {};
-				meta.user_id = JSON.stringify({
-					device_id: opts.deviceId,
-					account_uuid: "",
-					session_id: opts.sessionId,
-				});
-				obj.metadata = meta;
-			});
+		const probe = { ...p };
+		if (ensureClaudeMetadata(probe, opts.deviceId, opts.sessionId, opts.forceIdentity)) {
+			mutate((obj) => { obj.metadata = probe.metadata; });
 		}
 	}
 

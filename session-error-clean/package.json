@@ -7,8 +7,8 @@
 	"keywords": ["pi-package", "pi-extension", "session", "cleanup", "errors"],
 	"license": "MIT",
 	"scripts": {
-		"test": "node --experimental-strip-types --test test/*.test.mjs",
-		"check": "node --experimental-strip-types --check src/clean.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/index.ts"
+		"test": "node --test test/run.cjs",
+		"check": "node --experimental-strip-types --check src/clean.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/sanitize.ts && node --experimental-strip-types --check src/index.ts"
 	},
 	"pi": {
 		"extensions": ["./src/index.ts"]

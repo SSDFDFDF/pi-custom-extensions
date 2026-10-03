@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyClaudeCodeBodyPatch, type ClaudeCodeWrapOptions } from "./claude-cc-body-fix.ts";
+import { createClaudeCodeStreamSimpleWrapper, type WrapperOptions } from "./provider-wrap.ts";
+import { DEFAULT_PROFILES } from "./config.ts";
 
 const baseOpts: ClaudeCodeWrapOptions = {
 	deviceId: "dev-123",
@@ -133,4 +135,49 @@ test("preserves existing metadata.user_id", () => {
 			params.metadata.user_id,
 		);
 	}
+});
+
+test("wrapper snapshots identity per call, sees resets on the next call, and passes through when off", async () => {
+	const optionsFor = (sessionId: string): WrapperOptions => ({
+		...baseOpts,
+		sessionId,
+		deviceId: `device-${sessionId}`,
+		forceIdentity: true,
+		profile: DEFAULT_PROFILES["claude-code"],
+		templateContext: { version: baseOpts.version, sessionId, uuid: () => "random" },
+	});
+	let active: WrapperOptions | null = optionsFor("old-session");
+	const calls: any[] = [];
+	const delegate = ((_model: unknown, _context: unknown, options: unknown) => {
+		calls.push(options);
+		return options;
+	}) as any;
+	const wrapper = createClaudeCodeStreamSimpleWrapper(() => active, delegate);
+	const originalOptions = {
+		headers: { "user-agent": "pi", "Anthropic-Beta": "existing-beta" },
+		onPayload: async (payload: any) => ({ ...payload, preserved: true, metadata: { user_id: "stale" } }),
+	};
+	wrapper({}, {}, originalOptions);
+	active = optionsFor("new-session");
+	wrapper({}, {}, originalOptions);
+	assert.equal(calls[0].headers["X-Claude-Code-Session-Id"], "old-session");
+	assert.equal(calls[1].headers["X-Claude-Code-Session-Id"], "new-session");
+	assert.equal(calls[1].headers["user-agent"], null);
+	assert.equal(calls[1].headers["Anthropic-Beta"], null);
+	assert.ok(calls[1].headers["anthropic-beta"].startsWith("existing-beta,"));
+	for (const [index, sessionId] of ["old-session", "new-session"].entries()) {
+		const payload = await calls[index].onPayload({}, {});
+		assert.equal(payload.preserved, true);
+		assert.equal(JSON.parse(payload.metadata.user_id).session_id, sessionId);
+		assert.equal(JSON.parse(payload.metadata.user_id).device_id, `device-${sessionId}`);
+	}
+	// Compaction has no pre-existing onPayload and must still receive fresh IDs.
+	wrapper({}, {}, {});
+	const compact = await calls[2].onPayload({}, {});
+	assert.equal(JSON.parse(compact.metadata.user_id).session_id, "new-session");
+	assert.equal(compact.thinking.type, "adaptive");
+	active = null;
+	wrapper({}, {}, originalOptions);
+	assert.equal(calls[3], originalOptions);
+	assert.deepEqual(originalOptions.headers, { "user-agent": "pi", "Anthropic-Beta": "existing-beta" });
 });

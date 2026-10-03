@@ -29,6 +29,8 @@ src/
   fs-util.ts               # atomic write + exclusive lockfile
   ids.ts                   # shared UUID helpers
   *.test.ts                # unit tests (node:test)
+  headers.ts               # shared hook/wrapper header rewrite
+  provider-wrap.ts         # live per-request Claude wrapper options
   system-prompt.ts         # neutral / file prompt modes
   update.ts                # /mimic update via npm registry
 prompts/
@@ -48,33 +50,35 @@ Identity stores use **atomic write** and **exclusive lockfiles** (with merge-on-
 for the Codex identity map) so parallel pi/subagent processes are less likely to
 clobber mappings.
 
-Codex runtime state is a single `CodexIdentityState` object (session/thread/window/turn).
+Codex and Claude runtime states are stored in a single unified `CodexIdentityState`
+object per conversation (session/thread/window/turn/installation/deviceId/claudeSessionId).
 Mapping is persisted under:
 
 | path | purpose |
 |------|---------|
-| `~/.pi/agent/client-mimic.identity.json` | pi session id → Codex session/thread/window chain |
-| `~/.pi/agent/client-mimic.device_id` | Claude Code device_id (64 hex, machine-stable) |
-| `~/.pi/agent/client-mimic.claude-sessions.json` | pi session id → Claude session UUIDv4 when pi is not v4 |
-| `~/.codex/installation_id` (preferred) or `~/.pi/agent/client-mimic.installation_id` | machine-stable installation id |
+| `~/.pi/agent/client-mimic.sessions.json` | pi session id → unified conversation identities (Codex + Claude) |
 
-Identity store writes use temp file + `rename` (atomic on the same filesystem).
+Old files (`client-mimic.identity.json`, `client-mimic.device_id`,
+`client-mimic.claude-sessions.json`, `client-mimic.installation_id`) are no
+longer used, read, or migrated. Identity store writes use temp file + `rename`
+(atomic on the same filesystem).
 
 ### Dev commands
 
 ```bash
 cd ~/.pi/agent/extensions/client-mimic
-npm test    # node --test codex-identity tests
+npm test    # all unit and hook integration tests (Node with TS stripping support)
 npm run check
 ```
 
 ## Profiles
 
-Two built-in profiles (default `active` may be set in your live config):
+Three built-in profiles (default `active` may be set in your live config):
 
 | key           | client                          | notable behavior |
 |---------------|---------------------------------|------------------|
 | `codex`       | OpenAI Codex CLI (`codex_cli_rs`) | Full identity stack (below) + UA / originator / version / OpenAI-Beta |
+| `codex-lite`  | Codex Responses Lite            | Codex identities + Lite request-body conversion |
 | `claude-code` | Anthropic Claude Code           | CLI-shaped headers + Stainless set + body `metadata.user_id` + billing system blocks |
 
 ### Codex identity model (aligned with openai/codex)
@@ -99,6 +103,7 @@ Modeled on codex-rs `AgentControl` + `AutoCompactWindowIds` + Responses client h
 | fork / parentSession child | **inherit parent** | **new** (this pi session) | fresh chain for child |
 | resume / reload | restore from store | restore | **reuse** last chain (no new window) |
 | `session_compact` | unchanged | unchanged | advance: prev←cur, new cur, number++ |
+| `/mimic reset-ids` | fresh UUIDv7 | = new session_id; detach old parent | fresh chain `#0` |
 
 **Wire surface (codex and codex-lite profiles)**
 
@@ -141,8 +146,8 @@ thread/window chain.
 
 | id | shape | notes |
 |----|-------|-------|
-| `session_id` | **UUIDv4** | Header `X-Claude-Code-Session-Id` + `metadata.user_id.session_id`. If pi's session is already v4, reuse it; if pi uses UUIDv7, map to a stable v4 in `client-mimic.claude-sessions.json`. |
-| `device_id` | 64 hex | Persisted in `client-mimic.device_id` (sha256 seed once). |
+| `session_id` | **UUIDv4** | Header `X-Claude-Code-Session-Id` + `metadata.user_id.session_id`. Persisted in `client-mimic.sessions.json`. |
+| `device_id` | 64 hex | 64 lowercase hex, generated per conversation or reset via `/mimic reset-ids`. |
 | `account_uuid` | empty string by default | Real CLI fills from OAuth; we leave `""`. |
 | `parent_session_id` | optional | Real CLI sets on teammate/sidechain; not emitted yet. |
 
@@ -202,6 +207,8 @@ before profile headers apply; profile spelling wins on case collisions.
 /mimic                    show status + active profile
 /mimic on | off           master switch
 /mimic use <profile>      activate codex | codex-lite | claude-code | off
+/mimic ids               show current managed identities (including both client families)
+/mimic reset-ids         replace all managed identities for the current conversation
 /mimic list               list profiles
 /mimic show [profile]     print resolved headers + ids + body flags + prompt mode
 /mimic prompt                                show system-prompt config (all levels)
@@ -216,6 +223,47 @@ Launch flag (session-only, does not rewrite the config file):
 ```
 pi --mimic codex
 ```
+
+### 更换当前窗口的身份 / Reset current conversation IDs
+
+```text
+/reload                 # 修改插件代码后加载一次
+/mimic ids              # 查看当前身份
+/mimic reset-ids        # 一次更换，下一次请求生效
+```
+
+`reset-ids` replaces **client-mimic-managed outbound identities**, not every
+UUID string in the transcript. It works even while mimic is off; enable a
+profile afterward to send the new identities.
+
+- Codex: fresh `session_id` / `thread_id` (equal as a new root), `window_id` /
+  `first_window_id`, `turn_id`, and a **session-local** `installation_id`.
+- Old `parent_thread_id` / `previous_window_id` are cleared, not fabricated;
+  `window_number` restarts at `0`. Resetting a child detaches only that child.
+- Claude: fresh UUIDv4 `session_id` plus a new 64-hex `device_id` (not a UUID).
+- The new IDs are saved together in the current Pi session's identity-store
+  record and reused on reload/resume/restart while that record is retained
+  (the store retains the 200 most recently updated conversations).
+- Headers, `prompt_cache_key`, Codex body identity, and Claude `metadata.user_id`
+  use the reset values. For reset conversations, managed identity values take
+  precedence over existing body fields, identity `templateVars`, and hard-coded
+  managed identity headers. Explicit `null` header deletions still apply.
+- Claude provider wrappers resolve current settings per call, so compaction
+  sees the reset too. `/mimic off` makes registered wrappers pass through.
+
+**不会修改：** Pi 内部 session UUID、会话文件名、聊天历史、其他会话记录、
+全局 installation/device 文件、OAuth/API key 或真实 `account_uuid`。
+Pi's session manager is read-only to extensions; changing its internal UUID
+would require replacing the session rather than just changing client identity.
+The persistence scope is a **Pi conversation**, not an OS terminal/tab. Opening
+the same Pi conversation in another process can restore the same mapping.
+Arbitrary custom headers, historical response/tool IDs, and transport-level IDs
+are outside this command's scope.
+
+Run while idle with no queued messages. A busy session, lock timeout, or write
+failure leaves the current runtime identity unchanged and reports the problem.
+No restart or history clearing is needed after a successful reset. The changed
+cache key may cause a gateway prompt-cache miss on the next request.
 
 ## Auto-update from npm
 
@@ -273,8 +321,13 @@ when referenced as `extensions/client-mimic/prompts/...`).
   parity with official backends.
 - Not mimicked: Codex ChatGPT account headers, full Claude beta/thinking matrix,
   tool naming quirks, TLS/HTTP2 fingerprints.
-- Parallel pi/subagent processes share `client-mimic.identity.json` without a
-  cross-process lock; rare races can drop a mapping (see Future work).
+- Identity writes merge only the current session record under a lock, so an old
+  in-memory snapshot cannot roll back another conversation's reset. Lock timeouts
+  skip lifecycle writes; explicit resets fail without changing runtime state.
+- `wrapProviders` is for **Anthropic Messages** providers with a Claude-shaped
+  profile only, not Codex providers. Wrappers use the public
+  `@earendil-works/pi-ai/compat` entrypoint explicitly (also compatible with
+  Pi's extension-loader aliases).
 - `turn_id` is minted in `before_provider_headers`; body hook reuses the same
   in-memory state. If hook ordering ever changes, revisit request-scoped ids.
 
@@ -284,6 +337,10 @@ Ordered by likely value. **Do not implement until a gateway or bug forces it.**
 
 ### Done recently
 
+- `/mimic reset-ids` + `/mimic ids`; atomic session-local overrides for both clients
+- Fresh wrapper options per call; off/profile changes no longer leave stale Claude IDs
+- Ordinary `/new` creates a root instead of accidentally inheriting the previous session
+- Hook integration tests for reset, persistence, isolation, error paths and custom profiles
 - Cross-process lock + merge-on-write for Codex identity / Claude session map / device id
 - Claude body helpers extracted to `claude-body.ts`
 - Shared `ids.ts` + `fs-util.ts`
@@ -305,7 +362,7 @@ Ordered by likely value. **Do not implement until a gateway or bug forces it.**
 4. `/mimic tree` — print identity store parent/child chains for debugging.
 5. Optional headers for `first_window_id` / `previous_window_id` (body already has them).
 6. Richer `x-codex-turn-metadata` JSON blob (only if a gateway validates the full shape).
-7. Hooks-level integration tests (mock `before_provider_*` end-to-end).
+7. Live gateway smoke tests beyond mocked hooks/wrappers.
 
 ### Out of scope
 
@@ -378,7 +435,7 @@ A/B one field at a time. Common hard gates: non-empty Claude-shaped `system`,
 | path | role |
 |------|------|
 | `~/.pi/agent/client-mimic.config.json` | live config |
-| `~/.pi/agent/client-mimic.identity.json` | Codex session/thread/window map |
+| `~/.pi/agent/client-mimic.sessions.json` | unified conversation identity map (Codex + Claude) |
 | `extensions/client-mimic/config.example.json` | tracked template |
 | `src/index.ts` / `src/config.ts` / `src/codex-identity.ts` | hooks + identity |
 | `prompts/claude-code.md` / `prompts/codex.md` | seed system prompts |

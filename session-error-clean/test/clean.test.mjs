@@ -204,3 +204,76 @@ test("findSessionFiles prefers exact _<id>.jsonl matches over partials", () => {
 	assert.equal(partial.length, 2);
 	assert.deepEqual(findSessionFiles(dir, "nope"), []);
 });
+
+test("cleanSessionFile with cleanReasoning strips thinkingSignature, empty thinking blocks, textSignature, and fc_* suffixes", () => {
+	const dir = mkdtempSync(join(tmpdir(), "sec-reasoning-"));
+	const file = join(dir, "r.jsonl");
+	const assistantWithReasoning = {
+		type: "message",
+		id: "a1",
+		parentId: "u1",
+		timestamp: "2026-09-29T00:02:00.000Z",
+		message: {
+			role: "assistant",
+			responseId: "resp_old_123",
+			content: [
+				{
+					type: "thinking",
+					thinking: "",
+					thinkingSignature: JSON.stringify({ id: "rs_old_0", type: "reasoning", encrypted_content: "cipher0" }),
+				},
+				{
+					type: "thinking",
+					thinking: "human readable summary",
+					thinkingSignature: JSON.stringify({ id: "rs_old_1", type: "reasoning", encrypted_content: "cipher" }),
+				},
+				{
+					type: "text",
+					text: "hello",
+					textSignature: JSON.stringify({ v: 1, id: "msg_old_1", phase: "commentary" }),
+				},
+				{
+					type: "toolCall",
+					id: "call_abc|fc_old_1",
+					name: "bash",
+					arguments: { command: "ls" },
+				},
+			],
+			stopReason: "toolUse",
+			timestamp: 0,
+		},
+	};
+	const toolRes = {
+		type: "message",
+		id: "tr1",
+		parentId: "a1",
+		timestamp: "2026-09-29T00:03:00.000Z",
+		message: {
+			role: "toolResult",
+			toolCallId: "call_abc|fc_old_1",
+			toolName: "bash",
+			content: [{ type: "text", text: "ok" }],
+			timestamp: 0,
+		},
+	};
+	writeFileSync(
+		file,
+		[headerLine(), JSON.stringify(userEntry("u1", null, "hi")), JSON.stringify(assistantWithReasoning), JSON.stringify(toolRes), ""].join("\n"),
+	);
+
+	const result = cleanSessionFile(file, { cleanErrors: false, cleanReasoning: true }, { backup: true });
+	assert.equal(result.rewritten, true);
+	assert.equal(result.plan.reasoningCleaned, 2);
+	assert.equal(result.plan.signaturesRemoved, 4); // responseId + 2 thinkingSignatures + textSignature
+	assert.equal(result.plan.itemIdsRemoved, 2); // toolCall.id + toolResult.toolCallId
+
+	const parsed = parseSessionText(readFileSync(file, "utf8"));
+	const cleanedAsst = parsed[2].message;
+	assert.equal("responseId" in cleanedAsst, false);
+	assert.equal(cleanedAsst.content.length, 3); // empty thinking block removed
+	assert.equal(cleanedAsst.content[0].thinking, "human readable summary");
+	assert.equal("thinkingSignature" in cleanedAsst.content[0], false);
+	assert.equal("textSignature" in cleanedAsst.content[1], false);
+	assert.equal(cleanedAsst.content[2].id, "call_abc");
+	assert.equal(parsed[3].message.toolCallId, "call_abc");
+});
