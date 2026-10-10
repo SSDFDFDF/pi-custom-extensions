@@ -1,14 +1,14 @@
 {
 	"name": "prompt-cache-key",
-	"version": "0.1.0",
-	"description": "Pi extension: send prompt_cache_key (Pi session ID) on every OpenAI-compatible Chat Completions request, including custom models.json endpoints.",
+	"version": "0.2.0",
+	"description": "Pi extension: session-affinity headers (X-Session-ID) for every provider, plus an opt-in prompt_cache_key body field for OpenAI-compatible Chat Completions endpoints, with per-provider auto-disable when a gateway rejects a parameter.",
 	"type": "module",
 	"private": true,
-	"keywords": ["pi-package", "pi-extension", "prompt-cache", "openai"],
+	"keywords": ["pi-package", "pi-extension", "prompt-cache", "openai", "session-affinity"],
 	"license": "MIT",
 	"scripts": {
-		"test": "node --experimental-strip-types --test test/*.test.mjs",
-		"check": "node --experimental-strip-types --check index.ts"
+		"test": "node test/run.mjs",
+		"check": "node test/run.mjs --check"
 	},
 	"pi": {
 		"extensions": ["./index.ts"]

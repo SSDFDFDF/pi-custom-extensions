@@ -13,7 +13,7 @@ npm/git package extensions declared in `settings.json` are not tracked here.
 | `session-error-clean/` | dir | Removes persisted error entries and encrypted reasoning signatures (`thinkingSignature`, `\|fc_*`, `msg_*`) from session files with `ctx.switchSession()` live reload, plus outbound Responses `before_provider_request` reasoning compatibility guard (`/clean-errors`). |
 | `hybrid-goal/` | dir | Goal-mode state machine (pi-goal lineage) + independent judge + `/goal-evol` self-evolution. |
 | `pi-channels/` | dir | Multi-channel companion (Telegram first): queue, progress drafts, media, attach, connect lock. Replaces `@llblab/pi-telegram`. |
-| `prompt-cache-key/` | dir | Sends `prompt_cache_key` (pi session ID) on every OpenAI-compatible Chat Completions request, including custom `models.json` endpoints where pi-ai omits it. |
+| `prompt-cache-key/` | dir | Session-affinity `X-Session-ID` header on every provider request (default on), plus an opt-in `prompt_cache_key` body field for OpenAI-compatible Chat Completions endpoints, with per-provider auto-disable when a gateway rejects a parameter. |
 
 ## Layout
 
@@ -23,6 +23,10 @@ npm/git package extensions declared in `settings.json` are not tracked here.
 │   ├── index.ts
 │   ├── prompts/
 │   └── src/
+├── prompt-cache-key/
+│   ├── index.ts              # pi hooks + /prompt-cache
+│   ├── config.ts             # config load/save, presets, provider filters
+│   └── test/                 # node:test + esbuild runner (no --strip-types needed)
 ├── kun-retry/
 │   ├── index.ts
 │   ├── src/
