@@ -13,6 +13,7 @@ npm/git package extensions declared in `settings.json` are not tracked here.
 | `session-error-clean/` | dir | Removes persisted error entries and encrypted reasoning signatures (`thinkingSignature`, `\|fc_*`, `msg_*`) from session files with `ctx.switchSession()` live reload, plus outbound Responses `before_provider_request` reasoning compatibility guard (`/clean-errors`). |
 | `hybrid-goal/` | dir | Goal-mode state machine (pi-goal lineage) + independent judge + `/goal-evol` self-evolution. |
 | `pi-channels/` | dir | Multi-channel companion (Telegram first): queue, progress drafts, media, attach, connect lock. Replaces `@llblab/pi-telegram`. |
+| `prompt-cache-key/` | dir | Sends `prompt_cache_key` (pi session ID) on every OpenAI-compatible Chat Completions request, including custom `models.json` endpoints where pi-ai omits it. |
 
 ## Layout
 

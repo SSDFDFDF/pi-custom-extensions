@@ -1,0 +1,16 @@
+{
+	"name": "prompt-cache-key",
+	"version": "0.1.0",
+	"description": "Pi extension: send prompt_cache_key (Pi session ID) on every OpenAI-compatible Chat Completions request, including custom models.json endpoints.",
+	"type": "module",
+	"private": true,
+	"keywords": ["pi-package", "pi-extension", "prompt-cache", "openai"],
+	"license": "MIT",
+	"scripts": {
+		"test": "node --experimental-strip-types --test test/*.test.mjs",
+		"check": "node --experimental-strip-types --check index.ts"
+	},
+	"pi": {
+		"extensions": ["./index.ts"]
+	}
+}
