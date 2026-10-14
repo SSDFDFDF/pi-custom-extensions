@@ -10,7 +10,7 @@
  *   /loop at 15:30 部署               -> one shot at 15:30 (tomorrow if already passed)
  *   /loop at 2026-09-21 09:30 备份     -> one shot at an explicit date + time
  *   /loop now 汇报                    -> one shot right away
- *   /loop stop | status | help
+ *   /loop stop | pause | resume | status | help
  */
 
 /** Minimum interval, guards against hammering the model. */
@@ -37,6 +37,8 @@ export interface LoopSpec {
 export type LoopAction =
 	| { kind: "start"; spec: LoopSpec; note?: string }
 	| { kind: "stop" }
+	| { kind: "pause" }
+	| { kind: "resume" }
 	| { kind: "status" }
 	| { kind: "help" }
 	| { kind: "error"; message: string };
@@ -56,6 +58,8 @@ const DATE_TOKEN = /^(\d{4})-(\d{1,2})-(\d{1,2})$/;
 const DATE_TIME_TOKEN = /^(\d{4}-\d{1,2}-\d{1,2})[T ](\d{1,2}:\d{2}(?::\d{2})?)$/;
 
 const STOP_WORDS = new Set(["stop", "off", "cancel", "end", "kill", "停止", "取消", "关闭"]);
+const PAUSE_WORDS = new Set(["pause", "hold", "suspend", "freeze", "暂停", "挂起"]);
+const RESUME_WORDS = new Set(["resume", "unpause", "continue", "恢复", "继续"]);
 const STATUS_WORDS = new Set(["status", "state", "info", "ls", "list", "状态", "查看"]);
 const HELP_WORDS = new Set(["help", "-h", "--help", "?", "帮助"]);
 const NOW_WORDS = new Set(["now", "immediate", "立即", "马上"]);
@@ -167,6 +171,14 @@ export function parseCommand(raw: string, now: number = Date.now()): LoopAction 
 
 	const head = tokens[0].toLowerCase();
 	if (STOP_WORDS.has(head)) return { kind: "stop" };
+	if (PAUSE_WORDS.has(head)) {
+		return tokens.length === 1
+			? { kind: "pause" }
+			: { kind: "error", message: "pause 不接受参数;恢复请用 /loop resume" };
+	}
+	if (RESUME_WORDS.has(head)) {
+		return tokens.length === 1 ? { kind: "resume" } : { kind: "error", message: "resume 不接受参数" };
+	}
 	if (STATUS_WORDS.has(head)) return { kind: "status" };
 	if (HELP_WORDS.has(head)) return { kind: "help" };
 

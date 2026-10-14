@@ -92,7 +92,7 @@ test("ticks on schedule, reports, and stops at the count limit", async (t) => {
 	await harness.command().handler("10s x2 汇报进度", harness.ctx);
 
 	assert.equal(harness.messages.length, 0, "no tick before the first interval");
-	assert.match(lastStatus(harness), /loop 10s → #1\/2/);
+	assert.match(lastStatus(harness), /⏱ 10s → #1\/2/);
 
 	mock.timers.tick(10_000);
 	assert.equal(harness.messages.length, 1);
@@ -138,7 +138,7 @@ test("`in <duration>` waits, fires once, then stops", async (t) => {
 	await harness.command().handler("in 10s 检查部署", harness.ctx);
 
 	assert.equal(harness.messages.length, 0, "nothing before the delay elapses");
-	assert.match(lastStatus(harness), /loop 单次/);
+	assert.match(lastStatus(harness), /⏱ 单次/);
 
 	mock.timers.tick(9_999);
 	assert.equal(harness.messages.length, 0, "not yet");
@@ -259,6 +259,188 @@ test("stop cancels the loop, and stopping twice warns", async (t) => {
 
 	await harness.command().handler("stop", harness.ctx);
 	assert.equal(harness.notices.at(-1).level, "warning");
+});
+
+test("pause freezes the countdown and resume continues from there", async (t) => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	t.after(() => mock.timers.reset());
+
+	const harness = createHarness();
+	await harness.handlers.session_start({ reason: "startup" }, harness.ctx);
+	await harness.command().handler("10s x2 汇报进度", harness.ctx);
+
+	mock.timers.tick(4_000);
+	await harness.command().handler("pause", harness.ctx);
+	assert.match(harness.notices.at(-1).text, /已暂停\(剩 6s\)/);
+	assert.match(lastStatus(harness), /⏸ 10s → #1\/2 · 剩 6s/);
+	assert.equal(harness.entries.at(-1).data.paused, true);
+	assert.equal(harness.entries.at(-1).data.remainingMs, 6_000);
+
+	// Wall-clock time keeps flowing while paused: no tick, frozen status text.
+	mock.timers.tick(120_000);
+	assert.equal(harness.messages.length, 0);
+	assert.match(lastStatus(harness), /⏸ 10s → #1\/2 · 剩 6s/);
+
+	// Status spelled out while paused.
+	await harness.command().handler("status", harness.ctx);
+	assert.match(harness.notices.at(-1).text, /定时任务已暂停/);
+	assert.match(harness.notices.at(-1).text, /剩 6s ·/);
+
+	await harness.command().handler("resume", harness.ctx);
+	assert.match(harness.notices.at(-1).text, /已恢复\(剩 6s 后触发\)/);
+	mock.timers.tick(5_999);
+	assert.equal(harness.messages.length, 0, "resumed with the frozen remainder");
+	mock.timers.tick(1);
+	assert.equal(harness.messages.length, 1);
+	assert.equal(harness.messages[0].message.details.tick, 1);
+
+	// Normal loop semantics (interval, limit) apply again after resume.
+	mock.timers.tick(10_000);
+	assert.equal(harness.messages.length, 2);
+	assert.equal(harness.messages[1].message.details.tick, 2);
+	mock.timers.tick(60_000);
+	assert.equal(harness.messages.length, 2);
+	assert.equal(harness.entries.at(-1).data.active, false);
+});
+
+test("a new /loop replaces a paused task and starts running", async (t) => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	t.after(() => mock.timers.reset());
+
+	const harness = createHarness();
+	await harness.handlers.session_start({ reason: "startup" }, harness.ctx);
+	await harness.command().handler("10s 旧任务", harness.ctx);
+	mock.timers.tick(4_000);
+	await harness.command().handler("pause", harness.ctx);
+
+	// Replacing a paused task must not inherit the pause.
+	await harness.command().handler("10s 新任务", harness.ctx);
+	assert.match(harness.notices.at(-1).text, /替换旧任务,定时任务已启动/);
+	assert.equal(harness.entries.at(-1).data.paused, false);
+	assert.match(lastStatus(harness), /^⏱ 10s → #1 in 10s$/);
+
+	// The frozen remainder of the old task is gone: the new timer fires at its own pace.
+	mock.timers.tick(9_999);
+	assert.equal(harness.messages.length, 0);
+	mock.timers.tick(1);
+	assert.equal(harness.messages.length, 1);
+	assert.match(harness.messages[0].message.content, /新任务/);
+});
+
+test("pausing a scheduled task freezes its target time", async (t) => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	t.after(() => mock.timers.reset());
+
+	const harness = createHarness();
+	await harness.handlers.session_start({ reason: "startup" }, harness.ctx);
+	const target = clockTime(Date.now() + 30_000);
+	await harness.command().handler(`at ${target} 提醒上线`, harness.ctx);
+	assert.match(lastStatus(harness), /⏱ 单次 → \d{2}:\d{2}:\d{2} in 30s/);
+
+	mock.timers.tick(10_000);
+	await harness.command().handler("pause", harness.ctx);
+	assert.match(lastStatus(harness), /⏸ 单次 → \d{2}:\d{2}:\d{2} · 剩 20s/);
+
+	// The wall clock passes the planned time; the frozen line must not drift or fire.
+	mock.timers.tick(600_000);
+	assert.equal(harness.messages.length, 0);
+	assert.match(lastStatus(harness), /⏸ 单次 → \d{2}:\d{2}:\d{2} · 剩 20s/);
+
+	// Resuming re-anchors the plan to now + the frozen remainder.
+	await harness.command().handler("resume", harness.ctx);
+	mock.timers.tick(19_999);
+	assert.equal(harness.messages.length, 0);
+	mock.timers.tick(1);
+	assert.equal(harness.messages.length, 1);
+	assert.match(harness.messages[0].message.content, /提醒上线/);
+});
+
+test("pause / resume report when there is nothing to toggle", async (t) => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	t.after(() => mock.timers.reset());
+
+	const harness = createHarness();
+	await harness.handlers.session_start({ reason: "startup" }, harness.ctx);
+
+	await harness.command().handler("pause", harness.ctx);
+	assert.equal(harness.notices.at(-1).level, "warning");
+	assert.match(harness.notices.at(-1).text, /当前没有运行中的任务/);
+	await harness.command().handler("resume", harness.ctx);
+	assert.equal(harness.notices.at(-1).level, "warning");
+	assert.match(harness.notices.at(-1).text, /没有已暂停的任务/);
+
+	await harness.command().handler("6h 汇报", harness.ctx);
+	await harness.command().handler("resume", harness.ctx);
+	assert.equal(harness.notices.at(-1).level, "warning");
+	assert.match(harness.notices.at(-1).text, /没有已暂停的任务/);
+
+	await harness.command().handler("pause", harness.ctx);
+	await harness.command().handler("pause", harness.ctx);
+	assert.equal(harness.notices.at(-1).level, "warning");
+	assert.match(harness.notices.at(-1).text, /已处于暂停状态/);
+
+	await harness.command().handler("resume", harness.ctx);
+	assert.match(harness.notices.at(-1).text, /已恢复/);
+	await harness.command().handler("stop", harness.ctx);
+});
+
+test("a paused loop stays paused across /reload and resumes on demand", async (t) => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	t.after(() => mock.timers.reset());
+
+	const harness = createHarness();
+	await harness.handlers.session_start({ reason: "startup" }, harness.ctx);
+	await harness.command().handler("in 10s 检查部署", harness.ctx);
+	mock.timers.tick(4_000);
+	await harness.command().handler("pause", harness.ctx);
+	await harness.handlers.session_shutdown({ reason: "reload" }, harness.ctx);
+
+	const reloaded = createHarness();
+	reloaded.entries.push(...harness.entries);
+	await reloaded.handlers.session_start({ reason: "reload" }, reloaded.ctx);
+	assert.match(reloaded.notices.at(-1).text, /已暂停/);
+	assert.match(lastStatus(reloaded), /⏸ 单次 → .+ · 剩 6s/);
+
+	// A long pause neither expires nor fires the task.
+	mock.timers.tick(86_400_000);
+	assert.equal(reloaded.messages.length, 0);
+	assert.equal(reloaded.notices.filter((notice) => /过期/.test(notice.text)).length, 0);
+
+	await reloaded.command().handler("resume", reloaded.ctx);
+	mock.timers.tick(5_999);
+	assert.equal(reloaded.messages.length, 0);
+	mock.timers.tick(1);
+	assert.equal(reloaded.messages.length, 1);
+	assert.equal(reloaded.messages[0].message.details.tick, 1);
+	assert.equal(reloaded.messages[0].message.details.skipped, 0);
+});
+
+test("a paused repeating loop restores without a planned start time", async (t) => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	t.after(() => mock.timers.reset());
+
+	const harness = createHarness();
+	await harness.handlers.session_start({ reason: "startup" }, harness.ctx);
+	await harness.command().handler("10s x3 巡检", harness.ctx);
+	mock.timers.tick(4_000);
+	await harness.command().handler("pause", harness.ctx);
+	await harness.handlers.session_shutdown({ reason: "reload" }, harness.ctx);
+
+	const reloaded = createHarness();
+	reloaded.entries.push(...harness.entries);
+	await reloaded.handlers.session_start({ reason: "reload" }, reloaded.ctx);
+	assert.match(lastStatus(reloaded), /⏸ 10s → #1\/3 · 剩 6s/);
+
+	mock.timers.tick(3_600_000);
+	assert.equal(reloaded.messages.length, 0);
+
+	await reloaded.command().handler("resume", reloaded.ctx);
+	mock.timers.tick(6_000);
+	assert.equal(reloaded.messages.length, 1);
+	assert.equal(reloaded.messages[0].message.details.tick, 1);
+	mock.timers.tick(10_000);
+	assert.equal(reloaded.messages.length, 2);
+	assert.equal(reloaded.messages[1].message.details.tick, 2);
 });
 
 test("restores an active loop on /reload but not on plain startup", async (t) => {

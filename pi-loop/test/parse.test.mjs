@@ -80,14 +80,35 @@ test("parseCommand does not eat flag-like words inside the instruction", () => {
 	const action = parseCommand("1m 看看 now x5");
 	assert.equal(action.kind === "start" && action.spec.message, "看看 now x5");
 	assert.equal(action.kind === "start" && action.spec.immediate, false);
+
+	// pause/resume only act as commands in the leading position.
+	const paused = parseCommand("1m 暂停一下服务");
+	assert.equal(paused.kind === "start" && paused.spec.message, "暂停一下服务");
+	const resumed = parseCommand("5m resume 部署");
+	assert.equal(resumed.kind === "start" && resumed.spec.message, "resume 部署");
 });
 
 test("parseCommand recognises subcommands", () => {
 	assert.equal(parseCommand("stop").kind, "stop");
 	assert.equal(parseCommand("停止").kind, "stop");
+	assert.equal(parseCommand("pause").kind, "pause");
+	assert.equal(parseCommand("suspend").kind, "pause");
+	assert.equal(parseCommand("暂停").kind, "pause");
+	assert.equal(parseCommand("挂起").kind, "pause");
+	assert.equal(parseCommand("resume").kind, "resume");
+	assert.equal(parseCommand("continue").kind, "resume");
+	assert.equal(parseCommand("恢复").kind, "resume");
+	assert.equal(parseCommand("继续").kind, "resume");
 	assert.equal(parseCommand("status").kind, "status");
 	assert.equal(parseCommand("").kind, "status");
 	assert.equal(parseCommand("help").kind, "help");
+});
+
+test("pause / resume reject extra arguments", () => {
+	const pause = parseCommand("pause 10m");
+	assert.equal(pause.kind, "error");
+	assert.match(pause.kind === "error" ? pause.message : "", /\/loop resume/);
+	assert.equal(parseCommand("resume now").kind, "error");
 });
 
 test("parseCommand rejects bad intervals", () => {

@@ -6,6 +6,7 @@
  * /loop in 10m 检查部署          10 分钟后执行一次
  * /loop at 15:30 every 5m x3 巡检 15:30 开始,每 5 分钟一次,共 3 次
  * /loop stop                     停止
+ * /loop pause / resume           暂停 / 恢复(倒计时冻结,从中断处继续)
  * /loop status                   查看当前任务
  * /loop help                     用法
  *
@@ -47,6 +48,8 @@ interface RunningLoop extends LoopSpec {
 	skipped: number;
 	startedAt: number;
 	nextAt: number;
+	/** Frozen time-to-next-tick while paused; `undefined` means running. */
+	pausedRemainingMs?: number;
 	timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -57,6 +60,8 @@ interface PersistedState {
 	limit?: number;
 	ticks?: number;
 	startAt?: number;
+	paused?: boolean;
+	remainingMs?: number;
 }
 
 interface TickDetails {
@@ -74,6 +79,7 @@ const HELP_TEXT = [
 	"/loop at <时间> [every <间隔>] [xN] [指令]  指定时间执行(已过则顺延明天),如 /loop at 15:30 部署",
 	"/loop now [指令]                          立即执行一次",
 	"/loop stop / status                       停止 / 查看当前任务",
+	"/loop pause / resume                      暂停 / 恢复(倒计时冻结)",
 	`时长:500ms / 30s / 3m / 2h / 1d / 1h30m / 裸数字按秒算,最小 ${formatDuration(MIN_INTERVAL_MS)}`,
 	"时间:HH:MM[:SS] 或 YYYY-MM-DD HH:MM;xN 限定总次数(x1 即单次)",
 	"agent 忙碌时顺延重试,下次汇报会带上跳过次数;单次任务每 30s 重试直到空闲",
@@ -94,16 +100,20 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const now = Date.now();
-		const remaining = Math.max(0, loop.nextAt - now);
-		const countdown = formatDuration(Math.ceil(remaining / 1000) * 1000);
-		const head = loop.intervalMs ? `⏱ loop ${formatDuration(loop.intervalMs)}` : "⏱ loop 单次";
+		const paused = loop.pausedRemainingMs !== undefined;
+		// A paused loop is frozen: show the stored remainder instead of a live countdown.
+		const remaining = paused ? Math.max(0, loop.pausedRemainingMs ?? 0) : Math.max(0, loop.nextAt - now);
+		const countdown = formatDuration(Math.ceil(remaining / 1000) * 1_000);
+		const head = `${paused ? "⏸" : "⏱"}${loop.intervalMs ? ` ${formatDuration(loop.intervalMs)}` : " 单次"}`;
+		const tail = paused ? `· 剩 ${countdown}` : `in ${countdown}`;
 		// Waiting for a scheduled start: show the target time rather than a tick number.
-		if (loop.startAt !== undefined && loop.ticks === 0 && loop.startAt > now) {
-			view.setStatus(STATUS_KEY, `${head} → ${formatDateTime(loop.startAt, now)} in ${countdown}`);
+		if (loop.startAt !== undefined && loop.ticks === 0 && remaining > 0) {
+			// While paused even the target clock is frozen, so a long pause shows no stale date.
+			view.setStatus(STATUS_KEY, `${head} → ${formatDateTime(loop.startAt, paused ? frozenNow(loop) : now)} ${tail}`);
 			return;
 		}
 		const next = `#${loop.ticks + 1}${loop.limit ? `/${loop.limit}` : ""}`;
-		view.setStatus(STATUS_KEY, `${head} → ${next} in ${countdown}`);
+		view.setStatus(STATUS_KEY, `${head} → ${next} ${tail}`);
 	}
 
 	function clearTimers(): void {
@@ -124,6 +134,8 @@ export default function (pi: ExtensionAPI) {
 					limit: loop.limit,
 					ticks: loop.ticks,
 					startAt: loop.startAt,
+					paused: loop.pausedRemainingMs !== undefined,
+					remainingMs: loop.pausedRemainingMs,
 				}
 			: { active: false };
 		pi.appendEntry(STATE_ENTRY, state);
@@ -132,9 +144,11 @@ export default function (pi: ExtensionAPI) {
 	/** Arm the timer for `loop.nextAt`, re-arming in chunks for very long delays. */
 	function armTimer(): void {
 		if (!loop) return;
+		if (loop.pausedRemainingMs !== undefined) return;
 		const chunk = Math.min(Math.max(0, loop.nextAt - Date.now()), TIMER_CHUNK_MS);
 		loop.timer = setTimeout(() => {
 			if (!loop) return;
+			if (loop.pausedRemainingMs !== undefined) return;
 			if (loop.nextAt - Date.now() > WAKE_SLACK_MS) {
 				armTimer();
 				return;
@@ -154,6 +168,13 @@ export default function (pi: ExtensionAPI) {
 		if (!loop) return;
 		loop.nextAt = Date.now() + delayMs;
 		armTimer();
+	}
+
+	/** Clock view of a paused loop, so descriptions read as the frozen remainder. */
+	function frozenNow(state: RunningLoop): number {
+		return state.startAt !== undefined && state.pausedRemainingMs !== undefined
+			? state.startAt - state.pausedRemainingMs
+			: Date.now();
 	}
 
 	/** Delay before the first tick: scheduled start, `now`, or the plain interval. */
@@ -221,16 +242,46 @@ export default function (pi: ExtensionAPI) {
 		schedule(loop.intervalMs ?? ONE_SHOT_BUSY_RETRY_MS);
 	}
 
-	function start(spec: LoopSpec, resumeTicks = 0, restored = false): void {
+	function start(spec: LoopSpec, resumeTicks = 0, restored = false, pausedRemainingMs?: number): void {
 		const replaced = Boolean(loop);
 		clearTimers();
-		loop = { ...spec, ticks: resumeTicks, skipped: 0, startedAt: Date.now(), nextAt: 0 };
+		loop = { ...spec, ticks: resumeTicks, skipped: 0, startedAt: Date.now(), nextAt: 0, pausedRemainingMs };
 		persist();
-		ui()?.notify(
-			`${replaced ? "替换旧任务," : ""}定时任务已启动:${describeSpec(loop, resumeTicks)}`,
-			"info",
-		);
+		const prefix = replaced ? "替换旧任务," : "";
+		if (pausedRemainingMs !== undefined) {
+			renderStatus();
+			ui()?.notify(
+				`${prefix}定时任务已暂停(剩 ${formatDuration(pausedRemainingMs)}),/loop resume 继续:${describeSpec(loop, resumeTicks, frozenNow(loop))}`,
+				"info",
+			);
+			return;
+		}
+		ui()?.notify(`${prefix}定时任务已启动:${describeSpec(loop, resumeTicks)}`, "info");
 		schedule(firstDelay(loop, Date.now(), restored));
+	}
+
+	/** Freeze the countdown; the remaining time survives `/reload` via the persisted state. */
+	function pause(): boolean {
+		if (!loop || loop.pausedRemainingMs !== undefined) return false;
+		loop.pausedRemainingMs = Math.max(0, loop.nextAt - Date.now());
+		clearTimers();
+		persist();
+		renderStatus();
+		ui()?.notify(`定时任务已暂停(剩 ${formatDuration(loop.pausedRemainingMs)}),/loop resume 继续`, "info");
+		return true;
+	}
+
+	/** Resume a paused loop from the frozen remainder. */
+	function resume(): boolean {
+		if (!loop || loop.pausedRemainingMs === undefined) return false;
+		const remaining = loop.pausedRemainingMs;
+		loop.pausedRemainingMs = undefined;
+		// Keep `startAt` truthful: the first tick now lands after the frozen remainder.
+		if (loop.startAt !== undefined) loop.startAt = Date.now() + remaining;
+		schedule(remaining);
+		persist();
+		ui()?.notify(`定时任务已恢复(剩 ${formatDuration(remaining)} 后触发)`, "info");
+		return true;
 	}
 
 	function stop(note?: string): boolean {
@@ -255,8 +306,10 @@ export default function (pi: ExtensionAPI) {
 			const oneShot = state.limit === 1;
 			const repeatable = state.intervalMs !== undefined && state.intervalMs >= MIN_INTERVAL_MS;
 			const startAt = state.startAt;
+			// A paused task keeps its frozen countdown, so its start time cannot expire.
+			const pausedState = state.paused === true && state.remainingMs !== undefined;
 			// A one-shot whose start time passed while pi was closed cannot run retroactively.
-			if (oneShot && startAt !== undefined && startAt < now - AT_GRACE_MS) {
+			if (!pausedState && oneShot && startAt !== undefined && startAt < now - AT_GRACE_MS) {
 				ui()?.notify(
 					`有一条定时任务(原定 ${formatDateTime(startAt, now)})在会话关闭期间过期,已跳过`,
 					"warning",
@@ -265,6 +318,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (repeatable || startAt !== undefined) {
 				loop = undefined;
+				// A paused loop restores frozen, exactly where the user left it.
 				start(
 					{
 						intervalMs: state.intervalMs,
@@ -275,6 +329,7 @@ export default function (pi: ExtensionAPI) {
 					},
 					state.ticks ?? 0,
 					true,
+					pausedState ? Math.max(0, state.remainingMs ?? 0) : undefined,
 				);
 			}
 			return;
@@ -283,7 +338,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("loop", {
 		description:
-			"定时循环/定时任务:/loop 3m | /loop in 10m | /loop at 15:30 [every <间隔>] [xN] [now] | stop | status",
+			"定时循环/定时任务:/loop 3m | /loop in 10m | /loop at 15:30 [every <间隔>] [xN] [now] | stop | pause | resume | status",
 		getArgumentCompletions: (prefix) => {
 			const items = [
 				{ value: "in", label: "in", description: "多久后执行,如 in 10m / in 2h" },
@@ -297,6 +352,8 @@ export default function (pi: ExtensionAPI) {
 				{ value: "now", label: "now", description: "立即触发第一次" },
 				{ value: "x5", label: "x5", description: "共执行 5 次" },
 				{ value: "stop", label: "stop", description: "停止当前循环" },
+				{ value: "pause", label: "pause", description: "暂停当前循环(倒计时冻结)" },
+				{ value: "resume", label: "resume", description: "恢复暂停的循环" },
 				{ value: "status", label: "status", description: "查看当前循环" },
 				{ value: "help", label: "help", description: "用法说明" },
 			];
@@ -315,10 +372,19 @@ export default function (pi: ExtensionAPI) {
 				case "stop":
 					if (!stop("定时任务已停止")) ctx.ui.notify("当前没有运行中的任务", "warning");
 					return;
+				case "pause":
+					if (loop?.pausedRemainingMs !== undefined) ctx.ui.notify("定时任务已处于暂停状态", "warning");
+					else if (!pause()) ctx.ui.notify("当前没有运行中的任务", "warning");
+					return;
+				case "resume":
+					if (!resume()) ctx.ui.notify("没有已暂停的任务", "warning");
+					return;
 				case "status":
 					ctx.ui.notify(
 						loop
-							? `定时任务运行中:${describeSpec(loop, loop.ticks)} · 下次约 ${formatDuration(Math.max(0, loop.nextAt - Date.now()))} 后`
+							? loop.pausedRemainingMs !== undefined
+								? `定时任务已暂停:剩 ${formatDuration(loop.pausedRemainingMs)} · ${describeSpec(loop, loop.ticks, frozenNow(loop))}`
+								: `定时任务运行中:${describeSpec(loop, loop.ticks)} · 下次约 ${formatDuration(Math.max(0, loop.nextAt - Date.now()))} 后`
 							: `当前没有运行中的任务\n${HELP_TEXT}`,
 						"info",
 					);

@@ -1,7 +1,7 @@
 {
   "name": "pi-loop",
-  "version": "0.2.0",
-  "description": "Pi extension: /loop <interval> | in <delay> | at <time> [every <interval>] [xN] [now] <instruction> — periodic or scheduled self-triggered reports.",
+  "version": "0.3.0",
+  "description": "Pi extension: /loop <interval> | in <delay> | at <time> [every <interval>] [xN] [now] <instruction> — periodic or scheduled self-triggered reports, with pause/resume.",
   "type": "module",
   "private": true,
   "keywords": ["pi-package", "pi-extension", "loop", "scheduler", "cron", "reminder"],
