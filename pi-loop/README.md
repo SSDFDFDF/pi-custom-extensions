@@ -71,7 +71,7 @@
 
 ```
 pi-loop/
-├── index.ts            目录发现入口(package.json 的 pi.extensions 优先)
+├── package.json      pi.extensions 指向 src/index.ts(唯一入口)
 ├── src/index.ts        扩展主体:命令、定时器、状态栏、持久化
 ├── src/parse.ts        间隔 / 时间 / 参数解析
 └── test/*.test.mjs     单元测试(含 mock timers 驱动的触发逻辑)

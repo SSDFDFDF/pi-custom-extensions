@@ -19,6 +19,9 @@ service's client checks.
 
 ## Architecture
 
+Entry: `package.json` → `pi.extensions: ["./src/index.ts"]` (the only entry;
+no root `index.ts` shim).
+
 ```
 src/
   index.ts                 # pi hooks + /mimic commands only
@@ -44,7 +47,7 @@ prompts/
 | `claude-identity.ts` / `claude-body.ts` | Claude session/device + body helpers |
 | `fs-util.ts` | Atomic write + cross-process lock (`.lock` via `O_EXCL`) |
 | `config.ts` | Profile schema, defaults, placeholder resolution |
-| `index.ts` | Wire `pi.on(...)` and commands only |
+| `index.ts` (`src/`) | Wire `pi.on(...)` and commands only |
 
 Identity stores use **atomic write** and **exclusive lockfiles** (with merge-on-write
 for the Codex identity map) so parallel pi/subagent processes are less likely to

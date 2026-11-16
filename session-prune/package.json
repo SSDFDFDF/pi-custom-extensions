@@ -1,0 +1,22 @@
+{
+	"name": "session-prune",
+	"version": "0.1.0",
+	"description": "Pi extension (opt-in): trim the current session context down to the messages that still matter \u2014 the agent tool `session_prune` plus the `/prune` command, built on append-only context edits (no compaction, no history loss). Not auto-discovered: load it with `pi -e .../session-prune/extension.ts`.",
+	"type": "module",
+	"private": true,
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"session",
+		"context",
+		"prune",
+		"trim",
+		"context-edit"
+	],
+	"license": "MIT",
+	"scripts": {
+		"test": "node test/run.mjs",
+		"check": "node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/dsl.ts && node --experimental-strip-types --check src/format.ts && node --experimental-strip-types --check src/ops.ts && node --experimental-strip-types --check src/plan.ts && node --experimental-strip-types --check src/preview.ts && node --experimental-strip-types --check src/rows.ts && node --experimental-strip-types --check extension.ts",
+		"typecheck": "tsc -p tsconfig.json"
+	}
+}

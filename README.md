@@ -3,6 +3,8 @@
 Personal custom extensions for the [pi coding agent](https://pi.dev), living in
 `~/.pi/agent/extensions/`. This repo is a backup of hand-written extensions only;
 npm/git package extensions declared in `settings.json` are not tracked here.
+Extensions here are auto-loaded by directory discovery unless they opt out;
+`session-prune/` opts out (see its README) and is loaded explicitly.
 
 ## Extensions
 
@@ -14,25 +16,39 @@ npm/git package extensions declared in `settings.json` are not tracked here.
 | `hybrid-goal/` | dir | Goal-mode state machine (pi-goal lineage) + independent judge + `/goal-evol` self-evolution. |
 | `pi-channels/` | dir | Multi-channel companion (Telegram first): queue, progress drafts, media, attach, connect lock. Replaces `@llblab/pi-telegram`. |
 | `prompt-cache-key/` | dir | Session-affinity `X-Session-ID` header on every provider request (default on), plus an opt-in `prompt_cache_key` body field for OpenAI-compatible Chat Completions endpoints, with per-provider auto-disable when a gateway rejects a parameter. |
+| `session-prune/` | dir (**opt-in**) | Trim the current session context to the messages that still matter: the `session_prune` agent tool + `/prune` command on top of append-only `ContextEditEntry`s (targeted pruning instead of compaction, with undo and tool-call/result safety). **Not auto-discovered** — no `index.ts` and no `pi.extensions` manifest; load it per session with `pi -e ~/.pi/agent/extensions/session-prune/extension.ts`. |
 
 ## Layout
+
+Package structure (形态 A, consistent across multi-file extensions):
+`package.json` with `pi.extensions: ["./src/index.ts"]` is the single entry —
+no root `index.ts` shim (the manifest wins over `index.ts` during discovery,
+so a shim is dead code). `session-prune` and `pi-channels` keep their own
+special layouts on purpose.
 
 ```
 ~/.pi/agent/extensions/
 ├── client-mimic/
-│   ├── index.ts
+│   ├── package.json
 │   ├── prompts/
 │   └── src/
 ├── prompt-cache-key/
 │   ├── index.ts              # pi hooks + /prompt-cache
 │   ├── config.ts             # config load/save, presets, provider filters
 │   └── test/                 # node:test + esbuild runner (no --strip-types needed)
+├── session-prune/
+│   ├── extension.ts          # pi hooks + session_prune tool + /prune command
+│   │                         #   (named extension.ts on purpose: not discovered)
+│   ├── src/plan.ts           # pure planner: selectors + pairing closure
+│   ├── src/rows.ts           # session projection -> planner rows
+│   ├── src/ops.ts            # ledger records, drafts, undo, appending
+│   └── test/                 # node:test via jiti (real SessionManager)
 ├── kun-retry/
-│   ├── index.ts
+│   ├── package.json
 │   ├── src/
 │   └── test/
 ├── session-error-clean/
-│   ├── index.ts
+│   ├── package.json
 │   ├── src/
 │   └── test/
 ├── hybrid-goal/
@@ -40,7 +56,7 @@ npm/git package extensions declared in `settings.json` are not tracked here.
 │   ├── src/
 │   └── test/
 └── pi-channels/
-    ├── index.ts                 # Pi discovery entry
+    ├── index.ts                 # Pi discovery entry (manifest: ./index.ts)
     ├── packages/core/           # channel-agnostic runtime
     ├── packages/telegram/       # Telegram adapter
     └── packages/extension/      # Pi commands/tools wiring

@@ -1,0 +1,21 @@
+{
+	"compilerOptions": {
+		"target": "ES2023",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"allowImportingTsExtensions": true,
+		"verbatimModuleSyntax": true,
+		"types": [
+			"node"
+		],
+		"noUnusedLocals": true,
+		"noUnusedParameters": true
+	},
+	"include": [
+		"extension.ts",
+		"src/**/*.ts"
+	]
+}
