@@ -16,6 +16,7 @@ Extensions here are auto-loaded by directory discovery unless they opt out;
 | `hybrid-goal/` | dir | Goal-mode state machine (pi-goal lineage) + independent judge + `/goal-evol` self-evolution. |
 | `pi-channels/` | dir | Multi-channel companion (Telegram first): queue, progress drafts, media, attach, connect lock. Replaces `@llblab/pi-telegram`. |
 | `prompt-cache-key/` | dir | Session-affinity `X-Session-ID` header on every provider request (default on), plus an opt-in `prompt_cache_key` body field for OpenAI-compatible Chat Completions endpoints, with per-provider auto-disable when a gateway rejects a parameter. |
+| `compact-model/` | dir | Run compaction (context summarization) with a dedicated provider/model: reuses pi's official `compact()` so summary format and cut points stay identical, only the LLM changes. `/compact-model` command; zero footprint until configured. |
 | `session-prune/` | dir (**opt-in**) | Trim the current session context to the messages that still matter: the `session_prune` agent tool + `/prune` command on top of append-only `ContextEditEntry`s (targeted pruning instead of compaction, with undo and tool-call/result safety). **Not auto-discovered** — no `index.ts` and no `pi.extensions` manifest; load it per session with `pi -e ~/.pi/agent/extensions/session-prune/extension.ts`. |
 
 ## Layout
@@ -44,6 +45,10 @@ special layouts on purpose.
 │   ├── src/ops.ts            # ledger records, drafts, undo, appending
 │   └── test/                 # node:test via jiti (real SessionManager)
 ├── kun-retry/
+│   ├── package.json
+│   ├── src/
+│   └── test/
+├── compact-model/
 │   ├── package.json
 │   ├── src/
 │   └── test/
