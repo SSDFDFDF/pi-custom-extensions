@@ -123,7 +123,7 @@ export async function handleBeforeCompact(params: HandleParams): Promise<Decisio
 	if (!isConfigured(cfg)) return { kind: "passthrough" };
 
 	// 2. 解析模型与鉴权。fail：回退模式下 warning（静默回退原版），
-	// 不回退模式下 error（装配层负责 throw）。
+	// 不回退模式下 error（装配层负责 return {cancel:true} 阻止本次压缩）。
 	const fail = (message: string): Decision => ({
 		kind: "fallback",
 		level: cfg.fallbackToDefault ? "warning" : "error",

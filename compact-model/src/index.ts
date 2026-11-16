@@ -95,6 +95,9 @@ export default function compactModel(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_before_compact", async (event, ctx) => {
+		// 每次压缩重读配置：手改 config 文件后无需 /reload 即生效。
+		cfg = loadConfig();
+
 		// 零侵入退出：未配置时不碰任何东西。
 		if (!(cfg.enabled && cfg.provider && cfg.model)) return undefined;
 
@@ -132,8 +135,10 @@ export default function compactModel(pi: ExtensionAPI) {
 				return undefined;
 			case "fallback":
 				if (!cfg.fallbackToDefault) {
-					// 用户要求不回退：抛错让 pi 走 session_compact_failed。
-					throw new Error(decision.message);
+					// pi 的 runner.emit 会吞掉处理器异常并继续走默认压缩，因此不能用 throw。
+					// cancel 才会真正阻止本次压缩（pi 随后发 session_compact_failed）。
+					notify(ctx, "error", decision.message);
+					return { cancel: true };
 				}
 				notify(ctx, decision.level, decision.message);
 				notify(ctx, "warning", "compact-model: 回退 pi 原版压缩。可用 provider: " + describeProviders(ctx));
@@ -243,7 +248,7 @@ export default function compactModel(pi: ExtensionAPI) {
 						return;
 					}
 					cfg = saveConfig({ fallbackToDefault: value === "on" });
-					report(`fallbackToDefault → ${value}（off = 失败时直接报错不回退原版）`);
+					report(`fallbackToDefault → ${value}（off = 取消本次压缩并报错，不回退原版）`);
 					return;
 				}
 				case "mimic": {

@@ -33,7 +33,7 @@ provider/model 生成；未配置时走 pi 原版行为（零侵入）。
 | `enabled` | `false` | 总开关。false 时钩子第一行返回，完全零侵入 |
 | `provider` / `model` | 空 | 压缩专用模型（models.json 里的 provider key + model id） |
 | `thinkingLevel` | `"off"` | `"off"`：压缩不烧思考（推荐）；`"inherit"`：用会话当前级别 |
-| `fallbackToDefault` | `true` | 指定模型失败时回退 pi 原版压缩（永不阻断会话）；`false` 时直接报错 |
+| `fallbackToDefault` | `true` | 指定模型失败时回退 pi 原版压缩（永不阻断会话）；`false` 时取消本次压缩并报错（`session_compact_failed`），不回退原版 |
 | `followClientMimic` | `true` | 压缩请求沿用 client-mimic 的客户端伪装（见下节）；client-mimic 未安装/未激活时自动无效 |
 
 ## 与 client-mimic 协作
