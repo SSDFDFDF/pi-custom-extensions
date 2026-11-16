@@ -1,0 +1,16 @@
+{
+	"name": "compact-model",
+	"version": "0.1.0",
+	"description": "Pi extension: run compaction (context summarization) with a dedicated provider/model. Reuses pi's official compact() so the summary format, cut points, and session entries stay identical; only the LLM changes. Default is pi's built-in behavior (zero footprint until configured).",
+	"type": "module",
+	"private": true,
+	"keywords": ["pi-package", "pi-extension", "compaction", "summarization"],
+	"license": "MIT",
+	"scripts": {
+		"test": "node --test test/*.test.mjs",
+		"check": "node --check test/load.mjs 2>/dev/null || true"
+	},
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	}
+}
