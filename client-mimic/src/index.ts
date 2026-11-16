@@ -64,6 +64,13 @@ import {
 	type TemplateContext,
 } from "./config.ts";
 import { rewriteHeaders } from "./headers.ts";
+import {
+	clearRewriteService,
+	createRewriteService,
+	publishRewriteService,
+	type ClientMimicRewriteService,
+	type RewriteModelInfo,
+} from "./rewrite-service.ts";
 import { applySystemPrompt, effectiveSpec } from "./system-prompt.ts";
 import { formatUpdateResults, updateVersions } from "./update.ts";
 import {
@@ -273,28 +280,47 @@ export default function clientMimic(pi: ExtensionAPI) {
 		}
 	});
 
+	// Unpublish the shared service when this instance is torn down (quit, reload,
+	// or session replacement). The identity check keeps a successor instance's
+	// freshly published service intact.
+	pi.on("session_shutdown", () => {
+		clearRewriteService(rewriteService);
+	});
+
 	// ── Header rewrite ─────────────────────────────────────────────────────────
 
-	pi.on("before_provider_headers", (event, ctx) => {
+	// ── Shared rewrite service (also used by other extensions) ───────────────
+
+	const modelInfoOf = (ctx: Pick<ExtensionContext, "model">): RewriteModelInfo => ({
+		provider: ctx.model?.provider ?? "",
+		api: ctx.model?.api ?? "",
+		id: ctx.model?.id ?? "",
+	});
+
+	/** Skip reason for diagnostics; null when a profile is active. */
+	const inactiveReason = (): string =>
+		!cfg.enabled ? "disabled" : effectiveActive() === "off" ? "active=off" : `unknown profile "${effectiveActive()}"`;
+
+	/**
+	 * Header rewrites for one outbound request. Mints a fresh Codex turn id (one
+	 * per request), matching what the `before_provider_headers` hook used to do.
+	 */
+	const applyHeaders = (headers: Record<string, string | null>): void => {
 		const profile = effectiveProfile();
 		if (!profile) return;
-
-		// One turn_id per outbound request when mimicking Codex.
 		if (profile.ensureCodexIdentity) {
 			identity = { ...identity, turnId: uuidV7() };
 		}
-		const tctx = templateCtx(profile);
+		rewriteHeaders(headers, profile, templateCtx(profile), true);
+	};
 
-		rewriteHeaders(event.headers, profile, tctx, true);
-	});
-
-	// ── Body patch ───────────────────────────────────────────────────────────
-
-	pi.on("before_provider_request", (event, ctx) => {
+	/** Apply the configured body patches. Returns the original object when unchanged. */
+	const applyPayload = (input: unknown): unknown => {
 		const profile = effectiveProfile();
-		if (!profile) return;
+		if (!profile) return input;
+		if (input === null || typeof input !== "object") return input;
 
-		const payload = { ...(event.payload as Record<string, unknown>) };
+		const payload = { ...(input as Record<string, unknown>) };
 		let changed = false;
 
 		// 1. Shallow bodyPatch overrides (config-driven).
@@ -343,7 +369,31 @@ export default function clientMimic(pi: ExtensionAPI) {
 			if (applyCodexResponsesLite(payload)) changed = true;
 		}
 
-		return changed ? payload : undefined;
+		return changed ? payload : input;
+	};
+
+	const rewriteService: ClientMimicRewriteService = createRewriteService({
+		activeProfile: () => (effectiveProfile() ? effectiveActive() : null),
+		inactiveReason,
+		applyHeaders,
+		applyPayload,
+	});
+
+	// Published before any request can run. Other extensions resolve it by the
+	// shared symbol (see rewrite-service.ts); absence is a supported state.
+	publishRewriteService(rewriteService);
+
+	// ── Header rewrite ─────────────────────────────────────────────────────────
+
+	pi.on("before_provider_headers", (event, ctx) => {
+		rewriteService.rewriteHeaders(event.headers, modelInfoOf(ctx));
+	});
+
+	// ── Body patch ───────────────────────────────────────────────────────────
+
+	pi.on("before_provider_request", (event, ctx) => {
+		const outcome = rewriteService.patchPayload(event.payload, modelInfoOf(ctx));
+		return outcome.payload !== event.payload ? outcome.payload : undefined;
 	});
 
 	// ── System prompt ──────────────────────────────────────────────────────────

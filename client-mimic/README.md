@@ -253,6 +253,8 @@ profile afterward to send the new identities.
   managed identity headers. Explicit `null` header deletions still apply.
 - Claude provider wrappers resolve current settings per call, so compaction
   sees the reset too. `/mimic off` makes registered wrappers pass through.
+- The cross-extension rewrite service (see below) resolves settings per call as
+  well, so out-of-band requests (compaction) always use the live profile.
 
 **不会修改：** Pi 内部 session UUID、会话文件名、聊天历史、其他会话记录、
 全局 installation/device 文件、OAuth/API key 或真实 `account_uuid`。
@@ -333,6 +335,37 @@ when referenced as `extensions/client-mimic/prompts/...`).
   Pi's extension-loader aliases).
 - `turn_id` is minted in `before_provider_headers`; body hook reuses the same
   in-memory state. If hook ordering ever changes, revisit request-scoped ids.
+
+## Rewrite service (for other extensions)
+
+Pi's compaction and other out-of-band provider calls bypass the
+`before_provider_headers` / `before_provider_request` hooks. To let those calls
+carry the same client identity, this extension publishes its rewrite logic on a
+process-global, versioned service:
+
+```ts
+const KEY = Symbol.for("pi.client-mimic.rewrite-service");
+const service = globalThis[KEY]; // may be undefined
+if (service?.version === 1 && service.activeProfile()) {
+  service.rewriteHeaders(headers, { provider, api, id }); // mints turn_id
+  const { payload } = service.patchPayload(body, { provider, api, id });
+}
+```
+
+- Same logic as the hooks (single source of truth): headers, Codex body
+  identity, Claude metadata + billing preamble, Responses-Lite contract.
+- Order matters: `rewriteHeaders` mints the per-request identity, so call it
+  before `patchPayload` — exactly like the two hooks for a normal turn.
+- Ownership is instance-scoped: `session_shutdown` unpublishes only this
+  instance's service, so `/reload` and session replacement never remove a
+  successor's registration.
+- Failure containment lives in the service: a header or body failure returns
+  `{ profile: null, skipped }` and leaves the request unmodified. Consumers
+  should additionally treat a missing/unsupported service as "no rewriting".
+- Consumers: `compact-model` applies it to compaction summarization requests and
+  its `/compact-model test` probe.
+
+Tests: `npm run test:service` (jiti, no `--experimental-strip-types` needed).
 
 ## Future work (backlog)
 

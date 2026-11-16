@@ -10,13 +10,13 @@ Extensions here are auto-loaded by directory discovery unless they opt out;
 
 | Extension | Type | Purpose |
 |-----------|------|---------|
-| `client-mimic/` | dir | Rewrites outgoing provider headers/body to mimic Codex CLI / Claude Code, and owns system-prompt transformation (neutral rewrite or per-profile prompt files). Supersedes the former `neutral-system-prompt.ts`. |
+| `client-mimic/` | dir | Rewrites outgoing provider headers/body to mimic Codex CLI / Claude Code, owns system-prompt transformation (neutral rewrite or per-profile prompt files), and publishes a versioned rewrite service on `Symbol.for("pi.client-mimic.rewrite-service")` so out-of-band requests (compaction) can reuse it. Supersedes the former `neutral-system-prompt.ts`. |
 | `kun-retry/` | dir | Configurable retry: override built-in retry count/backoff, extra HTTP status codes and error patterns, stall watchdog, and `/retry-nl` unlimited mode. |
 | `session-error-clean/` | dir | Removes persisted error entries and encrypted reasoning signatures (`thinkingSignature`, `\|fc_*`, `msg_*`) from session files with `ctx.switchSession()` live reload, plus outbound Responses `before_provider_request` reasoning compatibility guard (`/clean-errors`). |
 | `hybrid-goal/` | dir | Goal-mode state machine (pi-goal lineage) + independent judge + `/goal-evol` self-evolution. |
 | `pi-channels/` | dir | Multi-channel companion (Telegram first): queue, progress drafts, media, attach, connect lock. Replaces `@llblab/pi-telegram`. |
 | `prompt-cache-key/` | dir | Session-affinity `X-Session-ID` header on every provider request (default on), plus an opt-in `prompt_cache_key` body field for OpenAI-compatible Chat Completions endpoints, with per-provider auto-disable when a gateway rejects a parameter. |
-| `compact-model/` | dir | Run compaction (context summarization) with a dedicated provider/model: reuses pi's official `compact()` so summary format and cut points stay identical, only the LLM changes. `/compact-model` command; zero footprint until configured. |
+| `compact-model/` | dir | Run compaction (context summarization) with a dedicated provider/model: reuses pi's official `compact()` so summary format and cut points stay identical, only the LLM changes. Consumes client-mimic's published rewrite service so compaction requests carry the same client identity as normal turns. `/compact-model` command; zero footprint until configured. |
 | `session-prune/` | dir (**opt-in**) | Trim the current session context to the messages that still matter: the `session_prune` agent tool + `/prune` command on top of append-only `ContextEditEntry`s (targeted pruning instead of compaction, with undo and tool-call/result safety). **Not auto-discovered** — no `index.ts` and no `pi.extensions` manifest; load it per session with `pi -e ~/.pi/agent/extensions/session-prune/extension.ts`. |
 
 ## Layout

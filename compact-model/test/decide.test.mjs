@@ -134,6 +134,21 @@ test("auth ok=false → fallback(含错误信息)", async () => {
 	assert.ok(decision.message.includes("boom"));
 });
 
+test("streamFn 透传（mimic 适配层注入）", async () => {
+	const compactFn = compactStub();
+	const fakeStreamFn = () => ({ result: async () => ({}) });
+	const { promise } = run({ compactFn, streamFn: fakeStreamFn });
+	await promise;
+	assert.equal(compactFn.calls[0].streamFn, fakeStreamFn);
+});
+
+test("未提供 streamFn → undefined（官方默认实现）", async () => {
+	const compactFn = compactStub();
+	const { promise } = run({ compactFn });
+	await promise;
+	assert.equal(compactFn.calls[0].streamFn, undefined);
+});
+
 test("成功 → compaction,并验证传给 compact() 的参数", async () => {
 	const compactFn = compactStub();
 	const preparation = basePreparation();

@@ -22,6 +22,15 @@ export interface CompactModelConfig {
 	thinkingLevel: "off" | "inherit";
 	/** 指定模型解析/调用失败时是否回退 pi 原版压缩。true = 永不阻断会话。 */
 	fallbackToDefault: boolean;
+	/**
+	 * 是否让压缩请求沿用 client-mimic 的客户端伪装（headers + body）。
+	 *
+	 * pi 的压缩走 provider `streamSimple`，不经过 `before_provider_headers` /
+	 * `before_provider_request`；client-mimic 把这些改写发布成跨扩展服务
+	 * （`Symbol.for("pi.client-mimic.rewrite-service")`），本扩展在这里消费。
+	 * 未安装/未启用/关闭伪装时自动降级，不影响压缩。
+	 */
+	followClientMimic: boolean;
 }
 
 export const DEFAULT_CONFIG: CompactModelConfig = {
@@ -30,6 +39,7 @@ export const DEFAULT_CONFIG: CompactModelConfig = {
 	model: "",
 	thinkingLevel: "off",
 	fallbackToDefault: true,
+	followClientMimic: true,
 };
 
 const CONFIG_FILE_NAME = "compact-model.config.json";
@@ -64,6 +74,7 @@ export function normalizeConfig(raw: Partial<CompactModelConfig> | undefined): C
 		model: asString(base.model),
 		thinkingLevel: asThinkingLevel(base.thinkingLevel),
 		fallbackToDefault: asBoolean(base.fallbackToDefault, DEFAULT_CONFIG.fallbackToDefault),
+		followClientMimic: asBoolean(base.followClientMimic, DEFAULT_CONFIG.followClientMimic),
 	};
 }
 
@@ -106,5 +117,6 @@ export function formatConfigSummary(cfg: CompactModelConfig): string {
 		`model: ${target}`,
 		`thinkingLevel: ${cfg.thinkingLevel}`,
 		`fallbackToDefault: ${cfg.fallbackToDefault}`,
+		`followClientMimic: ${cfg.followClientMimic}`,
 	].join("\n");
 }

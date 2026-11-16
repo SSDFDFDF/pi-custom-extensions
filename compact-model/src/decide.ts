@@ -61,6 +61,8 @@ export interface CompactCallArgs {
 	thinkingLevel: string;
 	env: Record<string, string> | undefined;
 	retry: unknown;
+	/** 自定义 streamFn（已包含 client-mimic 改写）；undefined = 官方 completeSimple 直连。 */
+	streamFn: unknown;
 }
 
 export type Decision =
@@ -81,6 +83,8 @@ export interface HandleParams {
 	signal: AbortSignal;
 	thinkingLevel: string;
 	retry: unknown;
+	/** 已包装 client-mimic 改写的 streamFn；不传则走官方默认实现。 */
+	streamFn?: unknown;
 	notify?: (level: "info" | "warning" | "error", message: string) => void;
 }
 
@@ -159,6 +163,7 @@ export async function handleBeforeCompact(params: HandleParams): Promise<Decisio
 			thinkingLevel: params.thinkingLevel,
 			env: auth && auth.ok === true ? auth.env : undefined,
 			retry: params.retry,
+			streamFn: params.streamFn,
 		});
 		return { kind: "compaction", result };
 	} catch (error) {

@@ -35,6 +35,7 @@ test("DEFAULT_CONFIG 内容", () => {
 		model: "",
 		thinkingLevel: "off",
 		fallbackToDefault: true,
+		followClientMimic: true,
 	});
 });
 
@@ -53,6 +54,7 @@ test("normalizeConfig: 非法字段回退默认", () => {
 			model: "deepseek-flash", // 字符串 trim
 			thinkingLevel: "off", // 乱值回退 off
 			fallbackToDefault: true, // 非布尔回退默认
+			followClientMimic: true, // 缺省 → 默认 true（跟随 client-mimic）
 		},
 	);
 });
@@ -65,6 +67,7 @@ test("normalizeConfig: 合法输入保留", () => {
 			model: "v4.1-flash",
 			thinkingLevel: "inherit",
 			fallbackToDefault: false,
+			followClientMimic: false,
 		}),
 		{
 			enabled: true,
@@ -72,6 +75,7 @@ test("normalizeConfig: 合法输入保留", () => {
 			model: "v4.1-flash",
 			thinkingLevel: "inherit",
 			fallbackToDefault: false,
+			followClientMimic: false,
 		},
 	);
 });
@@ -124,4 +128,5 @@ test("formatConfigSummary 包含各字段", () => {
 	assert.ok(text.includes("p/m"));
 	assert.ok(text.includes("thinkingLevel: off"));
 	assert.ok(text.includes("fallbackToDefault: true"));
+	assert.ok(text.includes("followClientMimic: true"));
 });
