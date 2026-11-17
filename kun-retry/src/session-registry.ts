@@ -6,7 +6,7 @@ export interface RegisteredSession {
 	isStreaming?: boolean;
 	isCompacting?: boolean;
 }
-interface SessionRecord { owner: WeakRef<RegisteredSession> }
+interface SessionRecord { owner?: WeakRef<RegisteredSession> }
 const REGISTRY = Symbol.for("kun-retry.sessionRegistry.v1");
 const PATCH = Symbol.for("kun-retry.sessionRegistry.patch.v1");
 interface Registry { sessions: WeakMap<object, SessionRecord> }
@@ -20,15 +20,23 @@ export function registerSession(session: RegisteredSession): void {
 	}
 }
 
+/** Older builds stored the raw session object as the record; tolerate both shapes. */
+function recordSession(record: SessionRecord | RegisteredSession | undefined): RegisteredSession | undefined {
+	if (!record) return undefined;
+	const ref = (record as SessionRecord).owner;
+	if (ref) return ref.deref();
+	return record as RegisteredSession;
+}
+
 export function resolveSession(manager: object | undefined): RegisteredSession | undefined {
 	if (!manager) return undefined;
-	const session = registry.sessions.get(manager)?.owner.deref();
+	const session = recordSession(registry.sessions.get(manager));
 	return session?.sessionManager === manager ? session : undefined;
 }
 
 export function forgetSession(session: RegisteredSession): void {
 	const manager = session.sessionManager;
-	if (manager && registry.sessions.get(manager)?.owner.deref() === session) registry.sessions.delete(manager);
+	if (manager && recordSession(registry.sessions.get(manager)) === session) registry.sessions.delete(manager);
 }
 
 /** _bindExtensionCore runs on construction AND reload, before session_start. */
