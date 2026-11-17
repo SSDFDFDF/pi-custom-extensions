@@ -49,8 +49,9 @@ export function readSettingsFile(): SettingsShape {
  * Sync extension retry policy into Pi's built-in settings.json so
  * agent-session `_prepareRetry` uses our maxRetries / baseDelayMs.
  *
- * In-memory settings update only after process restart or `/reload`.
- * Returns whether the file changed.
+ * This file bridge does not mutate in-memory settings. The session-scoped
+ * retry adapter separately supplies live agent-turn policy; other core paths
+ * still reload file settings on restart or `/reload`. Returns whether the file changed.
  */
 export function syncBuiltinRetrySettings(cfg: KunRetryConfig): {
 	changed: boolean;

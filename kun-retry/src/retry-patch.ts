@@ -1,30 +1,7 @@
-/**
- * Constant-interval retry backoff for Pi's built-in auto-retry.
- *
- * Pi computes its agent-level retry delay in `AgentSession._prepareRetry` as:
- *
- *     delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1)
- *
- * There is no cap and no jitter, so a long-running unlimited (`nl`) session
- * eventually waits days between attempts, and past ~2^31 ms Node's timer clamps
- * the delay back to 1ms and turns the backoff into a hot loop.
- *
- * Rather than reimplement retry, this module wraps `_prepareRetry` and, only when
- * constant mode is on, hands Pi a `baseDelayMs` pre-divided by the exponent Pi is
- * about to apply. Pi's own formula then lands exactly on the configured constant
- * interval, and everything else in `_prepareRetry` still runs untouched: budget
- * accounting, removal of the failed assistant turn from agent state, the
- * `auto_retry_start` event, the abortable sleep (Escape still cancels), and the
- * `auto_retry_end` bookkeeping. With constant mode off, the original method runs
- * completely unmodified.
- *
- * The scaling stays exact because the target is divided and re-multiplied by the
- * same power of two. To keep `2 ** exponent` finite over very long unlimited runs,
- * `_retryAttempt` is rewound once the exponent reaches {@link MAX_EXPONENT}; our
- * own cumulative counter remains authoritative for the retry budget.
- */
+/** Session-scoped policy adapter around Pi's capped agent retry. Core owns sleep, omission and cancellation. */
+import { resolveSession } from "./session-registry.ts";
 
-/** Exponent at which `_retryAttempt` is rewound to keep `2 ** exponent` finite. */
+/** @deprecated Legacy planner boundary; the live adapter never rewinds counters. */
 export const MAX_EXPONENT = 1000;
 
 /** Clamp for the configured constant interval (1ms .. 1h). */
@@ -45,7 +22,8 @@ export interface ConstantRetryPlan {
 }
 
 /**
- * Pure planner for one `_prepareRetry` call.
+ * @deprecated Retained as a pure helper for older imports/regression fixtures.
+ * Not used by the live adapter: Pi's safe capped formula needs no rewinding.
  *
  * @param retryAttempt Pi's `_retryAttempt` on entry, before Pi increments it.
  *   `0` marks a fresh retry sequence (Pi resets it on a successful assistant
@@ -118,132 +96,118 @@ export function formatDelay(ms: number): string {
 	return `${ms}ms`;
 }
 
+export type RetrySettings = { enabled: boolean; maxRetries: number; baseDelayMs: number; maxAgentDelayMs?: number };
 export interface ConstantDelayHooks {
-	/** Constant interval in ms; `0` falls through to Pi's exponential backoff. */
 	getConstantDelayMs(): number;
-	/** Effective retry budget used for our own accounting. */
 	getMaxRetries(): number;
-	/** Called before the backoff sleep, with the true cumulative attempt number. */
+	/** Optional live override. Undefined preserves project/core settings (syncSettings=false). */
+	getSettings?(): Partial<RetrySettings> | undefined;
 	onRetry?(info: { attempt: number; maxRetries: number; delayMs: number; exponent: number }): void;
-	/** Called when our own budget check refuses the retry. */
 	onExhausted?(info: { attempt: number; maxRetries: number }): void;
+	record?(phase: string, data?: Record<string, unknown>): void;
+}
+export interface InstallResult { installed: boolean; reason?: string }
+type SessionLike = { sessionManager?: object; _retryAttempt: number; settingsManager: { getRetrySettings(): RetrySettings } };
+const STATE = Symbol.for("kun-retry.retryState.v2");
+const PATCHED = Symbol.for("kun-retry.constantDelay.patch.v2");
+const globals = globalThis as typeof globalThis & { [STATE]?: {
+	hooks: WeakMap<object, { hooks: ConstantDelayHooks; owner?: WeakRef<object> }>;
+} };
+const state = globals[STATE] ??= { hooks: new WeakMap() };
+
+/** Disposer removes only its own registration, so a late old shutdown cannot unbind a replacement. */
+export function bindRetryHooks(manager: object, hooks: ConstantDelayHooks): () => void {
+	const owner = resolveSession(manager);
+	const registration = { hooks, owner: owner ? new WeakRef(owner) : undefined };
+	state.hooks.set(manager, registration);
+	return () => { if (state.hooks.get(manager) === registration) state.hooks.delete(manager); };
 }
 
-export interface InstallResult {
-	installed: boolean;
-	/** Present when the patch could not be installed. */
-	reason?: string;
+function observe(hooks: ConstantDelayHooks, fn: (() => void) | undefined): void {
+	const failed = (error: unknown) => {
+		try {
+			const result: unknown = hooks.record?.("callback_failed", { errorName: error instanceof Error ? error.name : "unknown" });
+			if (result && typeof (result as PromiseLike<unknown>).then === "function") void Promise.resolve(result).catch(() => {});
+		} catch { /* observer only */ }
+	};
+	try {
+		const result: unknown = fn?.();
+		if (result && typeof (result as PromiseLike<unknown>).then === "function") void Promise.resolve(result).catch(failed);
+	} catch (error) { failed(error); }
 }
 
-type RetrySettings = { enabled: boolean; maxRetries: number; baseDelayMs: number };
-type SettingsManagerLike = { getRetrySettings(): RetrySettings };
-type SessionLike = {
-	_retryAttempt: number;
-	settingsManager: SettingsManagerLike;
-};
-
-const HOOKS_KEY = Symbol.for("kun-retry.constantDelay.hooks");
-const PATCHED_KEY = Symbol.for("kun-retry.constantDelay.patched");
-
-type GlobalWithPatch = typeof globalThis & {
-	[HOOKS_KEY]?: ConstantDelayHooks | undefined;
-	[PATCHED_KEY]?: boolean;
-};
-
-const CUMULATIVE = new WeakMap<object, number>();
-
-/**
- * Patch `AgentSession.prototype._prepareRetry` once per process and point it at
- * `hooks`. Safe to call again after `/reload`: the patch is installed a single
- * time and later calls only swap the hooks, so reloading never stacks wrappers.
- */
-export function installConstantDelayPatch(
-	agentSessionClass: unknown,
-	hooks: ConstantDelayHooks,
-): InstallResult {
-	const g = globalThis as GlobalWithPatch;
-	g[HOOKS_KEY] = hooks;
-
-	if (g[PATCHED_KEY]) return { installed: true };
-
-	const proto = (agentSessionClass as { prototype?: Record<string, unknown> } | undefined)?.prototype;
+/** One wrapper per prototype (including independent SDK copies), with no last-loaded hooks. */
+export function installConstantDelayPatch(agentSessionClass: unknown): InstallResult {
+	// A live /reload may still have the v1 wrapper underneath us. Disable its
+	// process-global hooks so it delegates without consulting a stale child ctx.
+	(globalThis as Record<symbol, unknown>)[Symbol.for("kun-retry.constantDelay.hooks")] = undefined;
+	const proto = (agentSessionClass as { prototype?: Record<PropertyKey, unknown> } | undefined)?.prototype;
+	if (proto && Object.hasOwn(proto, PATCHED)) return { installed: true };
 	const original = proto?._prepareRetry;
-	if (!proto || typeof original !== "function") {
-		return {
-			installed: false,
-			reason: "AgentSession.prototype._prepareRetry not found; constant retry interval unavailable (Pi will use its built-in exponential backoff)",
-		};
-	}
-
-	const originalFn = original as (this: unknown, message: unknown) => Promise<boolean>;
-
-	proto._prepareRetry = async function patchedPrepareRetry(this: SessionLike, message: unknown) {
-		const active = (globalThis as GlobalWithPatch)[HOOKS_KEY];
-		const rawTarget = active?.getConstantDelayMs() ?? 0;
-		if (!active || rawTarget <= 0) {
+	if (!proto || typeof original !== "function") return { installed: false, reason: "AgentSession._prepareRetry unavailable; live policy and constant delay unavailable" };
+	const originalFn = original as (this: SessionLike, message: unknown) => Promise<boolean>;
+	proto._prepareRetry = async function (this: SessionLike, message: unknown) {
+		const registration = this.sessionManager && state.hooks.get(this.sessionManager);
+		if (!registration || (registration.owner && registration.owner.deref() !== this)) return originalFn.call(this, message);
+		const hooks = registration.hooks;
+		let settings: RetrySettings;
+		let target: number;
+		let max: number;
+		try {
+			settings = { ...this.settingsManager.getRetrySettings(), ...hooks.getSettings?.() };
+			target = hooks.getConstantDelayMs();
+			max = target > 0 ? Math.min(settings.maxRetries, hooks.getMaxRetries()) : settings.maxRetries;
+		} catch (error) {
+			observe(hooks, () => hooks.record?.("policy_failed", { errorName: error instanceof Error ? error.name : "unknown" }));
 			return originalFn.call(this, message);
 		}
-
-		const targetMs = clampConstantDelayMs(rawTarget);
-		const maxRetries = active.getMaxRetries();
-		const plan = planConstantRetry(this._retryAttempt, CUMULATIVE.get(this) ?? 0, maxRetries, targetMs);
-
-		if (plan.exhausted) {
-			CUMULATIVE.set(this, plan.cumulative);
-			active.onExhausted?.({ attempt: plan.cumulative, maxRetries });
-			// Leave `_retryAttempt` alone: `_handlePostAgentRun` reports the final
-			// failure from it, exactly as it does when Pi's own budget check refuses.
+		const count = this._retryAttempt;
+		observe(hooks, () => hooks.record?.("prepare", { coreAttempt: count, attempt: count, enabled: settings.enabled, maxRetries: max, constantDelayMs: target }));
+		if (!settings.enabled || count >= max) {
+			observe(hooks, () => hooks.record?.("declined", { reason: settings.enabled ? "budget" : "disabled", attempt: count, maxRetries: max }));
+			if (settings.enabled) observe(hooks, () => hooks.onExhausted?.({ attempt: count, maxRetries: max }));
 			return false;
 		}
-
-		CUMULATIVE.set(this, plan.cumulative);
-		if (plan.resetRetryAttempt) this._retryAttempt = 0;
-		active.onRetry?.({
-			attempt: plan.cumulative,
-			maxRetries,
-			delayMs: targetMs,
-			exponent: plan.exponent,
-		});
-
-		// Shadow `getRetrySettings` for exactly one call. `_prepareRetry` invokes it
-		// synchronously as its first statement, and the shadow removes itself there,
-		// so nothing else can observe the scaled `baseDelayMs`.
+		const constant = target > 0;
+		const exponential = settings.baseDelayMs * 2 ** count;
+		const delayMs = constant ? clampConstantDelayMs(target) : Math.min(Number.isSafeInteger(exponential) ? exponential : Number.MAX_SAFE_INTEGER, settings.maxAgentDelayMs ?? 60_000);
+		// Current Pi caps the curve: base=T and cap=T yields T even after
+		// exponent overflow. No counter rewind or duplicate budget accounting.
+		// This override is read only by this agent-turn call, not summarization.
+		const nextSettings = {
+			...settings, maxRetries: max,
+			...(constant ? { baseDelayMs: delayMs, maxAgentDelayMs: delayMs } : {}),
+		};
 		const manager = this.settingsManager;
-		const realGetRetrySettings = manager.getRetrySettings;
-		const originalOwnDescriptor = Object.getOwnPropertyDescriptor(manager, "getRetrySettings");
+		const descriptor = Object.getOwnPropertyDescriptor(manager, "getRetrySettings");
 		let restored = false;
-		let shadowedGetRetrySettings: SettingsManagerLike["getRetrySettings"];
 		const restore = () => {
 			if (restored) return;
 			restored = true;
-			const current = Object.getOwnPropertyDescriptor(manager, "getRetrySettings");
-			if (current?.value !== shadowedGetRetrySettings) return;
-			if (originalOwnDescriptor) {
-				Object.defineProperty(manager, "getRetrySettings", originalOwnDescriptor);
-			} else {
-				delete (manager as Partial<SettingsManagerLike>).getRetrySettings;
-			}
+			if (Object.getOwnPropertyDescriptor(manager, "getRetrySettings")?.value !== shadow) return;
+			if (descriptor) Object.defineProperty(manager, "getRetrySettings", descriptor);
+			else delete (manager as { getRetrySettings?: unknown }).getRetrySettings;
 		};
-
-		shadowedGetRetrySettings = function (this: unknown) {
-			const settings = realGetRetrySettings.call(this ?? manager);
+		const shadow = () => {
 			restore();
-			return { ...settings, baseDelayMs: plan.scaledBaseDelayMs };
+			observe(hooks, () => hooks.onRetry?.({ attempt: count + 1, maxRetries: max, delayMs, exponent: count }));
+			return nextSettings;
 		};
-		Object.defineProperty(manager, "getRetrySettings", {
-			configurable: true,
-			enumerable: originalOwnDescriptor?.enumerable ?? false,
-			writable: true,
-			value: shadowedGetRetrySettings,
-		});
-
 		try {
-			return await originalFn.call(this, message);
-		} finally {
-			restore();
+			Object.defineProperty(manager, "getRetrySettings", { configurable: true, writable: true, enumerable: descriptor?.enumerable ?? false, value: shadow });
+		} catch {
+			observe(hooks, () => hooks.record?.("adapter_unavailable", { reason: "settings_not_shadowable" }));
+			return originalFn.call(this, message);
 		}
+		try {
+			const result = await originalFn.call(this, message);
+			observe(hooks, () => hooks.record?.("prepared", { continue: result, attempt: count + 1, coreAttempt: this._retryAttempt }));
+			return result;
+		} catch (error) {
+			observe(hooks, () => hooks.record?.("prepare_failed", { errorName: error instanceof Error ? error.name : "unknown" }));
+			throw error;
+		} finally { restore(); }
 	};
-
-	g[PATCHED_KEY] = true;
+	Object.defineProperty(proto, PATCHED, { value: true });
 	return { installed: true };
 }

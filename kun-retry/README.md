@@ -4,8 +4,10 @@ Local Pi extension that replaces `@narumitw/pi-retry`.
 
 ## Features
 
-- **maxRetries / baseDelayMs override** — written into `~/.pi/agent/settings.json` so Pi’s built-in `_prepareRetry` uses your budget
-- **Constant retry interval** — opt-in fixed wait between attempts instead of Pi’s uncapped exponential backoff (`constantDelayMs`, off by default)
+- **maxRetries / baseDelayMs override** — live agent-turn policy, with optional `settings.json` synchronization for future sessions
+- **Constant retry interval** — opt-in fixed wait instead of Pi’s capped exponential backoff (`constantDelayMs`, off by default)
+- **Session isolation** — exact SessionManager/AgentSession ownership; parent/child callbacks and watchdogs never use a last-loaded context
+- **Diagnostic trace** — bounded metadata ring and opt-in persistence with `/retry trace`
 - **Extra HTTP status codes** in provider `errorMessage` (e.g. 401, 403, Cloudflare 520–524)
 - **Extra error regex patterns**
 - **Legacy transport matchers** (empty-detail Unknown error, Codex WS limit, OpenAI Responses premature stream end, WebSocket stream closed before completion, no response body, network errno, bad gateway)
@@ -31,7 +33,9 @@ Remove the old package:
 cd ~/.pi/agent/npm && npm uninstall @narumitw/pi-retry
 ```
 
-Then `/reload` or restart Pi.
+**When upgrading from 0.2.x, restart the Pi process once.** Old prototype wrappers cannot be fully removed by `/reload`; the new adapter neutralizes their legacy globals, but restarting gives a clean runtime. Subsequent reloads of this version are supported.
+
+Reload or restart each host process that loads this extension; files on disk do not hot-update already running sessions.
 
 ## Config file
 
@@ -75,7 +79,10 @@ Then `/reload` or restart Pi.
 | `/retry patterns "quota reset",timeout` | Extra regexes |
 | `/retry stall 60000` | Stall watchdog ms (`off`/`0` disables) |
 | `/retry empty on` / `off` | Retry empty provider responses (default on) |
-| `/retry sync` | Force write maxRetries into settings.json |
+| `/retry sync` | Synchronize settings.json when `syncSettings` is enabled |
+| `/retry trace` | Show the latest 20 entries of the current runtime's diagnostic ring |
+| `/retry trace on` / `off` | Enable / disable metadata persistence for this runtime |
+| `/retry trace clear` | Clear the in-memory ring (does not erase persisted history) |
 | `/retry-nl` | Toggle unlimited any-error mode |
 | `/retry-nl on` / `off` | Explicit nl |
 
@@ -101,7 +108,10 @@ Then `/reload` or restart Pi.
    Empty responses (non-error stopReason, no usable content) are rewritten with
    `stopReason: "error"` + the same hint so the built-in classifier sees them.
 2. Pi’s agent auto-retry removes the failed assistant turn and `continue()`s after a backoff.
-3. Attempt budget is **Pi settings** `retry.maxRetries` — this extension keeps that in sync with its config (and uses a large number when `nl` is on).
+3. Pi owns attempt accounting, abortable sleep, recovery omission and continuation. With `syncSettings: true`, the adapter supplies the configured budget/base delay for each agent-turn retry immediately. `nl` uses an effective budget of 1,000,000, not literal infinity.
+4. With `syncSettings: false`, project/core enabled, budget and base delay stay authoritative. Constant mode remains available, but cannot exceed either the core budget or the extension budget.
+
+`/retry off` preserves the existing behavior: it disables this extension's matching, empty-response conversion, watchdog and constant mode; it does **not** disable Pi's ordinary transient-error retry.
 
 ### Why the watchdog must not call `ctx.abort()`
 
@@ -112,14 +122,13 @@ watchdog built on `ctx.abort()` therefore writes a perfectly retryable-looking e
 message and Pi still refuses to retry it — which looked like "matched but never
 retried".
 
-The watchdog instead captures the live session (via a one-time wrap of
-`AgentSession.prototype.bindExtensions`) and aborts only the underlying agent run,
-leaving the cancel flag false so auto-retry runs. This also avoids a second side
-effect of `ctx.abort()`: interactive mode restores queued steering/follow-up messages
-back into the editor, which must not happen during an auto-retry. Every other abort
-(Escape, Ctrl+C, session switch) is untouched and still cancels the run as before.
-If the session cannot be captured, the watchdog falls back to `ctx.abort()` and warns
-once that the stalled stream will not be auto-retried.
+A narrow SDK adapter registers sessions by the **SessionManager object's identity** at `_bindExtensionCore` (construction and reload) and `bindExtensions`. The registry holds a weak owner reference, checks replacement ownership, and rolls back failed binding. The watchdog captures the owner and request signal, then calls only that owner's `agent.abort()`; it never intercepts `AgentSession.abort()` or calls `ctx.abort()`.
+
+This leaves the user-cancel flag untouched and avoids restoring steering/follow-up queues into the editor. Escape, Ctrl+C and session switch retain their normal cancellation behavior. User cancellation wins over a pending watchdog marker. Shutdown disposes timers and unregisters only its own hooks, so a late cleanup cannot remove a replacement's registration.
+
+If ownership or the soft route is unavailable, the watchdog **fails closed**: it leaves the stream untouched, records the decision and warns once. It does not hard-abort or fabricate a retryable stall.
+
+Timers track the last real activity timestamp. Token events update that timestamp without allocating a timer per token; each deadline check re-reads the timeout. A changed timeout takes effect at the next check/request, not necessarily immediately.
 
 ## Backoff: exponential vs constant
 
@@ -136,26 +145,15 @@ and degenerates into a hot loop past 2^31ms" hazard no longer applies.
 | `0` (default) | Pi's built-in exponential backoff, completely unmodified |
 | `5000` | Every attempt waits 5s, forever if `nl` is on |
 
-This is not a reimplementation of retry. The extension wraps `_prepareRetry` and,
-only in constant mode, hands Pi a `baseDelayMs` pre-divided by the exponent Pi is
-about to apply, so Pi's own formula lands exactly on the configured interval.
-Everything else in `_prepareRetry` still runs: budget accounting, removal of the
-failed assistant turn, the `auto_retry_start` event, the abortable sleep (Escape
-still cancels), and `auto_retry_end`.
+This is not a retry-loop reimplementation. The adapter wraps `_prepareRetry` and supplies `baseDelayMs=T` and `maxAgentDelayMs=T` for **one synchronous settings read**. Pi's capped formula then yields T at every attempt, even after exponent overflow. There is no counter rewind or duplicate budget accounting. The original settings descriptor is restored before observers/backoff; UI or diagnostic callback failures cannot prevent the core method from running.
 
-Because the fixed interval keeps attempt counts high on long runs, the extension
-tracks its own cumulative counter for the budget and rewinds Pi's `_retryAttempt`
-before `2 ** attempt` could overflow. The footer shows the true attempt number and
-interval, e.g. `retrying∞ 37 @5s`.
+Everything else remains in Pi: native attempt numbers, `auto_retry_start/end`, abortable sleep and durable recovery `context_edit`. The footer shows, for example, `retrying∞ 37 @5s`, and transient labels restore the steady `nl∞ @5s` status.
+
+The override is local to **agent-turn retries**. It deliberately does not use `SettingsManager.applyOverrides`, because that would also change compaction/branch-summary retry policy.
 
 ### The delay cap matters above 60s
 
-Because Pi clamps the delay at `retry.maxAgentDelayMs`, a `constantDelayMs` larger
-than that cap would be **silently truncated**. The extension therefore syncs
-`retry.maxAgentDelayMs` in settings.json up to at least `constantDelayMs` whenever
-constant mode is on (it never lowers a larger user value, and leaves it alone when
-constant mode is off). `/retry constant` reports the effective cap, and warns if it
-is still below the requested interval.
+The local agent-turn adapter supplies the matching cap immediately, so intervals above 60s are not truncated. When settings synchronization is enabled, it also raises the persisted cap to at least `constantDelayMs` for future processes (never lowering a larger stored value). Switching constant mode off immediately restores use of the core/project cap; the stored cap is not automatically lowered.
 
 The patch touches `AgentSession.prototype`, which is internal to Pi. It verifies
 that `_prepareRetry` exists before installing and otherwise warns once and leaves
@@ -163,7 +161,21 @@ Pi's exponential backoff in force. Other internal implementation changes remain
 a compatibility risk, so the wrapper and the real `AgentSession` are both covered
 by tests and should be rechecked after Pi upgrades.
 
-**Important:** Changing `settings.json` mid-session only updates the file. In-memory retry limits refresh on **process start** or **`/reload`**. After `/retry max` or `/retry-nl`, run `/reload` once so the agent uses the new budget.
+With the adapter installed and `syncSettings: true`, `/retry max`, `/retry delay`, `/retry constant` and `/retry-nl` affect the **next agent-turn retry decision** without reload. They do not reschedule a sleep already in progress. External config edits are re-read on lifecycle/command/provider-request paths, not watched continuously. Direct settings.json edits still follow Pi's ordinary reload rules.
+
+## Validation
+
+```bash
+cd ~/.pi/agent/extensions/kun-retry
+npm test
+npm run check
+# With TypeScript available:
+tsc -p tsconfig.json
+```
+
+Use a Node version supporting `--experimental-strip-types` (validated with Node 22.23.1 and installed Pi SDK 1.5.2). The suite covers identity/owner isolation, stale UI exceptions, shutdown/reload, abort races, native budgets and large-exponent constant delays. Complete SDK tests use only a local synthetic provider and temporary configuration/auth/session files; they verify recovery omission in both live and reopened session projections without network calls.
+
+Real HTTP/provider decoding, OAuth and compaction integrations are not simulated by these tests. The `_bindExtensionCore` discovery hook and `_prepareRetry` adapter remain private SDK dependencies; rerun tests after Pi upgrades. An unavailable adapter degrades to core retry with a warning rather than guessing session ownership.
 
 ## Stall flag / env
 
@@ -174,14 +186,14 @@ PI_RETRY_STALL_TIMEOUT_MS=10000 pi
 
 ## Notes
 
-- On `session_shutdown`, stall/status timers, footer status and the captured session reference are cleared; throttle clocks reset. No session files are written by this extension.
+- On `session_shutdown`, timers, footer/UI references, retry hooks and SDK subscriptions are released. The weak discovery mapping remains available for reload; it holds no extension context.
+- Diagnostics retain at most 100 entries in memory and display the latest 20. `/retry trace on` appends `kun-retry-diagnostic` custom entries to the session; these do not enter model context. Persistence is off by default and resets on reload. Raw provider payloads, error text, credentials and headers are excluded; error names and runtime-owned reasons are retained.
 - Context overflow is **not** turned into auto-retry (Pi compaction path).
 - Escape still cancels an in-progress backoff.
 - `nl` mode retries *every* `stopReason: "error"`; use carefully.
 - Constant mode ignores `baseDelayMs`; that value only matters when `constantDelayMs` is `0`.
 - Constant interval is clamped to 1 ms – 1 h. Very small values hammer the provider and can make 429s worse.
-- A constant interval above `retry.maxAgentDelayMs` needs that cap raised too; the
-  extension syncs it automatically when `constantDelayMs` is set.
+- The local constant adapter supplies its own cap. Persisted cap synchronization is a compatibility backup for other/future core calls.
 - Empty-response retry ignores `aborted` (user cancel) and `length` (partial output cut off by token limit) turns; disable with `/retry empty off` if a provider legitimately returns empty completions.
 
 ## Candidate-model rotation

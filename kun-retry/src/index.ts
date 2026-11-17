@@ -3,11 +3,11 @@
  *
  * Replaces @narumitw/pi-retry with:
  * - Configurable maxRetries / baseDelayMs (synced into settings.json for Pi built-in auto-retry)
- * - Optional constant retry interval instead of Pi's uncapped exponential backoff
+ * - Optional constant retry interval instead of Pi's capped exponential backoff
  * - Extra retryable HTTP status codes and error-message patterns
  * - Stall stream watchdog (from pi-retry)
  * - /retry-nl unlimited "any error" mode
- * - /retry status|on|off|config|codes|patterns|max|delay|constant|stall
+ * - /retry status|on|off|config|codes|patterns|max|delay|constant|stall|trace
  */
 
 import { AgentSession, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -22,8 +22,12 @@ import {
 	ROTATION_THINKING_LEVELS,
 	saveConfig,
 } from "./config.ts";
-import { formatDelay, installConstantDelayPatch, parseConstantDelayMs } from "./retry-patch.ts";
+import { bindRetryHooks, formatDelay, installConstantDelayPatch, parseConstantDelayMs } from "./retry-patch.ts";
 import { beginSoftAbort, installSoftAbortPatch } from "./soft-abort.ts";
+import { resolveSession } from "./session-registry.ts";
+import { createRetryStatus } from "./status.ts";
+import { createRetryDiagnostics } from "./diagnostics.ts";
+import { createStallWatchdog } from "./watchdog.ts";
 
 export { parseConstantDelayMs } from "./retry-patch.ts";
 import {
@@ -45,14 +49,10 @@ import {
 } from "./model-rotation.ts";
 
 const STALL_WATCHDOG_TAG = "[stall-watchdog-retry]";
-const STATUS_KEY = "kun-retry";
-const STATUS_VISIBLE_MS = 8_000;
-const INCOMING_STATUS_VISIBLE_MS = 1_500;
 const STALL_TIMEOUT_FLAG = "retry-stall-timeout-ms";
 const STALL_TIMEOUT_ENV = "PI_RETRY_STALL_TIMEOUT_MS";
 
 type StatusContext = Pick<ExtensionContext, "hasUI" | "ui">;
-type WatchdogContext = StatusContext & Pick<ExtensionContext, "abort" | "isIdle">;
 
 type MessageShape = {
 	role?: string;
@@ -62,7 +62,32 @@ type MessageShape = {
 	[key: string]: unknown;
 };
 
-type StatusMode = "incoming" | "retry";
+type ObservableSession = { subscribe?: AgentSession["subscribe"] };
+
+/** UI getters and methods can throw after reload; notifications never own control flow. */
+function safeNotify(ctx: StatusContext | undefined, text: string, level: "info" | "warning" | "error") {
+	try {
+		if (ctx?.hasUI) ctx.ui.notify?.(text, level);
+	} catch {
+		/* best-effort UI */
+	}
+}
+
+function snapshotUI(ctx: StatusContext): StatusContext | undefined {
+	try {
+		return ctx.hasUI ? { hasUI: true, ui: ctx.ui } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function errorName(error: unknown): string {
+	try {
+		return error instanceof Error ? error.name : "unknown";
+	} catch {
+		return "unknown";
+	}
+}
 
 export function parseStallTimeoutMs(value: unknown): number | undefined {
 	if (value === undefined || value === null || value === "") return undefined;
@@ -116,20 +141,57 @@ export default function kunRetry(pi: ExtensionAPI) {
 	});
 
 	let cfg: KunRetryConfig = loadConfig();
-	let clearStatusTimer: NodeJS.Timeout | undefined;
-	let statusMode: StatusMode | undefined;
-	let statusText: string | undefined;
-	/** Last context seen by an event handler, so the retry hook can update the footer. */
-	let lastCtx: StatusContext | undefined;
-	let patchWarning: string | undefined;
-	let stallTimer: NodeJS.Timeout | undefined;
-	let providerWatchdogActive = false;
-	let waitingForStallAbortMessage = false;
-	/** Throttle stream-driven UI + timer re-arms so high-token streams stay cheap. */
-	let lastIncomingUiAt = 0;
-	let lastStallRearmAt = 0;
+	// A factory owns at most one session at a time. Repeated session_start replaces
+	// all resources; callbacks retain their owner, not a live ExtensionContext.
+	type Runtime = {
+		manager: object | undefined;
+		sessionOwner: ReturnType<typeof resolveSession>;
+		sessionId: string | undefined;
+		notifyUI: StatusContext | undefined;
+		status: ReturnType<typeof createRetryStatus>;
+		diagnostics: ReturnType<typeof createRetryDiagnostics>;
+		watchdog: ReturnType<typeof createStallWatchdog>;
+		unbindRetryHooks?: () => void;
+		unsubscribe?: () => void;
+		disposed: boolean;
+		softAbortWarned: boolean;
+		requestSignal: AbortSignal | undefined;
+		lastIncomingUiAt: number;
+	};
+	let runtime: Runtime | undefined;
+	let disposed = false;
 	const INCOMING_UI_MIN_MS = 250;
-	const STALL_REARM_MIN_MS = 1_000;
+
+	const isCurrent = (owner: Runtime) => !disposed && !owner.disposed && runtime === owner &&
+		resolveSession(owner.manager) === owner.sessionOwner;
+	const activeRuntime = (ctx: ExtensionContext): Runtime | undefined => {
+		const owner = runtime;
+		if (!owner || !isCurrent(owner)) return undefined;
+		return ctx.sessionManager === owner.manager ? owner : undefined;
+	};
+
+	// Explicitly accept only flat diagnostic metadata. In particular a match's
+	// label may contain a configured regex, and provider errors/payloads stay out.
+	const diagnosticKeys = new Set([
+		"stopReason", "attempt", "reason", "errorName", "coreAttempt", "enabled",
+		"maxRetries", "maxAttempts", "constantDelayMs", "continue", "delayMs",
+		"exponent", "timeoutMs", "idleMs", "success", "aborted", "bound", "rewritten",
+	]);
+	const record = (owner: Runtime | undefined, phase: string, data?: Record<string, unknown>) => {
+		if (!owner || !isCurrent(owner)) return;
+		try {
+			const metadata: Record<string, unknown> = { sessionId: owner.sessionId };
+			for (const key of diagnosticKeys) {
+				const descriptor = data && Object.getOwnPropertyDescriptor(data, key);
+				if (descriptor && "value" in descriptor) metadata[key] = descriptor.value;
+			}
+			const error = data && Object.getOwnPropertyDescriptor(data, "error");
+			if (error && "value" in error) metadata.errorName = errorName(error.value);
+			owner.diagnostics.record(phase, metadata);
+		} catch {
+			/* diagnostics must not interfere with core retry or message transforms */
+		}
+	};
 	/** Consecutive retryable errors since the last success or model switch. */
 	let errorStreak = 0;
 	/**
@@ -166,7 +228,8 @@ export default function kunRetry(pi: ExtensionAPI) {
 	 * Awaited from `message_end` so the switch lands before Pi's auto-retry
 	 * continuation reads the session model.
 	 */
-	const rotateModelIfNeeded = async (ctx: RotationContext) => {
+	const rotateModelIfNeeded = async (ctx: RotationContext, owner: Runtime) => {
+		if (!isCurrent(owner)) return;
 		if (!sessionRotationOn || cfg.switchAfterErrors <= 0 || sessionCandidates.length === 0) return;
 
 		const decision = accountRetryableError(errorStreak, cfg.switchAfterErrors);
@@ -200,12 +263,10 @@ export default function kunRetry(pi: ExtensionAPI) {
 
 		const nextKey = pickNextModelKey(pool, currentKey, isUsable);
 		if (!nextKey) {
-			if (ctx.hasUI) {
-				ctx.ui.notify?.(
-					`kun-retry: no other usable candidate model to switch to (pool: ${pool.join(", ") || "empty"}). Staying on ${currentKey ?? "current"}.`,
-					"warning",
-				);
-			}
+			safeNotify(ctx,
+				`kun-retry: no other usable candidate model to switch to (pool: ${pool.join(", ") || "empty"}). Staying on ${currentKey ?? "current"}.`,
+				"warning",
+			);
 			return;
 		}
 
@@ -226,14 +287,14 @@ export default function kunRetry(pi: ExtensionAPI) {
 		try {
 			ok = await pi.setModel(model);
 		} catch (e) {
-			if (ctx.hasUI) {
-				ctx.ui.notify?.(
-					`kun-retry: switch to ${nextKey} failed (${e instanceof Error ? e.message : String(e)}). Keeping ${currentKey ?? "current"}.`,
-					"warning",
-				);
-			}
+			record(owner, "rotation_failed", { errorName: errorName(e) });
+			if (isCurrent(owner)) safeNotify(ctx,
+				`kun-retry: switch to ${nextKey} failed. Keeping ${currentKey ?? "current"}.`,
+				"warning",
+			);
 			return;
 		}
+		if (!isCurrent(owner)) return;
 
 		// Re-assert the thinking level after a successful switch. "inherit" restores
 		// the pre-switch level; a concrete level (default "max") is applied and Pi
@@ -248,51 +309,48 @@ export default function kunRetry(pi: ExtensionAPI) {
 				/* thinking level is best-effort; a failure must not break the retry */
 			}
 		}
-		if (ctx.hasUI) {
-			if (ok) {
-				ctx.ui.notify?.(
-					`kun-retry: switched model ${currentKey ?? "?"} → ${nextKey} after ${cfg.switchAfterErrors} retryable error(s)`,
-					"warning",
-				);
-			} else {
-				ctx.ui.notify?.(
-					`kun-retry: could not switch to ${nextKey} (no configured auth). Keeping ${currentKey ?? "current"}.`,
-					"warning",
-				);
-			}
+		safeNotify(ctx,
+			ok
+				? `kun-retry: switched model ${currentKey ?? "?"} → ${nextKey} after ${cfg.switchAfterErrors} retryable error(s)`
+				: `kun-retry: could not switch to ${nextKey} (no configured auth). Keeping ${currentKey ?? "current"}.`,
+			"warning",
+		);
+	};
+
+	const safeRotate = async (ctx: RotationContext, owner: Runtime) => {
+		try {
+			await rotateModelIfNeeded(ctx, owner);
+		} catch (error) {
+			record(owner, "rotation_failed", { errorName: errorName(error) });
+			if (isCurrent(owner)) safeNotify(ctx, "kun-retry: model rotation failed; keeping the retryable response.", "warning");
 		}
 	};
 
-	// Constant-interval backoff. Only engages when enabled + constantDelayMs > 0;
-	// otherwise Pi's built-in exponential backoff runs completely unmodified.
-	const patch = installConstantDelayPatch(AgentSession, {
-		getConstantDelayMs: () => (cfg.enabled ? cfg.constantDelayMs : 0),
-		getMaxRetries: () => effectiveMaxRetries(cfg),
-		onRetry: ({ attempt, delayMs }) => {
-			if (lastCtx?.hasUI) showRetryStatus(lastCtx, { attempt, delayMs });
-		},
-	});
-	if (!patch.installed) patchWarning = patch.reason;
-
-	// Keep the stall watchdog off Pi's user-cancel path. `ctx.abort()` sets
-	// `_agentRunAbortRequested`, which makes `_handlePostAgentRun` skip
-	// `_prepareRetry` entirely — a watchdog built on it can never auto-retry.
+	// Prototype wrappers only resolve manager-scoped hooks. No factory's policy
+	// or UI replaces another factory's callbacks when an SDK/session is shared.
+	const patch = installConstantDelayPatch(AgentSession);
+	let patchWarning = patch.installed ? undefined : patch.reason;
+	// Registry capture happens at _bindExtensionCore, including /reload. Never
+	// patch user abort, fall back to ctx.abort(), or guess a session by its ID.
 	const softAbortPatch = installSoftAbortPatch(AgentSession);
-	let softAbortWarning = softAbortPatch.installed ? undefined : softAbortPatch.reason;
-	let softAbortWarned = false;
+	const softAbortWarning = softAbortPatch.installed ? undefined : softAbortPatch.reason;
 
 	const applySettingsSync = (notify: StatusContext | undefined) => {
-		const result = syncBuiltinRetrySettings(cfg);
-		if (result.changed && notify?.hasUI) {
-			notify.ui.notify?.(
-				`kun-retry synced settings.json: retry.maxRetries=${result.maxRetries}, baseDelayMs=${result.baseDelayMs}, enabled=${result.enabled}. Run /reload if this session still uses old in-memory retry limits.`,
+		try {
+			const result = syncBuiltinRetrySettings(cfg);
+			if (result.changed) safeNotify(notify,
+				`kun-retry synced settings.json: retry.maxRetries=${result.maxRetries}, baseDelayMs=${result.baseDelayMs}, enabled=${result.enabled}. Live session policy is updated immediately.`,
 				"info",
 			);
+			return result;
+		} catch (error) {
+			record(runtime, "settings_sync_failed", { errorName: errorName(error) });
+			safeNotify(notify, "kun-retry: could not sync settings.json; live retry policy remains available.", "warning");
+			return undefined;
 		}
-		return result;
 	};
 
-	// Initial sync so a cold start after config edit picks up file values next launch.
+	// File sync is a compatibility backup; live getSettings needs no /reload.
 	applySettingsSync(undefined);
 
 	const getStallTimeoutMs = () =>
@@ -300,183 +358,195 @@ export default function kunRetry(pi: ExtensionAPI) {
 		parseStallTimeoutMs(process.env[STALL_TIMEOUT_ENV]) ??
 		refreshConfig().stallTimeoutMs;
 
-	const clearStatus = (ctx: StatusContext) => {
-		if (clearStatusTimer) clearTimeout(clearStatusTimer);
-		clearStatusTimer = undefined;
-		statusMode = undefined;
-		statusText = undefined;
-		ctx.ui.setStatus(STATUS_KEY, undefined);
-	};
-
-	const setTransientStatus = (ctx: StatusContext, mode: StatusMode, text: string, visibleMs: number) => {
-		if (clearStatusTimer) clearTimeout(clearStatusTimer);
-		if (statusMode !== mode || statusText !== text) ctx.ui.setStatus(STATUS_KEY, text);
-		statusMode = mode;
-		statusText = text;
-		clearStatusTimer = setTimeout(() => {
-			clearStatusTimer = undefined;
-			if (statusMode !== mode) return;
-			statusMode = undefined;
-			statusText = undefined;
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-		}, visibleMs);
-	};
-
-	const showRetryStatus = (ctx: StatusContext, constant?: { attempt: number; delayMs: number }) => {
-		const base = cfg.nl ? "retrying∞" : "retrying";
-		if (!constant) {
-			setTransientStatus(ctx, "retry", base, STATUS_VISIBLE_MS);
-			return;
+	const disposeRuntime = () => {
+		const owner = runtime;
+		if (!owner || owner.disposed) return;
+		owner.disposed = true;
+		owner.watchdog.dispose();
+		// The status config callback disables an obsolete owner's stable footer.
+		owner.status.clear();
+		owner.status.dispose();
+		for (const cleanup of [owner.unbindRetryHooks, owner.unsubscribe]) {
+			try { cleanup?.(); } catch { /* shutdown remains idempotent */ }
 		}
-		const budget = cfg.nl ? "" : `/${effectiveMaxRetries(cfg)}`;
-		const label = `${base} ${constant.attempt}${budget} @${formatDelay(constant.delayMs)}`;
-		// Keep the label up for the whole wait so a long constant interval is visible.
-		setTransientStatus(ctx, "retry", label, Math.max(constant.delayMs + STATUS_VISIBLE_MS, STATUS_VISIBLE_MS));
+		owner.diagnostics.dispose();
+		owner.unbindRetryHooks = undefined;
+		owner.unsubscribe = undefined;
+		owner.notifyUI = undefined;
+		owner.manager = undefined;
+		owner.sessionOwner = undefined;
+		owner.requestSignal = undefined;
+		owner.sessionId = undefined;
+		runtime = undefined;
+		// Registry's weak mapping belongs to AgentSession, not this factory. Keep
+		// it through reload; shutdown only removes this runtime's hooks/resources.
 	};
 
-	const showIncomingStatus = (ctx: StatusContext) => {
-		setTransientStatus(ctx, "incoming", "receiving", INCOMING_STATUS_VISIBLE_MS);
-	};
-
-	const clearIncomingStatus = (ctx: StatusContext) => {
-		if (statusMode === "incoming") clearStatus(ctx);
-	};
-
-	const disarmStallWatchdog = () => {
-		if (stallTimer) clearTimeout(stallTimer);
-		stallTimer = undefined;
-	};
-
-	const armStallWatchdog = (ctx: WatchdogContext) => {
-		disarmStallWatchdog();
-		if (!cfg.enabled) {
-			providerWatchdogActive = false;
-			return;
-		}
-
-		const timeoutMs = getStallTimeoutMs();
-		if (timeoutMs === 0) {
-			providerWatchdogActive = false;
-			return;
-		}
-
-		providerWatchdogActive = true;
-		stallTimer = setTimeout(() => {
-			stallTimer = undefined;
-			providerWatchdogActive = false;
-			if (ctx.isIdle()) return;
-
-			waitingForStallAbortMessage = true;
-			if (ctx.hasUI) showRetryStatus(ctx);
-
-			const mode = beginSoftAbort();
-			if (mode === "unavailable" && ctx.hasUI && !softAbortWarned) {
-				// No soft route exists, so `ctx.abort()` marks the run user-cancelled and
-				// Pi will not auto-retry the stalled stream. Warn once, don't fail mute.
-				softAbortWarned = true;
-				ctx.ui.notify?.(
-					`kun-retry: ${softAbortWarning ?? "soft abort unavailable"} — this stalled stream will not auto-retry. Run /reload after updating the extension, or restart Pi.`,
+	const createRuntime = (ctx: ExtensionContext): Runtime => {
+		const manager = ctx.sessionManager;
+		const sessionOwner = resolveSession(manager);
+		let sessionId: string | undefined;
+		try { sessionId = manager.getSessionId(); } catch { /* metadata only */ }
+		const status = createRetryStatus(() => ({ ...cfg, enabled: cfg.enabled && isCurrent(owner) }),
+			() => sessionRotationOn && cfg.switchAfterErrors > 0 ? ` rot/${cfg.switchAfterErrors}` : "",
+		);
+		const diagnostics = createRetryDiagnostics((entry) => {
+			if (isCurrent(owner)) pi.appendEntry("kun-retry-diagnostic", entry);
+		});
+		const watchdog = createStallWatchdog({
+			getTimeoutMs: getStallTimeoutMs,
+			isEnabled: () => isCurrent(owner) && cfg.enabled && !owner.requestSignal?.aborted &&
+				!owner.sessionOwner?._agentRunAbortRequested && !owner.sessionOwner?.isCompacting && owner.sessionOwner?.isStreaming !== false,
+			// A manager can be reused by a fork/replacement AgentSession. An old
+			// timer must never abort the new owner even if manager identity is equal.
+			abort: () => isCurrent(owner) && !owner.requestSignal?.aborted && owner.sessionOwner &&
+				resolveSession(owner.manager) === owner.sessionOwner
+				? beginSoftAbort(owner.manager) : "unavailable",
+			onStall: () => { if (isCurrent(owner)) owner.status.retry(); },
+			onUnavailable: () => {
+				if (!isCurrent(owner) || owner.softAbortWarned) return;
+				owner.softAbortWarned = true;
+				record(owner, "watchdog_unavailable", { reason: "soft_abort_unavailable" });
+				safeNotify(owner.notifyUI,
+					`kun-retry: ${softAbortWarning ?? "soft abort unavailable for this session"} — stalled stream left untouched (no user-cancel fallback).`,
 					"warning",
 				);
+			},
+			record: (phase, data) => record(owner, `watchdog_${phase}`, data),
+		});
+		const owner: Runtime = {
+			manager, sessionOwner, sessionId, notifyUI: snapshotUI(ctx), status, diagnostics, watchdog,
+			disposed: false, softAbortWarned: false, requestSignal: undefined, lastIncomingUiAt: 0,
+		};
+		runtime = owner;
+		status.capture(ctx);
+		owner.unbindRetryHooks = bindRetryHooks(manager, {
+			getConstantDelayMs: () => isCurrent(owner) && cfg.enabled ? cfg.constantDelayMs : 0,
+			getMaxRetries: () => isCurrent(owner) ? effectiveMaxRetries(cfg) : 0,
+			// Local agent-turn retry adapter only; never applyOverrides to the
+			// shared SettingsManager (summarization has an independent core policy).
+			// /retry off only disables extension matching/watchdog/constant mode.
+			// Core transient-error retry remains enabled, as in settings-bridge.
+			getSettings: () => isCurrent(owner) && cfg.syncSettings
+				? { enabled: true, maxRetries: effectiveMaxRetries(cfg), baseDelayMs: cfg.baseDelayMs }
+				: undefined,
+			onRetry: (info) => {
+				if (!isCurrent(owner)) return;
+				record(owner, "onRetry", info);
+				status.retry(info);
+			},
+			onExhausted: (info) => {
+				if (!isCurrent(owner)) return;
+				record(owner, "exhausted", info);
+				status.clear();
+			},
+			record: (phase, data) => record(owner, phase, data),
+		});
+		// Structural adapter works with independently loaded SDK copies without
+		// instanceof checks. Observers only select metadata, never raw errors.
+		try {
+			const session = sessionOwner as ObservableSession | undefined;
+			if (typeof session?.subscribe === "function") {
+				owner.unsubscribe = session.subscribe((event) => {
+					if (!isCurrent(owner)) return;
+					try {
+						if (event.type === "auto_retry_start") {
+							record(owner, event.type, { attempt: event.attempt, maxAttempts: event.maxAttempts, delayMs: event.delayMs });
+						} else if (event.type === "auto_retry_end") {
+							record(owner, event.type, { attempt: event.attempt, success: event.success });
+							owner.status.clear();
+						}
+					} catch (error) {
+						record(owner, "observer_failed", { errorName: errorName(error) });
+					}
+				});
 			}
-			// "direct" already aborted the stream. "deferred" and "unavailable" continue
-			// through ctx.abort(); the deferred route converts it via the armed flag.
-			if (mode !== "direct") ctx.abort();
-		}, timeoutMs);
+		} catch (error) {
+			record(owner, "subscribe_failed", { errorName: errorName(error) });
+		}
+		return owner;
 	};
 
-	const observeProviderOrStreamEvent = (ctx: WatchdogContext) => {
-		if (!providerWatchdogActive || waitingForStallAbortMessage) return;
-		if (ctx.isIdle()) {
-			disarmStallWatchdog();
-			providerWatchdogActive = false;
-			clearIncomingStatus(ctx);
-			return;
-		}
+	const observeProviderOrStreamEvent = (ctx: ExtensionContext) => {
+		const owner = activeRuntime(ctx);
+		if (!owner || !cfg.enabled || owner.sessionOwner?.isStreaming === false || owner.sessionOwner?.isCompacting) return;
+		owner.watchdog.touch();
 		const now = Date.now();
-		// Status text is cosmetic; avoid setStatus on every token.
-		if (ctx.hasUI && now - lastIncomingUiAt >= INCOMING_UI_MIN_MS) {
-			lastIncomingUiAt = now;
-			showIncomingStatus(ctx);
-		}
-		// Stall timer only needs second-level precision; re-arming every token is pure overhead.
-		if (now - lastStallRearmAt >= STALL_REARM_MIN_MS || !stallTimer) {
-			lastStallRearmAt = now;
-			armStallWatchdog(ctx);
+		if (now - owner.lastIncomingUiAt >= INCOMING_UI_MIN_MS) {
+			owner.lastIncomingUiAt = now;
+			owner.status.receiving();
 		}
 	};
 
-	const updateFooterStatus = (ctx: StatusContext) => {
-		if (!ctx.hasUI) return;
-		if (!cfg.enabled) {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-			return;
-		}
-		const rot = sessionRotationOn && cfg.switchAfterErrors > 0 ? ` rot/${cfg.switchAfterErrors}` : "";
-		if (cfg.nl) {
-			const suffix = cfg.constantDelayMs > 0 ? ` @${formatDelay(cfg.constantDelayMs)}` : "";
-			ctx.ui.setStatus(STATUS_KEY, `nl∞${suffix}${rot}`);
-		} else if (rot) {
-			// Rotation is a persistent mode worth surfacing even in bounded mode.
-			if (statusMode !== "retry" && statusMode !== "incoming") {
-				ctx.ui.setStatus(STATUS_KEY, `retry${rot}`);
-			}
-		} else {
-			// Keep footer quiet in normal mode; transient "retrying"/"receiving" only.
-			if (statusMode !== "retry" && statusMode !== "incoming") {
-				ctx.ui.setStatus(STATUS_KEY, undefined);
-			}
-		}
+	const updateFooterStatus = (ctx: ExtensionContext) => {
+		const owner = activeRuntime(ctx);
+		if (!owner) return;
+		owner.status.capture(ctx);
+		owner.status.refresh();
 	};
 
 	// ── Lifecycle ──────────────────────────────────────────────────────────
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
+		if (disposed) return;
+		disposeRuntime();
 		refreshConfig();
-		lastCtx = ctx;
-		applySettingsSync(ctx);
-		if (patchWarning && cfg.constantDelayMs > 0 && ctx.hasUI) {
-			ctx.ui.notify?.(`kun-retry: ${patchWarning}`, "warning");
-			patchWarning = undefined;
-		}
-		disarmStallWatchdog();
-		providerWatchdogActive = false;
-		waitingForStallAbortMessage = false;
 		errorStreak = 0;
 		baseModelKey = modelKeyOf(ctx.model);
-		// Session-scoped rotation state: starts empty each session.
 		sessionCandidates = [];
 		sessionRotationOn = false;
-		clearStatus(ctx);
-		updateFooterStatus(ctx);
+		const owner = createRuntime(ctx);
+		record(owner, "session_start", { reason: event.reason, bound: !!owner.sessionOwner });
+		// A failed file write must not prevent hook/session binding.
+		applySettingsSync(ctx);
+		if (patchWarning && (cfg.constantDelayMs > 0 || cfg.syncSettings)) {
+			safeNotify(ctx, `kun-retry: ${patchWarning}`, "warning");
+			patchWarning = undefined;
+		}
+		owner.status.clear();
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		disarmStallWatchdog();
-		providerWatchdogActive = false;
-		waitingForStallAbortMessage = false;
-		lastIncomingUiAt = 0;
-		lastStallRearmAt = 0;
+		if (disposed) return;
+		// A stale shutdown from an earlier manager must not dispose its replacement.
+		try {
+			if (runtime && ctx.sessionManager !== runtime.manager) return;
+		} catch {
+			/* A shutdown context may already be invalidated; still release resources. */
+		}
+		record(runtime, "session_shutdown");
+		disposed = true;
+		disposeRuntime();
 		errorStreak = 0;
 		baseModelKey = undefined;
 		sessionCandidates = [];
 		sessionRotationOn = false;
-		// Deliberately keep the captured session: `/reload` reuses the same
-		// AgentSession and does not re-run `bindExtensions`, so dropping it here would
-		// leave the next instance with only the deferred soft-abort route.
-		clearStatus(ctx);
 	});
 
 	pi.on("before_provider_request", (_event, ctx) => {
-		lastCtx = ctx;
-		if (!cfg.enabled) return;
-		if (ctx.hasUI) clearIncomingStatus(ctx);
-		lastIncomingUiAt = 0;
-		lastStallRearmAt = 0;
-		armStallWatchdog(ctx);
+		const owner = activeRuntime(ctx);
+		if (!owner) return;
+		const session = owner.sessionOwner;
+		// Provider hooks also run for summary/cache-warming requests. Real SDK
+		// sessions expose isStreaming=false there; undefined only accommodates
+		// structural test/older SDK fixtures, never a known non-agent request.
+		if (session?.isStreaming === false || session?.isCompacting || session?._agentRunAbortRequested) return;
+		const signal = ctx.signal;
+		if (signal?.aborted) return;
+		owner.requestSignal = signal;
+		owner.status.capture(ctx);
+		owner.status.clear();
+		owner.lastIncomingUiAt = 0;
+		owner.watchdog.start();
 	});
 
 	pi.on("after_provider_response", (_event, ctx) => {
+		observeProviderOrStreamEvent(ctx);
+	});
+
+	pi.on("provider_stream_event", (_event, ctx) => {
+		// Parsed provider activity can precede normalized text/thinking deltas.
+		// Never inspect/store its payload; keepalive/progress still resets idle time.
 		observeProviderOrStreamEvent(ctx);
 	});
 
@@ -489,132 +559,89 @@ export default function kunRetry(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", (_event, ctx) => {
-		disarmStallWatchdog();
-		providerWatchdogActive = false;
-		waitingForStallAbortMessage = false;
-		if (ctx.hasUI) clearIncomingStatus(ctx);
+		// This precedes _prepareRetry: never mark the session settled here.
+		record(activeRuntime(ctx), "agent_end");
+	});
+
+	pi.on("agent_settled", (event, ctx) => {
+		const owner = activeRuntime(ctx);
+		if (!owner) return;
+		record(owner, "agent_settled", { aborted: event.aborted });
+		owner.watchdog.stop();
+		owner.watchdog.consumeAbort();
+		owner.requestSignal = undefined;
+		owner.status.clear();
 	});
 
 	pi.on("message_end", async (event, ctx) => {
 		const message = event.message as unknown as MessageShape;
 		if (message.role !== "assistant") return;
-
-		disarmStallWatchdog();
-		providerWatchdogActive = false;
-		if (ctx.hasUI) clearIncomingStatus(ctx);
-
-		lastCtx = ctx;
-
-		// A successful turn ends the retry sequence; drop the stale "retrying" label
-		// instead of letting it linger for the rest of its visible window.
-		if (message.stopReason !== "error" && statusMode === "retry" && ctx.hasUI) {
-			clearStatus(ctx);
-			updateFooterStatus(ctx);
-		}
-
-		// A genuinely successful assistant turn (non-error, not user-aborted, has
-		// usable content, not a pending stall conversion) resets the rotation streak
-		// so the current model is kept until it starts failing again.
-		if (
-			message.stopReason !== "error" &&
-			message.stopReason !== "aborted" &&
-			!waitingForStallAbortMessage &&
-			!isEmptyAssistantContent(message.content)
-		) {
-			errorStreak = 0;
-		}
-
-		if (!cfg.enabled && !waitingForStallAbortMessage) return;
-
-		// Stall abort → force retryable error
-		if (waitingForStallAbortMessage) {
-			waitingForStallAbortMessage = false;
-			const originalErrorMessage =
-				typeof message.errorMessage === "string"
-					? message.errorMessage
-					: "Provider stream stalled while Pi was waiting for a response.";
-
-			if (!originalErrorMessage.includes(STALL_WATCHDOG_TAG)) {
-				// A stalled stream is transport-level, not a quota/billing refusal, so
-				// neutralize any non-retryable tokens that happen to be in the partial
-				// error text so Pi's built-in classifier does not veto the retry.
-				const { text } = neutralizeNonRetryable(originalErrorMessage);
-				const errorMessage = `${text}\n\n${STALL_WATCHDOG_TAG} ${RETRYABLE_HINT}; treating stalled provider stream as retryable.`;
-				if (ctx.hasUI) showRetryStatus(ctx);
-				await rotateModelIfNeeded(ctx);
-				return {
-					message: {
-						...message,
-						stopReason: "error",
-						errorMessage,
-					} as typeof event.message,
-				};
-			}
-		}
-
-		if (!cfg.enabled) return;
-
-		// Empty provider response → force retryable error.
-		// A completed-but-empty assistant turn (no answer text and no tool calls;
-		// thinking-only counts as empty) with a non-error stopReason is HTTP 200 with
-		// nothing usable. Pi's built-in classifier only inspects stopReason ===
-		// "error", so it never retries this. Rewrite it into a retryable error so the
-		// built-in retry path engages. "aborted" is a user cancel and "length" may
-		// carry partial output, so both are left untouched.
-		if (
-			cfg.retryEmptyResponse &&
-			message.stopReason !== "error" &&
-			message.stopReason !== "aborted" &&
-			message.stopReason !== "length" &&
-			isEmptyAssistantContent(message.content)
-		) {
-			const existing = typeof message.errorMessage === "string" ? message.errorMessage : "";
-			if (existing.includes(EMPTY_RESPONSE_TAG)) return;
-			const errorMessage = `Provider returned an empty response (stopReason: ${
-				typeof message.stopReason === "string" ? message.stopReason : "unknown"
-			}, no answer text or tool calls).\n\n${EMPTY_RESPONSE_TAG} ${RETRYABLE_HINT}; treating empty provider response as retryable.`;
-			if (ctx.hasUI) showRetryStatus(ctx);
-			await rotateModelIfNeeded(ctx);
-			return {
-				message: {
-					...message,
-					stopReason: "error",
-					errorMessage,
-				} as typeof event.message,
-			};
-		}
-
-		if (message.stopReason !== "error") return;
-		if (typeof message.errorMessage !== "string") return;
-
-		const matched = matchRetryableError(message.errorMessage, {
-			nl: cfg.nl,
-			statusCodes: cfg.statusCodes,
-			errorPatterns: cfg.errorPatterns,
-		});
-		if (!matched) return;
-
-		// Avoid appending the hint repeatedly on replayed messages.
-		if (message.errorMessage.includes(matched.tag) && message.errorMessage.includes(RETRYABLE_HINT)) {
+		const owner = activeRuntime(ctx);
+		if (!owner) return;
+		// Consume before stop(): only a confirmed direct watchdog abort may rewrite
+		// an aborted response. A simultaneous real user cancel always takes priority.
+		const stalled = owner.watchdog.consumeAbort();
+		owner.watchdog.stop();
+		owner.status.clear();
+		const userCancelled = resolveSession(owner.manager)?._agentRunAbortRequested === true;
+		if (userCancelled || (!stalled && message.stopReason === "aborted")) {
+			record(owner, "message_end_classified", { stopReason: message.stopReason, reason: "user_cancel", rewritten: false });
 			return;
 		}
 
-		// In nl mode the user asked to retry ANY error, including quota/billing
-		// refusals that Pi's built-in classifier normally vetoes. Neutralize those
-		// tokens so the built-in retry path actually engages. Bounded modes leave
-		// them intact so genuine quota exhaustion is not silently retried.
-		const base = cfg.nl ? neutralizeNonRetryable(message.errorMessage).text : message.errorMessage;
-		const errorMessage = appendRetryHint(base, matched);
+		if (message.stopReason !== "error" && message.stopReason !== "aborted" && !stalled && !isEmptyAssistantContent(message.content)) {
+			errorStreak = 0;
+		}
 
-		if (ctx.hasUI) showRetryStatus(ctx);
-		await rotateModelIfNeeded(ctx);
-
-		return {
-			message: {
+		let replacement: MessageShape | undefined;
+		let reason = cfg.enabled ? "unmatched" : "disabled";
+		if (stalled) {
+			reason = "stall";
+			const original = typeof message.errorMessage === "string"
+				? message.errorMessage
+				: "Provider stream stalled while Pi was waiting for a response.";
+			const { text } = neutralizeNonRetryable(original);
+			replacement = {
 				...message,
-				errorMessage,
-			} as typeof event.message,
-		};
+				stopReason: "error",
+				errorMessage: original.includes(STALL_WATCHDOG_TAG) && original.includes(RETRYABLE_HINT)
+					? text
+					: `${text}\n\n${STALL_WATCHDOG_TAG} ${RETRYABLE_HINT}; treating stalled provider stream as retryable.`,
+			};
+		} else if (cfg.enabled && cfg.retryEmptyResponse && message.stopReason !== "error" && message.stopReason !== "length" && isEmptyAssistantContent(message.content)) {
+			reason = "empty_response";
+			const existing = typeof message.errorMessage === "string" ? message.errorMessage : "";
+			if (!existing.includes(EMPTY_RESPONSE_TAG)) replacement = {
+				...message,
+				stopReason: "error",
+				errorMessage: `Provider returned an empty response (stopReason: ${
+					typeof message.stopReason === "string" ? message.stopReason : "unknown"
+				}, no answer text or tool calls).\n\n${EMPTY_RESPONSE_TAG} ${RETRYABLE_HINT}; treating empty provider response as retryable.`,
+			};
+		} else if (cfg.enabled && message.stopReason === "error" && typeof message.errorMessage === "string") {
+			const matched = matchRetryableError(message.errorMessage, {
+				nl: cfg.nl, statusCodes: cfg.statusCodes, errorPatterns: cfg.errorPatterns,
+			});
+			if (matched) {
+				// Tags are fixed metadata; labels can contain user/provider text.
+				reason = matched.tag;
+				if (!message.errorMessage.includes(matched.tag) || !message.errorMessage.includes(RETRYABLE_HINT)) {
+					const base = cfg.nl ? neutralizeNonRetryable(message.errorMessage).text : message.errorMessage;
+					replacement = { ...message, errorMessage: appendRetryHint(base, matched) };
+				}
+			}
+		}
+		if (!replacement && message.stopReason !== "error" && reason === "unmatched") reason = "success";
+		record(owner, "message_end_classified", { stopReason: message.stopReason, reason, rewritten: !!replacement });
+		if (!replacement) return;
+
+		// Compute the transform before any awaited UI/model work. Registry/pi/UI
+		// exceptions during rotation must never discard a retryable final message.
+		const result = { message: replacement as typeof event.message };
+		record(owner, "message_end_rewritten", { stopReason: replacement.stopReason, reason });
+		owner.status.retry();
+		await safeRotate(ctx, owner);
+		return result;
 	});
 
 	// ── Commands ───────────────────────────────────────────────────────────
@@ -627,6 +654,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 				.map((s) => ({ value: s, label: s }));
 		},
 		handler: async (args, ctx) => {
+			if (!activeRuntime(ctx)) return;
 			refreshConfig();
 			const a = (args ?? "").trim().toLowerCase();
 			let next: boolean;
@@ -634,16 +662,16 @@ export default function kunRetry(pi: ExtensionAPI) {
 			else if (a === "off" || a === "0" || a === "false" || a === "disable") next = false;
 			else if (!a) next = !cfg.nl;
 			else {
-				ctx.ui.notify(`Usage: /retry-nl [on|off]  (current: ${cfg.nl ? "on" : "off"})`, "error");
+				safeNotify(ctx, `Usage: /retry-nl [on|off]  (current: ${cfg.nl ? "on" : "off"})`, "error");
 				return;
 			}
 			cfg = saveConfig({ nl: next, enabled: next ? true : cfg.enabled });
-			const sync = applySettingsSync(ctx);
+			applySettingsSync(ctx);
 			updateFooterStatus(ctx);
-			ctx.ui.notify(
+			safeNotify(ctx,
 				next
-					? `kun-retry nl ON — any provider error is retryable, maxRetries=${sync.maxRetries} (settings). Prefer /reload so this session uses the new limit. Escape cancels a backoff.`
-					: `kun-retry nl OFF — back to maxRetries=${cfg.maxRetries}, status codes + patterns only. /reload recommended if limit was raised.`,
+					? `kun-retry nl ON — any provider error is retryable, extension maxRetries=${effectiveMaxRetries(cfg)}.${cfg.syncSettings ? " Live agent budget updated." : " syncSettings=false: core budget preserved."} Escape cancels a backoff.`
+					: `kun-retry nl OFF — back to maxRetries=${cfg.maxRetries}, status codes + patterns only.`,
 				next ? "warning" : "info",
 			);
 		},
@@ -651,12 +679,17 @@ export default function kunRetry(pi: ExtensionAPI) {
 
 	pi.registerCommand("retry", {
 		description:
-			"kun-retry: status | on | off | max <n> | delay <ms> | constant <ms|off> | codes <list> | patterns <list> | stall <ms|off> | empty <on|off> | sync | help",
+			"kun-retry: status | on | off | max <n> | delay <ms> | constant <ms|off> | codes <list> | patterns <list> | stall <ms|off> | empty <on|off> | trace [on|off|clear] | sync | help",
 		getArgumentCompletions: (prefix: string) => {
 			const subs = [
 				"status", "on", "off", "max", "delay", "constant", "codes", "patterns",
-				"stall", "empty", "sync", "help",
+				"stall", "empty", "trace", "sync", "help",
 			];
+			if (prefix.startsWith("trace ")) {
+				const rest = prefix.slice(6);
+				return ["on", "off", "clear"].filter((s) => s.startsWith(rest))
+					.map((s) => ({ value: `trace ${s}`, label: s }));
+			}
 			if (prefix.startsWith("empty ")) {
 				const rest = prefix.slice(6);
 				return ["on", "off"]
@@ -680,6 +713,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 				.map((s) => ({ value: s, label: s }));
 		},
 		handler: async (args, ctx) => {
+			if (!activeRuntime(ctx)) return;
 			refreshConfig();
 			const raw = (args ?? "").trim();
 			const [cmd, ...rest] = raw.split(/\s+/);
@@ -687,7 +721,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 			const sub = (cmd ?? "").toLowerCase();
 
 			if (!sub || sub === "status" || sub === "show") {
-				ctx.ui.notify(formatConfigSummary(cfg), "info");
+				safeNotify(ctx, formatConfigSummary(cfg), "info");
 				return;
 			}
 
@@ -695,7 +729,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 				cfg = saveConfig({ enabled: true });
 				applySettingsSync(ctx);
 				updateFooterStatus(ctx);
-				ctx.ui.notify("kun-retry enabled", "info");
+				safeNotify(ctx, "kun-retry enabled", "info");
 				return;
 			}
 
@@ -703,13 +737,13 @@ export default function kunRetry(pi: ExtensionAPI) {
 				cfg = saveConfig({ enabled: false, nl: false });
 				applySettingsSync(ctx);
 				updateFooterStatus(ctx);
-				ctx.ui.notify("kun-retry disabled (and nl off)", "info");
+				safeNotify(ctx, "kun-retry disabled (and nl off)", "info");
 				return;
 			}
 
 			if (sub === "config") {
 				if (!restJoined) {
-					ctx.ui.notify(formatConfigSummary(cfg), "info");
+					safeNotify(ctx, formatConfigSummary(cfg), "info");
 					return;
 				}
 				// JSON patch: /retry config {"maxRetries":20}
@@ -718,9 +752,9 @@ export default function kunRetry(pi: ExtensionAPI) {
 					cfg = saveConfig(patch);
 					applySettingsSync(ctx);
 					updateFooterStatus(ctx);
-					ctx.ui.notify(`kun-retry config updated:\n${formatConfigSummary(cfg)}`, "info");
+					safeNotify(ctx, `kun-retry config updated:\n${formatConfigSummary(cfg)}`, "info");
 				} catch (e) {
-					ctx.ui.notify(`Invalid JSON patch: ${e instanceof Error ? e.message : String(e)}`, "error");
+					safeNotify(ctx, `Invalid JSON patch: ${e instanceof Error ? e.message : String(e)}`, "error");
 				}
 				return;
 			}
@@ -728,13 +762,14 @@ export default function kunRetry(pi: ExtensionAPI) {
 			if (sub === "max" || sub === "maxretries") {
 				const n = Number(restJoined);
 				if (!Number.isFinite(n) || n < 0) {
-					ctx.ui.notify("Usage: /retry max <non-negative integer>", "error");
+					safeNotify(ctx, "Usage: /retry max <non-negative integer>", "error");
 					return;
 				}
 				cfg = saveConfig({ maxRetries: Math.floor(n) });
-				const sync = applySettingsSync(ctx);
-				ctx.ui.notify(
-					`kun-retry maxRetries=${cfg.maxRetries} (effective ${effectiveMaxRetries(cfg)}; settings maxRetries=${sync.maxRetries}). /reload to refresh in-memory Pi retry budget.`,
+				applySettingsSync(ctx);
+				updateFooterStatus(ctx);
+				safeNotify(ctx,
+					`kun-retry maxRetries=${cfg.maxRetries} (effective ${effectiveMaxRetries(cfg)}). ${cfg.syncSettings ? "Live agent retry budget updated." : "syncSettings=false: core retry budget preserved."}`,
 					"info",
 				);
 				return;
@@ -743,18 +778,18 @@ export default function kunRetry(pi: ExtensionAPI) {
 			if (sub === "delay" || sub === "basedelay") {
 				const n = Number(restJoined);
 				if (!Number.isFinite(n) || n < 0) {
-					ctx.ui.notify("Usage: /retry delay <ms>", "error");
+					safeNotify(ctx, "Usage: /retry delay <ms>", "error");
 					return;
 				}
 				cfg = saveConfig({ baseDelayMs: Math.floor(n) });
 				applySettingsSync(ctx);
-				ctx.ui.notify(`kun-retry baseDelayMs=${cfg.baseDelayMs}. /reload if in-memory delay looks stale.`, "info");
+				safeNotify(ctx, `kun-retry baseDelayMs=${cfg.baseDelayMs}. ${cfg.syncSettings ? "Live agent delay updated." : "syncSettings=false: core delay preserved."}`, "info");
 				return;
 			}
 
 			if (sub === "constant" || sub === "const" || sub === "fixed") {
 				if (!restJoined) {
-					ctx.ui.notify(
+					safeNotify(ctx,
 						cfg.constantDelayMs > 0
 							? `constantDelayMs=${cfg.constantDelayMs} (${formatDelay(cfg.constantDelayMs)} fixed interval)`
 							: "constantDelayMs=0 (off — Pi built-in exponential backoff)",
@@ -764,18 +799,19 @@ export default function kunRetry(pi: ExtensionAPI) {
 				}
 				const parsed = parseConstantDelayMs(restJoined);
 				if (parsed === undefined) {
-					ctx.ui.notify("Usage: /retry constant <ms|5s|2m|off>", "error");
+					safeNotify(ctx, "Usage: /retry constant <ms|5s|2m|off>", "error");
 					return;
 				}
 				cfg = saveConfig({ constantDelayMs: parsed });
+				applySettingsSync(ctx);
 				if (cfg.constantDelayMs === 0) {
-					ctx.ui.notify(
+					safeNotify(ctx,
 						`kun-retry constant interval off — back to Pi built-in exponential backoff (${cfg.baseDelayMs}ms × 2^(attempt-1)).`,
 						"info",
 					);
 				} else {
-					ctx.ui.notify(
-						`kun-retry constant interval ON — every retry waits ${formatDelay(cfg.constantDelayMs)}, no exponential growth. Takes effect immediately (no /reload needed).`,
+					safeNotify(ctx,
+						`kun-retry constant interval ON — every retry waits ${formatDelay(cfg.constantDelayMs)}, no exponential growth. Takes effect immediately.`,
 						"info",
 					);
 				}
@@ -786,33 +822,33 @@ export default function kunRetry(pi: ExtensionAPI) {
 			if (sub === "codes" || sub === "statuscodes") {
 				if (!restJoined || restJoined === "clear" || restJoined === "none") {
 					cfg = saveConfig({ statusCodes: [] });
-					ctx.ui.notify("kun-retry statusCodes cleared", "info");
+					safeNotify(ctx, "kun-retry statusCodes cleared", "info");
 					return;
 				}
 				if (restJoined === "default" || restJoined === "reset") {
 					cfg = saveConfig({ statusCodes: [...DEFAULT_CONFIG.statusCodes] });
-					ctx.ui.notify(`kun-retry statusCodes reset: [${cfg.statusCodes.join(", ")}]`, "info");
+					safeNotify(ctx, `kun-retry statusCodes reset: [${cfg.statusCodes.join(", ")}]`, "info");
 					return;
 				}
 				const codes = parseIntList(restJoined);
 				if (!codes.length) {
-					ctx.ui.notify("Usage: /retry codes 401,403,429  | clear | default", "error");
+					safeNotify(ctx, "Usage: /retry codes 401,403,429  | clear | default", "error");
 					return;
 				}
 				cfg = saveConfig({ statusCodes: codes });
-				ctx.ui.notify(`kun-retry statusCodes: [${cfg.statusCodes.join(", ")}]`, "info");
+				safeNotify(ctx, `kun-retry statusCodes: [${cfg.statusCodes.join(", ")}]`, "info");
 				return;
 			}
 
 			if (sub === "patterns" || sub === "pattern") {
 				if (!restJoined || restJoined === "clear" || restJoined === "none") {
 					cfg = saveConfig({ errorPatterns: [] });
-					ctx.ui.notify("kun-retry errorPatterns cleared", "info");
+					safeNotify(ctx, "kun-retry errorPatterns cleared", "info");
 					return;
 				}
 				const patterns = parsePatternArgs(restJoined);
 				if (!patterns.length) {
-					ctx.ui.notify('Usage: /retry patterns "foo|bar",timeout  or JSON array', "error");
+					safeNotify(ctx, 'Usage: /retry patterns "foo|bar",timeout  or JSON array', "error");
 					return;
 				}
 				// Validate compile
@@ -820,33 +856,33 @@ export default function kunRetry(pi: ExtensionAPI) {
 					try {
 						new RegExp(p, "i");
 					} catch (e) {
-						ctx.ui.notify(`Invalid regex ${JSON.stringify(p)}: ${e instanceof Error ? e.message : String(e)}`, "error");
+						safeNotify(ctx, `Invalid regex ${JSON.stringify(p)}: ${e instanceof Error ? e.message : String(e)}`, "error");
 						return;
 					}
 				}
 				cfg = saveConfig({ errorPatterns: patterns });
-				ctx.ui.notify(`kun-retry errorPatterns (${cfg.errorPatterns.length}): ${cfg.errorPatterns.join(" | ")}`, "info");
+				safeNotify(ctx, `kun-retry errorPatterns (${cfg.errorPatterns.length}): ${cfg.errorPatterns.join(" | ")}`, "info");
 				return;
 			}
 
 			if (sub === "stall") {
 				if (!restJoined) {
-					ctx.ui.notify(`stallTimeoutMs=${cfg.stallTimeoutMs} (0=off)`, "info");
+					safeNotify(ctx, `stallTimeoutMs=${cfg.stallTimeoutMs} (0=off)`, "info");
 					return;
 				}
 				const parsed = parseStallTimeoutMs(restJoined);
 				if (parsed === undefined) {
-					ctx.ui.notify("Usage: /retry stall <ms|off|0>", "error");
+					safeNotify(ctx, "Usage: /retry stall <ms|off|0>", "error");
 					return;
 				}
 				cfg = saveConfig({ stallTimeoutMs: parsed });
-				ctx.ui.notify(`kun-retry stallTimeoutMs=${cfg.stallTimeoutMs === 0 ? "off" : cfg.stallTimeoutMs}`, "info");
+				safeNotify(ctx, `kun-retry stallTimeoutMs=${cfg.stallTimeoutMs === 0 ? "off" : cfg.stallTimeoutMs}`, "info");
 				return;
 			}
 
 			if (sub === "empty" || sub === "emptyresponse") {
 				if (!restJoined) {
-					ctx.ui.notify(`retryEmptyResponse=${cfg.retryEmptyResponse}`, "info");
+					safeNotify(ctx, `retryEmptyResponse=${cfg.retryEmptyResponse}`, "info");
 					return;
 				}
 				const a = restJoined.toLowerCase();
@@ -854,25 +890,42 @@ export default function kunRetry(pi: ExtensionAPI) {
 				if (a === "on" || a === "1" || a === "true" || a === "enable") next = true;
 				else if (a === "off" || a === "0" || a === "false" || a === "disable") next = false;
 				else {
-					ctx.ui.notify("Usage: /retry empty <on|off>", "error");
+					safeNotify(ctx, "Usage: /retry empty <on|off>", "error");
 					return;
 				}
 				cfg = saveConfig({ retryEmptyResponse: next });
-				ctx.ui.notify(`kun-retry retryEmptyResponse=${cfg.retryEmptyResponse}`, "info");
+				safeNotify(ctx, `kun-retry retryEmptyResponse=${cfg.retryEmptyResponse}`, "info");
+				return;
+			}
+
+			if (sub === "trace") {
+				const owner = activeRuntime(ctx);
+				if (!owner) return;
+				const action = restJoined.toLowerCase();
+				if (!action) safeNotify(ctx, owner.diagnostics.format(), "info");
+				else if (action === "clear") {
+					owner.diagnostics.clear();
+					safeNotify(ctx, "kun-retry diagnostic ring cleared", "info");
+				} else if (action === "on" || action === "off") {
+					owner.diagnostics.enabled = action === "on";
+					record(owner, "trace", { enabled: owner.diagnostics.enabled });
+					safeNotify(ctx, `kun-retry trace ${action.toUpperCase()} (current runtime only; ${action === "on" ? "metadata entries persisted" : "memory ring only"})`, "info");
+				} else safeNotify(ctx, "Usage: /retry trace [on|off|clear]", "error");
 				return;
 			}
 
 			if (sub === "sync") {
 				const sync = applySettingsSync(ctx);
-				ctx.ui.notify(
-					`settings.json ${sync.changed ? "updated" : "already in sync"}: maxRetries=${sync.maxRetries}, baseDelayMs=${sync.baseDelayMs}, maxAgentDelayMs=${sync.maxAgentDelayMs}, enabled=${sync.enabled}. Path: ${sync.path}. /reload applies to in-memory agent.`,
+				if (!sync) return;
+				safeNotify(ctx,
+					`settings.json ${sync.changed ? "updated" : "already in sync"}: maxRetries=${sync.maxRetries}, baseDelayMs=${sync.baseDelayMs}, maxAgentDelayMs=${sync.maxAgentDelayMs}, enabled=${sync.enabled}. Path: ${sync.path}. ${cfg.syncSettings ? "Live agent policy is current." : "syncSettings=false: core settings preserved."}`,
 					"info",
 				);
 				return;
 			}
 
 			if (sub === "help") {
-				ctx.ui.notify(
+				safeNotify(ctx,
 					[
 						"/retry status",
 						"/retry on|off",
@@ -885,6 +938,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 						"/retry empty <on|off>   retry empty (no-content) responses",
 						"/retry config {json}    patch config file",
 						"/retry sync             write maxRetries into settings.json",
+						"/retry trace [on|off|clear] runtime diagnostic metadata (no arg: show)",
 						"/retry-nl [on|off]      unlimited any-error mode",
 						"/retry-models           manage model rotation (see /retry-models help)",
 						`nl cap constant: ${NL_MAX_RETRIES}`,
@@ -894,7 +948,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.notify(`Unknown /retry subcommand: ${sub}. Try /retry help`, "error");
+			safeNotify(ctx, `Unknown /retry subcommand: ${sub}. Try /retry help`, "error");
 		},
 	});
 
@@ -924,6 +978,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 				.map((s) => ({ value: s, label: s }));
 		},
 		handler: async (args, ctx) => {
+			if (!activeRuntime(ctx)) return;
 			refreshConfig();
 			const raw = (args ?? "").trim();
 			const [cmd, ...rest] = raw.split(/\s+/);
@@ -946,7 +1001,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 			const showPool = () => {
 				const currentKey = modelKeyOf(ctx.model) ?? "(unknown)";
 				const list = sessionCandidates.length ? sessionCandidates.join("\n  ") : "(none)";
-				ctx.ui.notify(
+				safeNotify(ctx,
 					[
 						`rotation: ${sessionRotationOn ? "on" : "off"}  switchAfterErrors: ${cfg.switchAfterErrors}  includeActive: ${cfg.includeActiveInRotation}  thinking: ${cfg.rotationThinkingLevel}`,
 						`active model: ${currentKey}`,
@@ -960,11 +1015,11 @@ export default function kunRetry(pi: ExtensionAPI) {
 				try {
 					all = ctx.modelRegistry.getAvailable();
 				} catch (e) {
-					ctx.ui.notify(`kun-retry: could not read available models: ${e instanceof Error ? e.message : String(e)}`, "error");
+					safeNotify(ctx, `kun-retry: could not read available models: ${e instanceof Error ? e.message : String(e)}`, "error");
 					return;
 				}
 				if (!all.length) {
-					ctx.ui.notify("kun-retry: no configured/available models (check provider auth / API keys)", "info");
+					safeNotify(ctx, "kun-retry: no configured/available models (check provider auth / API keys)", "info");
 					return;
 				}
 				const currentKey = modelKeyOf(ctx.model);
@@ -976,7 +1031,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 						const mark = k === currentKey ? "→ " : inPool.has(k) ? "✓ " : "  ";
 						return `${mark}${k}`;
 					});
-				ctx.ui.notify(
+				safeNotify(ctx,
 					[
 						`kun-retry: ${all.length} available model(s)  (→ active, ✓ in pool):`,
 						...rows,
@@ -993,7 +1048,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 			}
 
 			if (sub === "help") {
-				ctx.ui.notify(
+				safeNotify(ctx,
 					[
 						"/retry-models                    show pool + rotation state",
 						"/retry-models <p/id> [more...]    set candidates (enables rotation)",
@@ -1024,20 +1079,20 @@ export default function kunRetry(pi: ExtensionAPI) {
 				errorStreak = 0;
 				baseModelKey = modelKeyOf(ctx.model);
 				updateFooterStatus(ctx);
-				ctx.ui.notify("kun-retry model rotation cleared (candidates removed, rotation off)", "info");
+				safeNotify(ctx, "kun-retry model rotation cleared (candidates removed, rotation off)", "info");
 				return;
 			}
 
 			if (sub === "add") {
 				const added = parseModelList(restJoined);
 				if (!added.length) {
-					ctx.ui.notify("Usage: /retry-models add <provider/id> [more...]", "error");
+					safeNotify(ctx, "Usage: /retry-models add <provider/id> [more...]", "error");
 					return;
 				}
 				const validAdded = filterAvailable(added);
 				const skipped = added.filter((k) => !validAdded.includes(k));
 				if (!validAdded.length) {
-					ctx.ui.notify(
+					safeNotify(ctx,
 						`kun-retry: none of the specified models are currently available/configured. Skipped: ${skipped.join(", ")}`,
 						"error",
 					);
@@ -1048,7 +1103,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 				sessionCandidates = merged;
 				sessionRotationOn = rotateAfterAdd;
 				updateFooterStatus(ctx);
-				ctx.ui.notify(
+				safeNotify(ctx,
 					[
 						`kun-retry candidates (${merged.length}):\n  ${merged.join("\n  ")}`,
 						skipped.length ? `skipped unavailable: ${skipped.join(", ")}` : "",
@@ -1063,14 +1118,14 @@ export default function kunRetry(pi: ExtensionAPI) {
 			if (sub === "remove" || sub === "rm" || sub === "del" || sub === "delete") {
 				const drop = new Set(parseModelList(restJoined));
 				if (!drop.size) {
-					ctx.ui.notify("Usage: /retry-models remove <provider/id> [more...]", "error");
+					safeNotify(ctx, "Usage: /retry-models remove <provider/id> [more...]", "error");
 					return;
 				}
 				const kept = sessionCandidates.filter((m) => !drop.has(m));
 				sessionCandidates = kept;
 				sessionRotationOn = kept.length > 0 && sessionRotationOn;
 				updateFooterStatus(ctx);
-				ctx.ui.notify(
+				safeNotify(ctx,
 					kept.length
 						? `kun-retry candidates (${kept.length}):\n  ${kept.join("\n  ")}`
 						: "kun-retry candidates now empty (rotation off)",
@@ -1081,7 +1136,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 
 			if (sub === "switch" || sub === "switchafter" || sub === "every") {
 				if (!restJoined) {
-					ctx.ui.notify(
+					safeNotify(ctx,
 						`switchAfterErrors=${cfg.switchAfterErrors}${cfg.switchAfterErrors === 0 ? " (0 = switching disabled)" : ""}`,
 						"info",
 					);
@@ -1089,12 +1144,13 @@ export default function kunRetry(pi: ExtensionAPI) {
 				}
 				const n = Number(restJoined);
 				if (!Number.isFinite(n) || n < 0) {
-					ctx.ui.notify("Usage: /retry-models switch <non-negative integer>  (0 disables switching)", "error");
+					safeNotify(ctx, "Usage: /retry-models switch <non-negative integer>  (0 disables switching)", "error");
 					return;
 				}
 				cfg = saveConfig({ switchAfterErrors: Math.floor(n) });
 				errorStreak = 0;
-				ctx.ui.notify(
+				updateFooterStatus(ctx);
+				safeNotify(ctx,
 					cfg.switchAfterErrors === 0
 						? "kun-retry switchAfterErrors=0 — model switching disabled (rotation idle)"
 						: `kun-retry switchAfterErrors=${cfg.switchAfterErrors} — switch model after every ${cfg.switchAfterErrors} retryable error(s)`,
@@ -1105,7 +1161,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 
 			if (sub === "rotate" || sub === "rotation") {
 				if (!restJoined) {
-					ctx.ui.notify(`modelRotation=${sessionRotationOn ? "on" : "off"} (${sessionCandidates.length} candidate(s))`, "info");
+					safeNotify(ctx, `modelRotation=${sessionRotationOn ? "on" : "off"} (${sessionCandidates.length} candidate(s))`, "info");
 					return;
 				}
 				const a = restJoined.toLowerCase();
@@ -1113,23 +1169,23 @@ export default function kunRetry(pi: ExtensionAPI) {
 				if (a === "on" || a === "1" || a === "true" || a === "enable") next = true;
 				else if (a === "off" || a === "0" || a === "false" || a === "disable") next = false;
 				else {
-					ctx.ui.notify("Usage: /retry-models rotate <on|off>", "error");
+					safeNotify(ctx, "Usage: /retry-models rotate <on|off>", "error");
 					return;
 				}
 				if (next && sessionCandidates.length === 0) {
-					ctx.ui.notify("kun-retry: set candidates first with /retry-models <provider/id> ...", "error");
+					safeNotify(ctx, "kun-retry: set candidates first with /retry-models <provider/id> ...", "error");
 					return;
 				}
 				sessionRotationOn = next;
 				errorStreak = 0;
 				updateFooterStatus(ctx);
-				ctx.ui.notify(`kun-retry modelRotation=${sessionRotationOn ? "on" : "off"}`, "info");
+				safeNotify(ctx, `kun-retry modelRotation=${sessionRotationOn ? "on" : "off"}`, "info");
 				return;
 			}
 
 			if (sub === "active" || sub === "includeactive") {
 				if (!restJoined) {
-					ctx.ui.notify(`includeActiveInRotation=${cfg.includeActiveInRotation}`, "info");
+					safeNotify(ctx, `includeActiveInRotation=${cfg.includeActiveInRotation}`, "info");
 					return;
 				}
 				const a = restJoined.toLowerCase();
@@ -1137,20 +1193,20 @@ export default function kunRetry(pi: ExtensionAPI) {
 				if (a === "on" || a === "1" || a === "true" || a === "enable") next = true;
 				else if (a === "off" || a === "0" || a === "false" || a === "disable") next = false;
 				else {
-					ctx.ui.notify("Usage: /retry-models active <on|off>", "error");
+					safeNotify(ctx, "Usage: /retry-models active <on|off>", "error");
 					return;
 				}
 				cfg = saveConfig({ includeActiveInRotation: next });
 				// Changing pool composition mid-sequence: reset the streak so the next
 				// switch is computed against the new pool from a clean count.
 				errorStreak = 0;
-				ctx.ui.notify(`kun-retry includeActiveInRotation=${cfg.includeActiveInRotation}`, "info");
+				safeNotify(ctx, `kun-retry includeActiveInRotation=${cfg.includeActiveInRotation}`, "info");
 				return;
 			}
 
 			if (sub === "thinking" || sub === "think" || sub === "level") {
 				if (!restJoined) {
-					ctx.ui.notify(
+					safeNotify(ctx,
 						`rotationThinkingLevel=${cfg.rotationThinkingLevel}${
 							cfg.rotationThinkingLevel === "max" ? " (falls back to each model's own highest supported level)" : ""
 						}`,
@@ -1160,14 +1216,14 @@ export default function kunRetry(pi: ExtensionAPI) {
 				}
 				const a = restJoined.toLowerCase() as RotationThinkingLevel;
 				if (!ROTATION_THINKING_LEVELS.includes(a)) {
-					ctx.ui.notify(
+					safeNotify(ctx,
 						`Usage: /retry-models thinking <${ROTATION_THINKING_LEVELS.join("|")}>`,
 						"error",
 					);
 					return;
 				}
 				cfg = saveConfig({ rotationThinkingLevel: a });
-				ctx.ui.notify(
+				safeNotify(ctx,
 					a === "inherit"
 						? "kun-retry rotationThinkingLevel=inherit — keep the session's current thinking level across switches"
 						: `kun-retry rotationThinkingLevel=${a} — applied after each switch (clamped to the target model's strongest supported level)`,
@@ -1183,7 +1239,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 			const skipped = parsed.filter((k) => !models.includes(k));
 			const invalidTokens = rawTokens.filter((t) => !parseModelKey(t));
 			if (!models.length) {
-				ctx.ui.notify(
+				safeNotify(ctx,
 					[
 						'Usage: /retry-models <provider/id> [more...]  (e.g. "openai/gpt-4o anthropic/claude-3-5-sonnet")',
 						parsed.length ? `All specified models are unavailable/not configured. Skipped: ${skipped.join(", ")}` : "",
@@ -1200,7 +1256,7 @@ export default function kunRetry(pi: ExtensionAPI) {
 			errorStreak = 0;
 			baseModelKey = modelKeyOf(ctx.model);
 			updateFooterStatus(ctx);
-			ctx.ui.notify(
+			safeNotify(ctx,
 				[
 					`kun-retry model rotation ON: switches after ${cfg.switchAfterErrors} retryable error(s), cycling ${
 						cfg.includeActiveInRotation ? "active + candidates" : "candidates only"

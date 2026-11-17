@@ -101,14 +101,14 @@ test("pickNextModelKey starts at the front when current is not in pool", () => {
 test("pickNextModelKey skips unusable models", () => {
 	const pool = ["a/0", "b/1", "c/2"];
 	// b/1 has no auth, so from a/0 we skip to c/2.
-	const usable = (k: string) => k !== "b/1";
+	const usable = (k) => k !== "b/1";
 	assert.equal(pickNextModelKey(pool, "a/0", usable), "c/2");
 });
 
 test("pickNextModelKey returns undefined when nothing else is usable", () => {
 	const pool = ["a/0", "b/1"];
 	// Only the current model is usable.
-	const usable = (k: string) => k === "a/0";
+	const usable = (k) => k === "a/0";
 	assert.equal(pickNextModelKey(pool, "a/0", usable), undefined);
 });
 

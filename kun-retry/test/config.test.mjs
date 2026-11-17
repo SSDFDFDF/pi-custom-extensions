@@ -35,7 +35,7 @@ test("rotationThinkingLevel defaults to max and validates input", () => {
 	assert.equal(normalizeConfig({ rotationThinkingLevel: "high" }).rotationThinkingLevel, "high");
 	// Unknown level falls back to the default.
 	assert.equal(
-		normalizeConfig({ rotationThinkingLevel: "ultra" as never }).rotationThinkingLevel,
+		normalizeConfig({ rotationThinkingLevel: "ultra" }).rotationThinkingLevel,
 		"max",
 	);
 });
@@ -46,7 +46,7 @@ test("unknown/legacy keys are dropped from the normalized config", () => {
 	const c = normalizeConfig({
 		modelRotation: true,
 		candidateModels: ["openai/gpt-4o"],
-	} as unknown as Parameters<typeof normalizeConfig>[0]);
+	});
 	assert.equal("modelRotation" in c, false);
 	assert.equal("candidateModels" in c, false);
 });
@@ -63,7 +63,7 @@ test("saveConfig round-trips the persisted rotation fields through loadConfig", 
 		assert.equal(reloaded.rotationThinkingLevel, "inherit");
 
 		// The file must not contain a candidate list.
-		const raw = JSON.parse(readFileSync(join(dir, "kun-retry.config.json"), "utf8")) as Record<string, unknown>;
+		const raw = JSON.parse(readFileSync(join(dir, "kun-retry.config.json"), "utf8"));
 		assert.equal("candidateModels" in raw, false);
 		assert.equal("modelRotation" in raw, false);
 	} finally {
@@ -80,7 +80,7 @@ test("legacy candidate fields written to disk are ignored on load", () => {
 	try {
 		saveConfig({ switchAfterErrors: 4 });
 		const path = join(dir, "kun-retry.config.json");
-		const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		const raw = JSON.parse(readFileSync(path, "utf8"));
 		raw.candidateModels = ["openai/gpt-4o"];
 		raw.modelRotation = true;
 		writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`);
